@@ -20,6 +20,7 @@ const mnSearchRoute = require('./routes/mnSearch');
 // New authenticated subsystem (auth + vault).
 const { openDatabase } = require('./lib/db');
 const { createMailer } = require('./lib/mailer');
+const { selectMailTransport } = require('./lib/mailTransport');
 const {
   buildServices,
   finalizeSessionMw,
@@ -77,8 +78,11 @@ app.use((req, res, next) => {
 // -----------------------------------------------------------------------------
 const dbPath = process.env.SYSNODE_DB_PATH || './data/sysnode.db';
 const db = openDatabase(dbPath);
+
+// Fail-fast transport selection. See lib/mailTransport.js for the full
+// rationale (Codex round-6 P1).
 const mailer = createMailer({
-  transport: process.env.SMTP_HOST ? 'smtp' : 'log',
+  transport: selectMailTransport(),
   from: process.env.MAIL_FROM || 'no-reply@syscoin.dev',
 });
 const services = finalizeSessionMw(buildServices({ db }));

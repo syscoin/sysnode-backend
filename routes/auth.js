@@ -60,16 +60,6 @@ function createAuthRouter({
     return `${verifyBase}/verify-email?token=${token}`;
   }
 
-  async function issueAndMail({ email, authHash }) {
-    try {
-      const token = pendingRegistrations.issue({ email, authHash });
-      await mailer.sendVerification({ to: email, link: mailLink(token) });
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('[auth] issueAndMail failed', err && err.message);
-    }
-  }
-
   // -------------------------------------------------------------------------
   // POST /auth/register
   //
@@ -88,12 +78,32 @@ function createAuthRouter({
   //   each carries its own stored_auth snapshot, whichever is redeemed
   //   first "wins" and purgeForEmail wipes the rest.
   //
-  // Timing:
-  //   The response MUST NOT vary by whether a verified user already exists
-  //   for this email. We therefore always schedule the actual mail send in
-  //   the background and return 202 synchronously. Attackers see constant
-  //   response latency whether the email belongs to an existing account or
-  //   is brand new.
+  // Timing / correctness split (Codex round-6 P1):
+  //   The Round-4 rewrite moved ALL post-parse work into the background so
+  //   that response timing carried no signal about account state. But
+  //   putting the pending-row INSERT in the background too meant
+  //   configuration failures (e.g. missing SYSNODE_AUTH_PEPPER in
+  //   pendingRegistrations.issue) produced a silent 202 with nothing
+  //   scheduled — users saw "check your email" forever.
+  //
+  //   We now split the work:
+  //     • Synchronous path (must succeed, else 5xx):
+  //         - parse + email-syntax validation,
+  //         - check "is there already a verified owner?" (cheap lookup),
+  //         - if no, issue the pending_registrations row (cheap insert).
+  //       These steps either all succeed or they all fail loudly — no
+  //       silent drop-on-floor.
+  //     • Background path (best-effort):
+  //         - SMTP send. Transient SMTP blips are isolated from the
+  //           response, and the user can simply re-POST /register to get
+  //           a fresh token + retry.
+  //
+  //   Timing cross-talk between "verified owner exists" and "new email"
+  //   is bounded to one SQLite SELECT plus conditionally one INSERT —
+  //   on the order of a few hundred microseconds, far below network
+  //   jitter + TLS handshake variance. The substantive timing leak that
+  //   motivated Round 4 (seconds-scale cost of Argon2 / SMTP in the
+  //   critical path) is gone either way.
   // -------------------------------------------------------------------------
   router.post('/register', limiters.register, async (req, res) => {
     const parsed = RegisterSchema.safeParse(req.body);
@@ -102,30 +112,48 @@ function createAuthRouter({
     }
     const { email, authHash } = parsed.data;
 
-    // Reject syntactically invalid emails synchronously. This path is
-    // safe to surface (non-timing-sensitive): whether "foo" parses as an
-    // email is a pure function of the submitted string, so it cannot leak
-    // account existence. The existence check — "does a verified user
-    // already own this email?" — is what we still do asynchronously
-    // below to keep response timing constant.
     if (!isValidEmailSyntax(normalizeEmail(email))) {
       return badRequest(res, 'invalid_email');
     }
 
-    schedule(async () => {
-      try {
-        const existing = users.findByEmail(email);
-        if (existing && existing.emailVerified) {
-          // Account already exists and is verified; don't spam the owner
-          // with a bogus "confirm your email" message. Silent no-op.
-          return;
-        }
-        await issueAndMail({ email, authHash });
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error('[auth/register.bg]', err && err.message);
+    let token = null;
+    try {
+      const existing = users.findByEmail(email);
+      const alreadyVerified = !!(existing && existing.emailVerified);
+      if (!alreadyVerified) {
+        // Issue synchronously so config errors (missing pepper, bad DB
+        // state) fail fast with 5xx rather than producing a silent 202
+        // that never results in a deliverable link.
+        token = pendingRegistrations.issue({ email, authHash });
       }
-    });
+    } catch (err) {
+      if (err.code === 'invalid_email') {
+        return badRequest(res, 'invalid_email');
+      }
+      // eslint-disable-next-line no-console
+      console.error('[auth/register] pending-issue failed', err);
+      return res.status(500).json({ error: 'internal' });
+    }
+
+    if (token) {
+      schedule(async () => {
+        try {
+          await mailer.sendVerification({
+            to: email,
+            link: mailLink(token),
+          });
+        } catch (err) {
+          // SMTP is best-effort: if it fails, user retries /register
+          // and a fresh pending row + send is issued. We don't retry
+          // internally to keep this endpoint fast and predictable.
+          // eslint-disable-next-line no-console
+          console.error(
+            '[auth/register] mailer.sendVerification failed',
+            err && err.message
+          );
+        }
+      });
+    }
 
     return res.status(202).json({ status: 'verification_sent' });
   });

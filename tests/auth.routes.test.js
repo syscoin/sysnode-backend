@@ -340,6 +340,57 @@ describe('auth routes', () => {
     expect(ctx.mailer.outbox.length).toBe(outboxBefore);
   });
 
+  test('POST /auth/register fails fast (5xx) when pending-row issuance throws (Codex round-6 P1)', async () => {
+    // Simulate a configuration failure (e.g. missing pepper) by making
+    // pendingRegistrations.issue throw. The response must NOT be 202 —
+    // users shouldn't be told "check your email" when the server
+    // couldn't actually schedule a link.
+    const broken = {
+      issue: () => {
+        throw new Error('pending issue blew up');
+      },
+      redeem: ctx.pendingRegistrations.redeem,
+      purgeForEmail: ctx.pendingRegistrations.purgeForEmail,
+      cleanupExpired: ctx.pendingRegistrations.cleanupExpired,
+    };
+    // Swap in the broken stub via the same appFactory services object.
+    ctx.pendingRegistrations.issue = broken.issue;
+
+    const res = await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'ops-broken@example.com', authHash: SAMPLE_AUTH });
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('internal');
+    expect(ctx.mailer.outbox).toHaveLength(0);
+  });
+
+  test('POST /auth/register still returns 202 when SMTP send fails (background best-effort)', async () => {
+    // SMTP is intentionally best-effort: a flaky relay shouldn't break
+    // /register. The pending row is already persisted synchronously, so
+    // the user can retry /register to get another mail attempt.
+    const originalSend = ctx.mailer.sendVerification;
+    ctx.mailer.sendVerification = async () => {
+      throw new Error('smtp down');
+    };
+    const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const res = await request(ctx.app)
+        .post('/auth/register')
+        .send({ email: 'flaky@example.com', authHash: SAMPLE_AUTH });
+      expect(res.status).toBe(202);
+      expect(err).toHaveBeenCalled();
+      const pendingRow = ctx.db
+        .prepare(
+          'SELECT COUNT(*) AS c FROM pending_registrations WHERE email_normalized = ?'
+        )
+        .get('flaky@example.com');
+      expect(pendingRow.c).toBe(1);
+    } finally {
+      err.mockRestore();
+      ctx.mailer.sendVerification = originalSend;
+    }
+  });
+
   test('verify-email rotates a legacy unverified users row in place (Codex round-5 P1)', async () => {
     // Migration 003 wipes pre-existing email_verified=0 rows at deploy,
     // but the code must also handle the case defensively (e.g. a future
