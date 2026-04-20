@@ -25,7 +25,6 @@
   },
   "dependencies": {
     "@syscoin/syscoin-js": "git+https://github.com/syscoin/syscoind-rpc.git#637a1de10522d1ce34a4e0f283c59b9d55bde814",
-    "argon2": "^0.44.0",
     "axios": "0.27.2",
     "better-sqlite3": "^12.9.0",
     "body-parser": "1.20.2",
