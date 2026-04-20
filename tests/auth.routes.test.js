@@ -427,6 +427,50 @@ describe('auth routes', () => {
     }
   });
 
+  test('POST /auth/logout clears cookies even when sessions.revoke throws (Codex round-11 P2)', async () => {
+    // Invariant: logout must always leave the browser cookie-less, even
+    // if the server-side revoke fails. Otherwise a transient DB blip
+    // silently re-authenticates the user on their next request.
+    const agent = request.agent(ctx.app);
+    await agent
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await agent.post('/auth/verify-email').send({ token });
+    const loginRes = await agent
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const csrf = extractCookies(loginRes).csrf;
+
+    const originalRevoke = ctx.sessions.revoke;
+    ctx.sessions.revoke = () => {
+      throw new Error('transient sqlite failure');
+    };
+
+    try {
+      const res = await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
+      // Response still 200 from the client's POV — the user IS logged
+      // out browser-side. Server logs the revoke failure.
+      expect(res.status).toBe(200);
+
+      const setCookies = res.headers['set-cookie'] || [];
+      // Both auth cookies cleared: expired/empty Set-Cookie lines.
+      // express's res.clearCookie emits cookies with Expires=Thu, 01 Jan 1970.
+      expect(
+        setCookies.some(
+          (c) => /^sid=;/.test(c) && /Expires=/i.test(c)
+        )
+      ).toBe(true);
+      expect(
+        setCookies.some(
+          (c) => /^csrf=;/.test(c) && /Expires=/i.test(c)
+        )
+      ).toBe(true);
+    } finally {
+      ctx.sessions.revoke = originalRevoke;
+    }
+  });
+
   test('POST /auth/verify-email keeps the token redeemable when the account write fails (Codex round-10 P1)', async () => {
     // Token-integrity invariant: if anything after pendingRegistrations.redeem
     // throws inside /verify-email, the whole operation must roll back so

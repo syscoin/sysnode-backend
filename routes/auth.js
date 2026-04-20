@@ -330,9 +330,23 @@ function createAuthRouter({
   // POST /auth/logout
   // -------------------------------------------------------------------------
   router.post('/logout', csrfMw.require, (req, res) => {
-    if (req.sessionToken) sessions.revoke(req.sessionToken);
-    sessionMw.clearSessionCookie(res);
-    csrfMw.clearCookie(res);
+    // Clear cookies UNCONDITIONALLY — even if sessions.revoke throws
+    // on a transient DB failure (Codex round-11 P2). Otherwise a logout
+    // that blew up on the server would leave `sid` and `csrf` in the
+    // browser, making the user effectively still signed in. Worst-case
+    // the stale session row remains in the DB until its cleanup sweep,
+    // but the user is definitely signed out client-side.
+    try {
+      if (req.sessionToken) sessions.revoke(req.sessionToken);
+    } catch (err) {
+      // Log-and-continue — response is still 200 because from the
+      // client's point of view logout succeeded (cookies are gone).
+      // eslint-disable-next-line no-console
+      console.error('[auth/logout] sessions.revoke failed', err && err.message);
+    } finally {
+      sessionMw.clearSessionCookie(res);
+      csrfMw.clearCookie(res);
+    }
     return res.json({ status: 'ok' });
   });
 

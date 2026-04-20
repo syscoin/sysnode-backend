@@ -27,10 +27,28 @@ function buildCookieOpts(expiresAt, { secure }) {
 }
 
 function createCsrfMiddleware({ secureCookies }) {
+  // Constant-time comparison of two CSRF tokens.
+  //
+  // The previous implementation guarded `crypto.timingSafeEqual` with a
+  // String#length check, then passed the strings through `Buffer.from(x)`
+  // for the compare. String#length is UTF-16 code-unit count; Buffer.from
+  // default-encodes UTF-8. For any non-ASCII header value with the same
+  // UTF-16 length as the cookie, the two resulting buffers differ in
+  // BYTE length and `timingSafeEqual` throws RangeError. Because this
+  // ran inside csrfMw.require, it was reachable on every CSRF-protected
+  // route (logout, change-password, vault writes) and turned a normal
+  // CSRF mismatch into a 500. (Codex round-11 P1.)
+  //
+  // Fix: encode both sides to utf-8 bytes explicitly, bail cleanly if
+  // the byte lengths differ. Our issued tokens are always 64 hex ASCII
+  // chars, so any honest client hits the fast equality branch; hostile
+  // headers return false instead of throwing.
   function timingEqual(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
-    if (a.length !== b.length) return false;
-    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+    const ba = Buffer.from(a, 'utf8');
+    const bb = Buffer.from(b, 'utf8');
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
   }
 
   return {
