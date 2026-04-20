@@ -427,6 +427,34 @@ describe('auth routes', () => {
     }
   });
 
+  test('POST /auth/register sends verification mail to the NORMALIZED recipient (Codex round-12 P2)', async () => {
+    // Pre-fix /register stored the normalized email but handed the raw
+    // user input to the mailer. Whitespace/case variations that
+    // normalized cleanly could therefore be rejected at RCPT TO by
+    // the SMTP peer, and because sends are background best-effort the
+    // caller got 202 with no email delivered.
+    const res = await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: '  User@Example.COM  ', authHash: SAMPLE_AUTH });
+    expect(res.status).toBe(202);
+
+    expect(ctx.mailer.outbox).toHaveLength(1);
+    // Outbox recipient must be the canonical form that also backs the
+    // pending row — no leading/trailing whitespace, no casing drift.
+    expect(ctx.mailer.outbox[0].to).toBe('user@example.com');
+    // And the token the link carries must redeem to the canonical
+    // email so subsequent login works without re-normalization on the
+    // client.
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    const verify = await request(ctx.app)
+      .post('/auth/verify-email')
+      .send({ token });
+    expect(verify.status).toBe(200);
+    const user = ctx.users.findByEmail('user@example.com');
+    expect(user).not.toBeNull();
+    expect(user.emailVerified).toBe(true);
+  });
+
   test('POST /auth/logout clears cookies even when sessions.revoke throws (Codex round-11 P2)', async () => {
     // Invariant: logout must always leave the browser cookie-less, even
     // if the server-side revoke fails. Otherwise a transient DB blip

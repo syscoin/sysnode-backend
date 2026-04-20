@@ -132,19 +132,32 @@ function createAuthRouter({
     }
     const { email, authHash } = parsed.data;
 
-    if (!isValidEmailSyntax(normalizeEmail(email))) {
+    // Normalize once up front. The rest of the handler (validation,
+    // users lookup, pending issuance, AND the SMTP recipient) must use
+    // the same canonical value. Previously the SMTP `to:` field was
+    // passed the raw user input, so a form submission like
+    // "  User@Example.COM  " would validate + persist as
+    // "user@example.com" but be handed to nodemailer with surrounding
+    // whitespace, which many SMTP servers reject at RCPT TO. Because
+    // the send is best-effort / backgrounded, the API still returned
+    // 202 and the user never got a link. (Codex round-12 P2.)
+    const normalizedEmail = normalizeEmail(email);
+    if (!isValidEmailSyntax(normalizedEmail)) {
       return badRequest(res, 'invalid_email');
     }
 
     let token = null;
     try {
-      const existing = users.findByEmail(email);
+      const existing = users.findByEmail(normalizedEmail);
       const alreadyVerified = !!(existing && existing.emailVerified);
       if (!alreadyVerified) {
         // Issue synchronously so config errors (missing pepper, bad DB
         // state) fail fast with 5xx rather than producing a silent 202
         // that never results in a deliverable link.
-        token = pendingRegistrations.issue({ email, authHash });
+        token = pendingRegistrations.issue({
+          email: normalizedEmail,
+          authHash,
+        });
       }
     } catch (err) {
       if (err.code === 'invalid_email') {
@@ -159,7 +172,7 @@ function createAuthRouter({
       schedule(async () => {
         try {
           await mailer.sendVerification({
-            to: email,
+            to: normalizedEmail,
             link: mailLink(token),
           });
         } catch (err) {
