@@ -427,6 +427,116 @@ describe('auth routes', () => {
     }
   });
 
+  test('POST /auth/verify-email keeps the token redeemable when the account write fails (Codex round-10 P1)', async () => {
+    // Token-integrity invariant: if anything after pendingRegistrations.redeem
+    // throws inside /verify-email, the whole operation must roll back so
+    // the user can retry their original link. Pre-round-10 the token was
+    // consumed unconditionally up front.
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+
+    // Make the user-row insert fail once.
+    const originalCreate = ctx.users.createVerifiedWithStoredAuth;
+    ctx.users.createVerifiedWithStoredAuth = () => {
+      throw new Error('simulated db write failure');
+    };
+
+    let errored;
+    await expectNoUnhandledRejection(async () => {
+      errored = await request(ctx.app)
+        .post('/auth/verify-email')
+        .send({ token });
+      expect(errored.status).toBe(500);
+      expect(errored.body.error).toBe('internal');
+    });
+
+    // Restore the repo so the retry can succeed.
+    ctx.users.createVerifiedWithStoredAuth = originalCreate;
+
+    // Retry with the SAME token: must succeed now. If the repo had
+    // consumed the token on the failed first attempt (no transaction),
+    // this would return 400 invalid_or_expired_token.
+    const retry = await request(ctx.app)
+      .post('/auth/verify-email')
+      .send({ token });
+    expect(retry.status).toBe(200);
+    expect(retry.body.status).toBe('verified');
+
+    // And the account is actually created + verified.
+    const user = ctx.users.findByEmail('user@example.com');
+    expect(user).not.toBeNull();
+    expect(user.emailVerified).toBe(true);
+  });
+
+  test('POST /auth/change-password is atomic — failed session issue rolls back hash + revocation (Codex round-10 P2)', async () => {
+    // Atomicity invariant: if any write inside the password-rotation
+    // sequence throws, none of them stick. Verifiable via a real
+    // user: after a forced failure the old password must still work
+    // and any pre-existing session must still be valid.
+    const agent = request.agent(ctx.app);
+    await agent
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await agent.post('/auth/verify-email').send({ token });
+    const loginRes = await agent
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const csrf = extractCookies(loginRes).csrf;
+
+    // Establish a second, independent session that change-password
+    // SHOULD revoke on success. We'll later assert it's preserved
+    // because the change rolled back.
+    const otherAgent = request.agent(ctx.app);
+    await otherAgent
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const preRollbackOther = await otherAgent.get('/auth/me');
+    expect(preRollbackOther.status).toBe(200);
+
+    // Fail the *last* write in the transaction (sessions.issue). Per
+    // round-10 P2, updateAuthHash + revokeAllForUser must also roll back.
+    const originalIssue = ctx.sessions.issue;
+    let issueCalls = 0;
+    ctx.sessions.issue = (...args) => {
+      issueCalls += 1;
+      if (issueCalls === 1) {
+        throw new Error('sessions.issue failed mid-transaction');
+      }
+      return originalIssue.apply(ctx.sessions, args);
+    };
+
+    const NEW =
+      'c1d2e3f4c1d2e3f4c1d2e3f4c1d2e3f4c1d2e3f4c1d2e3f4c1d2e3f4c1d2e3f4';
+    await expectNoUnhandledRejection(async () => {
+      const res = await agent
+        .post('/auth/change-password')
+        .set('X-CSRF-Token', csrf)
+        .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: NEW });
+      expect(res.status).toBe(500);
+      expect(res.body.error).toBe('internal');
+    });
+
+    ctx.sessions.issue = originalIssue;
+
+    // Invariant A: stored_auth was NOT rotated. Old password still works;
+    // new password does not.
+    const oldStillWorks = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(oldStillWorks.status).toBe(200);
+    const newDoesntWork = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: NEW });
+    expect(newDoesntWork.status).toBe(401);
+
+    // Invariant B: the other session was NOT revoked.
+    const otherStillLive = await otherAgent.get('/auth/me');
+    expect(otherStillLive.status).toBe(200);
+  });
+
   test('POST /auth/change-password returns 500 when updateAuthHash throws post-verifyAuth (Codex round-9 P1)', async () => {
     // Full happy-path auth first.
     const agent = request.agent(ctx.app);

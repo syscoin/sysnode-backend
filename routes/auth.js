@@ -58,7 +58,11 @@ function createAuthRouter({
   baseUrl,
   frontendUrl,
   scheduler,
+  runAtomic,
 }) {
+  if (typeof runAtomic !== 'function') {
+    throw new Error('createAuthRouter: runAtomic is required');
+  }
   const router = express.Router();
 
   // The verification link must land on the frontend (which will POST the
@@ -186,69 +190,93 @@ function createAuthRouter({
     const parsed = VerifySchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_token');
 
-    const redeemed = pendingRegistrations.redeem(parsed.data.token);
-    if (!redeemed) return badRequest(res, 'invalid_or_expired_token');
-
-    const { email, storedAuth } = redeemed;
-
-    // Three cases to handle (in order):
-    //   (1) Users row exists and is already verified → 409 already_verified.
-    //   (2) Users row exists and is still unverified → promote it in
-    //       place, rebinding stored_auth to the just-redeemed pending
-    //       (Codex round-5 P1: migration 003 clears these at deploy,
-    //        but we also defend in code against any future regression
-    //        that might leak an unverified row back into the table).
-    //   (3) No users row → create verified from the redeemed snapshot.
-    //       Insert can still race against a concurrent verify-email for
-    //       the same email and lose on the UNIQUE(email) constraint; we
-    //       re-check and fall back to cases (1)/(2).
-    const existing = users.findByEmail(email);
-    if (existing && existing.emailVerified) {
-      pendingRegistrations.purgeForEmail(email);
-      return res.status(409).json({ error: 'already_verified' });
-    }
-    if (existing && !existing.emailVerified) {
-      const ok = users.promoteUnverifiedWithStoredAuth({
-        id: existing.id,
-        storedAuth,
-      });
-      if (!ok) {
-        // Race: row was concurrently flipped to verified. Treat as already
-        // verified to match case (1) above.
-        pendingRegistrations.purgeForEmail(email);
-        return res.status(409).json({ error: 'already_verified' });
-      }
-      pendingRegistrations.purgeForEmail(email);
-      return res.json({ status: 'verified' });
-    }
-
+    // Atomic redemption + account write (Codex round-10 P1).
+    //
+    // The old flow called pendingRegistrations.redeem() unconditionally
+    // up front, so any downstream DB failure (users.* throw, SQLite
+    // error) burned the user's token forever — they couldn't retry with
+    // their original link, and any other pending token for the same
+    // email stayed live as a latent account-takeover vector.
+    //
+    // Wrapping redeem + all subsequent writes in a single transaction
+    // means a throw at any step rolls back the redeem as well. The
+    // token stays valid for a legitimate retry, and purgeForEmail
+    // (which only fires on the success path) still wipes competing
+    // pendings after the account is successfully created/promoted.
+    //
+    // The body MUST be synchronous — better-sqlite3 transactions can't
+    // await. All repo calls here are synchronous prepared statements.
+    let outcome;
     try {
-      users.createVerifiedWithStoredAuth({ email, storedAuth });
-    } catch (err) {
-      if (err.code === 'email_taken') {
-        // Lost the UNIQUE(email) race to a concurrent verify-email on a
-        // different pending for the same address. Reload; the other
-        // redeem created a verified row, so fold into the already_verified
-        // response.
-        const after = users.findByEmail(email);
-        pendingRegistrations.purgeForEmail(email);
-        if (after && after.emailVerified) {
-          return res.status(409).json({ error: 'already_verified' });
+      outcome = runAtomic(() => {
+        const redeemed = pendingRegistrations.redeem(parsed.data.token);
+        if (!redeemed) return { kind: 'invalid_or_expired_token' };
+
+        const { email, storedAuth } = redeemed;
+
+        // Three cases to handle (in order):
+        //   (1) Users row exists and is already verified → 409.
+        //   (2) Users row exists and is still unverified → promote in
+        //       place (round-5 P1 defense against a regression that
+        //       re-introduces unverified rows; migration 003 wipes any
+        //       legacy ones at deploy).
+        //   (3) No users row → insert verified from the snapshot. Can
+        //       race another verify-email for the same email and lose
+        //       on UNIQUE(email); re-check in the email_taken branch.
+        const existing = users.findByEmail(email);
+        if (existing && existing.emailVerified) {
+          pendingRegistrations.purgeForEmail(email);
+          return { kind: 'already_verified' };
         }
-        // Extremely unlikely: email_taken without a verified row. Fail
-        // loud rather than silently drop the verify request.
-        // eslint-disable-next-line no-console
-        console.error('[auth/verify-email] email_taken without verified row');
-        return res.status(500).json({ error: 'internal' });
+        if (existing && !existing.emailVerified) {
+          const ok = users.promoteUnverifiedWithStoredAuth({
+            id: existing.id,
+            storedAuth,
+          });
+          pendingRegistrations.purgeForEmail(email);
+          return { kind: ok ? 'verified' : 'already_verified' };
+        }
+
+        try {
+          users.createVerifiedWithStoredAuth({ email, storedAuth });
+        } catch (err) {
+          if (err && err.code === 'email_taken') {
+            const after = users.findByEmail(email);
+            pendingRegistrations.purgeForEmail(email);
+            if (after && after.emailVerified) {
+              return { kind: 'already_verified' };
+            }
+            // Extremely unlikely (email_taken without a verified row).
+            // Re-throw to roll back the transaction.
+            throw err;
+          }
+          throw err;
+        }
+        pendingRegistrations.purgeForEmail(email);
+        return { kind: 'verified' };
+      });
+    } catch (err) {
+      if (err && err.code === 'invalid_email') {
+        return badRequest(res, 'invalid_email');
       }
-      if (err.code === 'invalid_email') return badRequest(res, 'invalid_email');
-      // eslint-disable-next-line no-console
-      console.error('[auth/verify-email]', err);
-      return res.status(500).json({ error: 'internal' });
+      // Any other throw rolled back the redeem — token is still live.
+      // Let asyncHandler route to the central error middleware.
+      throw err;
     }
 
-    pendingRegistrations.purgeForEmail(email);
-    return res.json({ status: 'verified' });
+    switch (outcome.kind) {
+      case 'invalid_or_expired_token':
+        return badRequest(res, 'invalid_or_expired_token');
+      case 'already_verified':
+        return res.status(409).json({ error: 'already_verified' });
+      case 'verified':
+        return res.json({ status: 'verified' });
+      default:
+        // Should be unreachable; defensive 500.
+        // eslint-disable-next-line no-console
+        console.error('[auth/verify-email] unknown outcome', outcome);
+        return res.status(500).json({ error: 'internal' });
+    }
   }));
 
   // -------------------------------------------------------------------------
@@ -355,16 +383,31 @@ function createAuthRouter({
       if (!confirmed) {
         return res.status(401).json({ error: 'invalid_credentials' });
       }
-      // These DB writes were previously unguarded; a transient SQLite
-      // error would reject the async handler promise and never respond.
-      // asyncHandler now forwards any rejection to the error middleware,
-      // which returns 500 instead of hanging the connection. (Codex
-      // round-9 P1 "Wrap password-change writes".)
-      users.updateAuthHash(req.user.id, parsed.data.newAuthHash);
-      sessions.revokeAllForUser(req.user.id);
-      const { token, expiresAt } = sessions.issue(req.user.id, {
-        userAgent: req.get('user-agent') || null,
-        ip: req.ip,
+      // Atomic rotation of auth state (Codex round-10 P2).
+      //
+      // Without a transaction, the three writes here could leave the
+      // account in torn states on mid-sequence failure:
+      //   (a) updateAuthHash succeeds, revokeAllForUser fails → user's
+      //       password rotated but old sessions on other devices are
+      //       still live (silent auth bypass window).
+      //   (b) both succeed, sessions.issue fails → every session
+      //       revoked including the current one, user gets 500 but is
+      //       silently signed out from everywhere.
+      // Wrapping in a transaction rolls all three back on any throw,
+      // so the only observable outcomes are "fully rotated" or "no
+      // change". The client can retry safely.
+      //
+      // Side-effect note: setSessionCookie + csrfMw.issueCookie live
+      // OUTSIDE the transaction (they only set response headers, no DB
+      // writes). They must run after the transaction commits, using the
+      // token/expiresAt produced inside.
+      const { token, expiresAt } = runAtomic(() => {
+        users.updateAuthHash(req.user.id, parsed.data.newAuthHash);
+        sessions.revokeAllForUser(req.user.id);
+        return sessions.issue(req.user.id, {
+          userAgent: req.get('user-agent') || null,
+          ip: req.ip,
+        });
       });
       sessionMw.setSessionCookie(res, token, expiresAt);
       csrfMw.issueCookie(res, expiresAt);
