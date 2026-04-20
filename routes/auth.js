@@ -241,7 +241,21 @@ function createAuthRouter({
   router.post('/login', limiters.login, async (req, res) => {
     const parsed = LoginSchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_body');
-    const user = users.verifyAuth(parsed.data.email, parsed.data.authHash);
+    let user;
+    try {
+      user = users.verifyAuth(parsed.data.email, parsed.data.authHash);
+    } catch (err) {
+      // Config errors (e.g. missing SYSNODE_AUTH_PEPPER) propagate out of
+      // users.verifyAuth → kdf.verifyAuthHash. Surface as 503 so ops alerts
+      // fire loudly instead of masquerading as a bad password. (Codex
+      // round-7 P1.)
+      if (err && err.code === 'kdf_config') {
+        // eslint-disable-next-line no-console
+        console.error('[auth/login] kdf config error', err.message);
+        return res.status(503).json({ error: 'server_misconfigured' });
+      }
+      throw err;
+    }
     if (!user) {
       return res.status(401).json({ error: 'invalid_credentials' });
     }
@@ -298,10 +312,20 @@ function createAuthRouter({
     async (req, res) => {
       const parsed = ChangePasswordSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
-      const confirmed = users.verifyAuth(
-        req.user.email,
-        parsed.data.oldAuthHash
-      );
+      let confirmed;
+      try {
+        confirmed = users.verifyAuth(
+          req.user.email,
+          parsed.data.oldAuthHash
+        );
+      } catch (err) {
+        if (err && err.code === 'kdf_config') {
+          // eslint-disable-next-line no-console
+          console.error('[auth/change-password] kdf config error', err.message);
+          return res.status(503).json({ error: 'server_misconfigured' });
+        }
+        throw err;
+      }
       if (!confirmed) {
         return res.status(401).json({ error: 'invalid_credentials' });
       }

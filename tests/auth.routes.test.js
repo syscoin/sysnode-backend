@@ -340,6 +340,39 @@ describe('auth routes', () => {
     expect(ctx.mailer.outbox.length).toBe(outboxBefore);
   });
 
+  test('POST /auth/login returns 503 server_misconfigured when the KDF pepper is missing (Codex round-7 P1)', async () => {
+    // Happy-path setup: register + verify a real account using the
+    // correctly-configured pepper.
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await request(ctx.app).post('/auth/verify-email').send({ token });
+
+    // Now simulate ops losing/unsetting the pepper: drop the env var,
+    // bounce the pepper cache, and flip to production mode so
+    // loadPepper refuses the dev fallback.
+    const { _resetPepperForTests } = require('../lib/kdf');
+    const originalPepper = process.env.SYSNODE_AUTH_PEPPER;
+    delete process.env.SYSNODE_AUTH_PEPPER;
+    process.env.NODE_ENV = 'production';
+    _resetPepperForTests();
+
+    try {
+      const res = await request(ctx.app)
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      // Critical assertion: NOT 401. The response must clearly flag
+      // server misconfiguration so alerting catches it.
+      expect(res.status).toBe(503);
+      expect(res.body.error).toBe('server_misconfigured');
+    } finally {
+      process.env.SYSNODE_AUTH_PEPPER = originalPepper;
+      process.env.NODE_ENV = 'test';
+      _resetPepperForTests();
+    }
+  });
+
   test('POST /auth/register fails fast (5xx) when pending-row issuance throws (Codex round-6 P1)', async () => {
     // Simulate a configuration failure (e.g. missing pepper) by making
     // pendingRegistrations.issue throw. The response must NOT be 202 —

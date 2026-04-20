@@ -21,6 +21,7 @@ const mnSearchRoute = require('./routes/mnSearch');
 const { openDatabase } = require('./lib/db');
 const { createMailer } = require('./lib/mailer');
 const { selectMailTransport } = require('./lib/mailTransport');
+const { assertPepperConfigured } = require('./lib/kdf');
 const {
   buildServices,
   finalizeSessionMw,
@@ -79,8 +80,11 @@ app.use((req, res, next) => {
 const dbPath = process.env.SYSNODE_DB_PATH || './data/sysnode.db';
 const db = openDatabase(dbPath);
 
-// Fail-fast transport selection. See lib/mailTransport.js for the full
-// rationale (Codex round-6 P1).
+// Boot-time config sanity checks. These throw synchronously so a
+// misconfigured deploy crashes on startup rather than silently turning
+// every login into a 401 (Codex round-7 P1 on pepper) or dropping mail
+// to stdout (Codex round-6 P1 on SMTP).
+assertPepperConfigured();
 const mailer = createMailer({
   transport: selectMailTransport(),
   from: process.env.MAIL_FROM || 'no-reply@syscoin.dev',
