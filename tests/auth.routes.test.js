@@ -134,6 +134,47 @@ describe('auth routes', () => {
     expect(res.status).toBe(401);
   });
 
+  test('authenticated requests refresh sid + csrf cookie expiries (sliding window)', async () => {
+    // Codex P2: sessions.verify() extends expires_at in the DB on each
+    // request, but earlier the sid cookie was only set at login time, so
+    // the browser dropped it at the original expiry and the user was
+    // silently logged out mid-session. Every authenticated request must
+    // now emit fresh Set-Cookie headers with the new expiry.
+    const agent = require('supertest').agent(ctx.app);
+    await agent
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await agent.post('/auth/verify-email').send({ token });
+    const loginRes = await agent
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const originalCsrf = extractCookies(loginRes).csrf;
+
+    const me = await agent.get('/auth/me');
+    expect(me.status).toBe(200);
+    const refreshed = me.headers['set-cookie'] || [];
+    const sidCookie = refreshed.find((c) => c.startsWith('sid='));
+    const csrfCookie = refreshed.find((c) => c.startsWith('csrf='));
+    expect(sidCookie).toBeDefined();
+    expect(csrfCookie).toBeDefined();
+    // Both carry an Expires attribute (sliding window, not a session
+    // cookie that dies on browser close).
+    expect(sidCookie).toMatch(/Expires=/i);
+    expect(csrfCookie).toMatch(/Expires=/i);
+    // CSRF token VALUE must be preserved so the SPA's in-memory mirror
+    // keeps working; only the expiry moves.
+    const csrfMap = extractCookies(me);
+    expect(csrfMap.csrf).toBe(originalCsrf);
+  });
+
+  test('unauthenticated requests do NOT emit a sid cookie refresh', async () => {
+    const res = await request(ctx.app).get('/auth/me');
+    expect(res.status).toBe(401);
+    const setCookies = res.headers['set-cookie'] || [];
+    expect(setCookies.some((c) => c.startsWith('sid='))).toBe(false);
+  });
+
   test('GET /auth/me returns user when authenticated', async () => {
     const agent = request.agent(ctx.app);
     await agent
