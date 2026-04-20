@@ -31,6 +31,22 @@ function badRequest(res, code, details) {
     .json(details ? { error: code, details } : { error: code });
 }
 
+// Express 4 quirk: returned promises from `async` route handlers are NOT
+// routed through the app's error middleware. A bare `throw` inside an
+// async handler becomes an unhandled rejection and can crash the process.
+//
+// This wrapper forces every rejection onto `next(err)`, which then hits
+// the last-chance error middleware mounted in `lib/appFactory.js`. It
+// means individual handlers can let transient DB/SMTP errors bubble
+// without wrapping every write in try/catch, while the wire response is
+// still a controlled 500 instead of a connection hang.
+// (Codex round-9 P1 — covers /verify-email, /login post-verify path,
+// and /change-password post-verify writes.)
+function asyncHandler(fn) {
+  return (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
+}
+
 function createAuthRouter({
   users,
   sessions,
@@ -105,7 +121,7 @@ function createAuthRouter({
   //   motivated Round 4 (seconds-scale cost of Argon2 / SMTP in the
   //   critical path) is gone either way.
   // -------------------------------------------------------------------------
-  router.post('/register', limiters.register, async (req, res) => {
+  router.post('/register', limiters.register, asyncHandler(async (req, res) => {
     const parsed = RegisterSchema.safeParse(req.body);
     if (!parsed.success) {
       return badRequest(res, 'invalid_body', parsed.error.flatten());
@@ -156,7 +172,7 @@ function createAuthRouter({
     }
 
     return res.status(202).json({ status: 'verification_sent' });
-  });
+  }));
 
   // -------------------------------------------------------------------------
   // POST /auth/verify-email
@@ -166,7 +182,7 @@ function createAuthRouter({
   // email (another pending for the same email verified first), we surface
   // 409 and purge remaining pendings so attacker-spawned tokens die.
   // -------------------------------------------------------------------------
-  router.post('/verify-email', async (req, res) => {
+  router.post('/verify-email', asyncHandler(async (req, res) => {
     const parsed = VerifySchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_token');
 
@@ -233,12 +249,12 @@ function createAuthRouter({
 
     pendingRegistrations.purgeForEmail(email);
     return res.json({ status: 'verified' });
-  });
+  }));
 
   // -------------------------------------------------------------------------
   // POST /auth/login
   // -------------------------------------------------------------------------
-  router.post('/login', limiters.login, async (req, res) => {
+  router.post('/login', limiters.login, asyncHandler(async (req, res) => {
     const parsed = LoginSchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_body');
     let user;
@@ -254,14 +270,10 @@ function createAuthRouter({
         console.error('[auth/login] kdf config error', err.message);
         return res.status(503).json({ error: 'server_misconfigured' });
       }
-      // Any other exception (transient DB error, etc.) MUST NOT be
-      // re-thrown from an async handler: Express 4 doesn't route
-      // rejected handler promises through the error pipeline, so a
-      // throw here would become an unhandled rejection that can crash
-      // the process. Log + 500 instead. (Codex round-9 P1.)
-      // eslint-disable-next-line no-console
-      console.error('[auth/login] unexpected error', err);
-      return res.status(500).json({ error: 'internal' });
+      // Any other failure in verifyAuth (transient DB, etc.) is not a
+      // credential mismatch. Let it bubble so asyncHandler routes it
+      // through our central error middleware → 500. (Codex round-9 P1.)
+      throw err;
     }
     if (!user) {
       return res.status(401).json({ error: 'invalid_credentials' });
@@ -269,6 +281,11 @@ function createAuthRouter({
     if (!user.emailVerified) {
       return res.status(403).json({ error: 'email_not_verified' });
     }
+    // sessions.issue / setSessionCookie / issueCookie may also throw on
+    // transient DB failures. They ran unprotected before (Codex round-9
+    // P1 "Guard login session creation"); asyncHandler now forwards any
+    // rejection to the error middleware instead of producing an
+    // unhandled promise rejection.
     const { token, expiresAt } = sessions.issue(user.id, {
       userAgent: req.get('user-agent') || null,
       ip: req.ip,
@@ -279,7 +296,7 @@ function createAuthRouter({
       user: { id: user.id, email: user.email },
       expiresAt,
     });
-  });
+  }));
 
   // -------------------------------------------------------------------------
   // POST /auth/logout
@@ -316,7 +333,7 @@ function createAuthRouter({
     '/change-password',
     sessionMw.requireAuth,
     csrfMw.require,
-    async (req, res) => {
+    asyncHandler(async (req, res) => {
       const parsed = ChangePasswordSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
       let confirmed;
@@ -331,20 +348,20 @@ function createAuthRouter({
           console.error('[auth/change-password] kdf config error', err.message);
           return res.status(503).json({ error: 'server_misconfigured' });
         }
-        // Express 4 doesn't auto-route rejected async handler promises
-        // through error middleware — rethrowing here would leak an
-        // unhandled rejection and may crash the process. Respond 500
-        // explicitly. (Codex round-9 P1.)
-        // eslint-disable-next-line no-console
-        console.error('[auth/change-password] unexpected error', err);
-        return res.status(500).json({ error: 'internal' });
+        // Non-config failures bubble through asyncHandler → error mw.
+        // (Codex round-9 P1.)
+        throw err;
       }
       if (!confirmed) {
         return res.status(401).json({ error: 'invalid_credentials' });
       }
+      // These DB writes were previously unguarded; a transient SQLite
+      // error would reject the async handler promise and never respond.
+      // asyncHandler now forwards any rejection to the error middleware,
+      // which returns 500 instead of hanging the connection. (Codex
+      // round-9 P1 "Wrap password-change writes".)
       users.updateAuthHash(req.user.id, parsed.data.newAuthHash);
       sessions.revokeAllForUser(req.user.id);
-      // Re-issue a fresh session for the current request.
       const { token, expiresAt } = sessions.issue(req.user.id, {
         userAgent: req.get('user-agent') || null,
         ip: req.ip,
@@ -357,11 +374,13 @@ function createAuthRouter({
           when: Date.now(),
         });
       } catch (err) {
+        // Password change itself succeeded; notification mail is
+        // best-effort. Swallow and log.
         // eslint-disable-next-line no-console
         console.error('[auth/change-password] mail failed', err && err.message);
       }
       return res.json({ status: 'ok', expiresAt });
-    }
+    })
   );
 
   return router;

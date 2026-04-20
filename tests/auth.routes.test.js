@@ -340,34 +340,123 @@ describe('auth routes', () => {
     expect(ctx.mailer.outbox.length).toBe(outboxBefore);
   });
 
-  test('POST /auth/login returns 500 (not unhandled rejection) when users.verifyAuth throws unexpectedly (Codex round-9 P1)', async () => {
-    // Simulate a transient DB/driver failure inside users.verifyAuth.
-    // Under Express 4, an async-handler `throw` becomes an unhandled
-    // rejection; we've replaced it with an explicit 500 response.
-    // Assertion: the client sees a controlled 5xx rather than a
-    // connection hang, and no unhandledRejection event fires.
-    const original = ctx.users.verifyAuth;
-    ctx.users.verifyAuth = () => {
-      throw new Error('db connection lost');
-    };
+  // -----------------------------------------------------------------------
+  // Codex round-9 P1 coverage: async-handler rejections must not produce
+  // unhandled promise rejections; every post-parse throw from a repo or
+  // middleware must bubble to a controlled 500 response via asyncHandler
+  // + the app-level error middleware.
+  //
+  // Covers the three handlers Codex specifically flagged:
+  //   • /verify-email (the whole body ran with no try/catch)
+  //   • /login post-verifyAuth (sessions.issue / cookie writes)
+  //   • /change-password post-verifyAuth (updateAuthHash, revoke, issue)
+  // -----------------------------------------------------------------------
+  async function expectNoUnhandledRejection(run) {
     const unhandled = jest.fn();
     process.on('unhandledRejection', unhandled);
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-
     try {
-      const res = await request(ctx.app)
-        .post('/auth/login')
-        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
-      expect(res.status).toBe(500);
-      expect(res.body.error).toBe('internal');
-
-      // Give any deferred rejection a tick to fire.
+      await run();
+      // Give any deferred microtask a chance to fire.
       await new Promise((r) => setImmediate(r));
       expect(unhandled).not.toHaveBeenCalled();
     } finally {
       process.off('unhandledRejection', unhandled);
       errSpy.mockRestore();
+    }
+  }
+
+  test('POST /auth/login returns 500 when users.verifyAuth throws unexpectedly (Codex round-9 P1)', async () => {
+    const original = ctx.users.verifyAuth;
+    ctx.users.verifyAuth = () => {
+      throw new Error('db connection lost');
+    };
+    try {
+      await expectNoUnhandledRejection(async () => {
+        const res = await request(ctx.app)
+          .post('/auth/login')
+          .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      });
+    } finally {
       ctx.users.verifyAuth = original;
+    }
+  });
+
+  test('POST /auth/login returns 500 when sessions.issue throws after successful verifyAuth (Codex round-9 P1)', async () => {
+    // Set up a real verified account so verifyAuth succeeds.
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await request(ctx.app).post('/auth/verify-email').send({ token });
+
+    const original = ctx.sessions.issue;
+    ctx.sessions.issue = () => {
+      throw new Error('sessions table write failed');
+    };
+    try {
+      await expectNoUnhandledRejection(async () => {
+        const res = await request(ctx.app)
+          .post('/auth/login')
+          .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      });
+    } finally {
+      ctx.sessions.issue = original;
+    }
+  });
+
+  test('POST /auth/verify-email returns 500 when the pending-registrations repo throws (Codex round-9 P1)', async () => {
+    const original = ctx.pendingRegistrations.redeem;
+    ctx.pendingRegistrations.redeem = () => {
+      throw new Error('redeem exploded');
+    };
+    try {
+      await expectNoUnhandledRejection(async () => {
+        const res = await request(ctx.app)
+          .post('/auth/verify-email')
+          .send({ token: 'a'.repeat(64) });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      });
+    } finally {
+      ctx.pendingRegistrations.redeem = original;
+    }
+  });
+
+  test('POST /auth/change-password returns 500 when updateAuthHash throws post-verifyAuth (Codex round-9 P1)', async () => {
+    // Full happy-path auth first.
+    const agent = request.agent(ctx.app);
+    await agent
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await agent.post('/auth/verify-email').send({ token });
+    const loginRes = await agent
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const csrf = extractCookies(loginRes).csrf;
+
+    const original = ctx.users.updateAuthHash;
+    ctx.users.updateAuthHash = () => {
+      throw new Error('updateAuthHash failed');
+    };
+    const NEW =
+      'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+    try {
+      await expectNoUnhandledRejection(async () => {
+        const res = await agent
+          .post('/auth/change-password')
+          .set('X-CSRF-Token', csrf)
+          .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: NEW });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      });
+    } finally {
+      ctx.users.updateAuthHash = original;
     }
   });
 
