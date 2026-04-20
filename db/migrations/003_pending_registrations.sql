@@ -34,3 +34,18 @@ CREATE INDEX IF NOT EXISTS idx_pending_registrations_email
 
 CREATE INDEX IF NOT EXISTS idx_pending_registrations_expires
   ON pending_registrations(expires_at);
+
+-- One-time backfill: the pre-deferred /auth/register flow inserted users
+-- rows with email_verified = 0 before email ownership was proven. Those
+-- rows are untrusted (their stored_auth belongs to "whoever submitted
+-- /register last" for that email, not to a verified account owner) AND,
+-- under the new flow, they become permanently stranded: verify-email
+-- no longer touches pre-existing rows, so the affected user could never
+-- complete email verification without manual DB surgery. (Codex round-5
+-- P1 in syscoin/sysnode-backend#2.)
+--
+-- We delete them here. Any user whose verification was in-flight at
+-- deploy time simply re-registers — no data is lost (the account never
+-- had verified credentials to begin with). Rows with email_verified = 1
+-- are preserved untouched.
+DELETE FROM users WHERE email_verified = 0;

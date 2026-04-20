@@ -340,6 +340,49 @@ describe('auth routes', () => {
     expect(ctx.mailer.outbox.length).toBe(outboxBefore);
   });
 
+  test('verify-email rotates a legacy unverified users row in place (Codex round-5 P1)', async () => {
+    // Migration 003 wipes pre-existing email_verified=0 rows at deploy,
+    // but the code must also handle the case defensively (e.g. a future
+    // regression re-introduces one, or a race around migration time).
+    //
+    // Here we directly insert a legacy unverified row with SOME stored
+    // auth (could be attacker's, victim's, doesn't matter — the
+    // pre-deferred flow never proved ownership). Then we drive a
+    // normal /register → click link flow and confirm:
+    //   - verify-email succeeds with 200 verified,
+    //   - the row's stored_auth is rotated to the one submitted via
+    //     the just-redeemed pending,
+    //   - login works with the NEW authHash, not the legacy one.
+    const LEGACY_AUTH =
+      'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3';
+    ctx.users.create({ email: 'legacy@example.com', authHash: LEGACY_AUTH });
+    // sanity: the legacy row is unverified and bound to LEGACY_AUTH.
+    expect(ctx.users.findByEmail('legacy@example.com').emailVerified).toBe(false);
+
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'legacy@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    const verify = await request(ctx.app)
+      .post('/auth/verify-email')
+      .send({ token });
+    expect(verify.status).toBe(200);
+    expect(verify.body.status).toBe('verified');
+
+    const row = ctx.users.findByEmail('legacy@example.com');
+    expect(row.emailVerified).toBe(true);
+
+    const goodLogin = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'legacy@example.com', authHash: SAMPLE_AUTH });
+    expect(goodLogin.status).toBe(200);
+
+    const legacyLogin = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'legacy@example.com', authHash: LEGACY_AUTH });
+    expect(legacyLogin.status).toBe(401);
+  });
+
   test('deferred binding: attacker-issued token cannot bind to a later victim account', async () => {
     // The core threat that motivated moving to pending_registrations.
     // 1. Attacker pre-registers with victim@example.com + attacker's authHash.

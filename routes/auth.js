@@ -146,22 +146,56 @@ function createAuthRouter({
     if (!redeemed) return badRequest(res, 'invalid_or_expired_token');
 
     const { email, storedAuth } = redeemed;
+
+    // Three cases to handle (in order):
+    //   (1) Users row exists and is already verified → 409 already_verified.
+    //   (2) Users row exists and is still unverified → promote it in
+    //       place, rebinding stored_auth to the just-redeemed pending
+    //       (Codex round-5 P1: migration 003 clears these at deploy,
+    //        but we also defend in code against any future regression
+    //        that might leak an unverified row back into the table).
+    //   (3) No users row → create verified from the redeemed snapshot.
+    //       Insert can still race against a concurrent verify-email for
+    //       the same email and lose on the UNIQUE(email) constraint; we
+    //       re-check and fall back to cases (1)/(2).
     const existing = users.findByEmail(email);
     if (existing && existing.emailVerified) {
-      // Another pending for this email already verified. Wipe any
-      // remaining pendings so stale tokens — including attacker-spawned
-      // ones — can't linger.
       pendingRegistrations.purgeForEmail(email);
       return res.status(409).json({ error: 'already_verified' });
+    }
+    if (existing && !existing.emailVerified) {
+      const ok = users.promoteUnverifiedWithStoredAuth({
+        id: existing.id,
+        storedAuth,
+      });
+      if (!ok) {
+        // Race: row was concurrently flipped to verified. Treat as already
+        // verified to match case (1) above.
+        pendingRegistrations.purgeForEmail(email);
+        return res.status(409).json({ error: 'already_verified' });
+      }
+      pendingRegistrations.purgeForEmail(email);
+      return res.json({ status: 'verified' });
     }
 
     try {
       users.createVerifiedWithStoredAuth({ email, storedAuth });
     } catch (err) {
       if (err.code === 'email_taken') {
-        // Lost the race to another concurrent verify for the same email.
+        // Lost the UNIQUE(email) race to a concurrent verify-email on a
+        // different pending for the same address. Reload; the other
+        // redeem created a verified row, so fold into the already_verified
+        // response.
+        const after = users.findByEmail(email);
         pendingRegistrations.purgeForEmail(email);
-        return res.status(409).json({ error: 'already_verified' });
+        if (after && after.emailVerified) {
+          return res.status(409).json({ error: 'already_verified' });
+        }
+        // Extremely unlikely: email_taken without a verified row. Fail
+        // loud rather than silently drop the verify request.
+        // eslint-disable-next-line no-console
+        console.error('[auth/verify-email] email_taken without verified row');
+        return res.status(500).json({ error: 'internal' });
       }
       if (err.code === 'invalid_email') return badRequest(res, 'invalid_email');
       // eslint-disable-next-line no-console
@@ -169,9 +203,6 @@ function createAuthRouter({
       return res.status(500).json({ error: 'internal' });
     }
 
-    // Success: purge every other pending for this email so no other token
-    // (including an attacker-spawned one that would bind a different
-    // stored_auth) can ever be redeemed against this now-verified account.
     pendingRegistrations.purgeForEmail(email);
     return res.json({ status: 'verified' });
   });
