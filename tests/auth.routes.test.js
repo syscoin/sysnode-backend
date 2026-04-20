@@ -340,6 +340,37 @@ describe('auth routes', () => {
     expect(ctx.mailer.outbox.length).toBe(outboxBefore);
   });
 
+  test('POST /auth/login returns 500 (not unhandled rejection) when users.verifyAuth throws unexpectedly (Codex round-9 P1)', async () => {
+    // Simulate a transient DB/driver failure inside users.verifyAuth.
+    // Under Express 4, an async-handler `throw` becomes an unhandled
+    // rejection; we've replaced it with an explicit 500 response.
+    // Assertion: the client sees a controlled 5xx rather than a
+    // connection hang, and no unhandledRejection event fires.
+    const original = ctx.users.verifyAuth;
+    ctx.users.verifyAuth = () => {
+      throw new Error('db connection lost');
+    };
+    const unhandled = jest.fn();
+    process.on('unhandledRejection', unhandled);
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const res = await request(ctx.app)
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      expect(res.status).toBe(500);
+      expect(res.body.error).toBe('internal');
+
+      // Give any deferred rejection a tick to fire.
+      await new Promise((r) => setImmediate(r));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off('unhandledRejection', unhandled);
+      errSpy.mockRestore();
+      ctx.users.verifyAuth = original;
+    }
+  });
+
   test('POST /auth/login returns 503 server_misconfigured when the KDF pepper is missing (Codex round-7 P1)', async () => {
     // Happy-path setup: register + verify a real account using the
     // correctly-configured pepper.

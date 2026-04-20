@@ -254,7 +254,14 @@ function createAuthRouter({
         console.error('[auth/login] kdf config error', err.message);
         return res.status(503).json({ error: 'server_misconfigured' });
       }
-      throw err;
+      // Any other exception (transient DB error, etc.) MUST NOT be
+      // re-thrown from an async handler: Express 4 doesn't route
+      // rejected handler promises through the error pipeline, so a
+      // throw here would become an unhandled rejection that can crash
+      // the process. Log + 500 instead. (Codex round-9 P1.)
+      // eslint-disable-next-line no-console
+      console.error('[auth/login] unexpected error', err);
+      return res.status(500).json({ error: 'internal' });
     }
     if (!user) {
       return res.status(401).json({ error: 'invalid_credentials' });
@@ -324,7 +331,13 @@ function createAuthRouter({
           console.error('[auth/change-password] kdf config error', err.message);
           return res.status(503).json({ error: 'server_misconfigured' });
         }
-        throw err;
+        // Express 4 doesn't auto-route rejected async handler promises
+        // through error middleware — rethrowing here would leak an
+        // unhandled rejection and may crash the process. Respond 500
+        // explicitly. (Codex round-9 P1.)
+        // eslint-disable-next-line no-console
+        console.error('[auth/change-password] unexpected error', err);
+        return res.status(500).json({ error: 'internal' });
       }
       if (!confirmed) {
         return res.status(401).json({ error: 'invalid_credentials' });
