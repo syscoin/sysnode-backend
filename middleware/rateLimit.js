@@ -1,0 +1,68 @@
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
+const { normalizeEmail } = require('../lib/email');
+
+// Per-route limiters for authentication endpoints.
+// In-memory store is fine for single-process; switch to a shared store (Redis
+// etc.) if we move to multi-process in the future.
+//
+// Email-bucketed keys MUST use the same normalization as `users.verifyAuth`
+// (`normalizeEmail`: NFKC + trim + lowercase). Otherwise an attacker can
+// bypass the bucket by submitting canonical-equivalent variants (trailing
+// whitespace, different Unicode normalization, mixed case) while still hitting
+// the same account downstream.
+//
+// IP-bucketed keys MUST go through `ipKeyGenerator` rather than using raw
+// `req.ip`. For IPv4 it's a no-op, but for IPv6 it masks down to the /56
+// subnet so a single /64 (or smaller) allocation can't trivially rotate
+// addresses to bypass the limit.
+
+const MINUTE = 60 * 1000;
+
+function ipBucket(req) {
+  return ipKeyGenerator(req.ip || '');
+}
+
+function loginKey(req) {
+  const raw = (req.body && req.body.email) || '';
+  return `login|${ipBucket(req)}|${normalizeEmail(raw)}`;
+}
+
+function registerKey(req) {
+  return `register|${ipBucket(req)}`;
+}
+
+function loginLimiter() {
+  return rateLimit({
+    windowMs: 15 * MINUTE,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: loginKey,
+    message: { error: 'too_many_attempts' },
+  });
+}
+
+function registerLimiter() {
+  return rateLimit({
+    windowMs: 60 * MINUTE,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: registerKey,
+    message: { error: 'too_many_registrations' },
+  });
+}
+
+function disabled() {
+  return (_req, _res, next) => next();
+}
+
+module.exports = {
+  loginLimiter,
+  registerLimiter,
+  disabled,
+  // Exported for direct unit testing.
+  loginKey,
+  registerKey,
+};
