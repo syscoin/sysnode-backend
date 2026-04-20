@@ -108,13 +108,22 @@ app.use(mnSearchRoute);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Housekeeping: expire stale sessions once per hour.
+// Housekeeping: expire stale sessions + pending-registration tokens once
+// per hour. pending_registrations is bounded by TTL (default 30m) so the
+// sweep is mostly defensive — it caps table growth if the router is ever
+// spammed faster than natural expiry + redeem-on-use can drain it.
 setInterval(() => {
   try {
     services.sessions.cleanupExpired();
   } catch (err) {
     // eslint-disable-next-line no-console
     console.error('[sessions.cleanup]', err && err.message);
+  }
+  try {
+    services.pendingRegistrations.cleanupExpired();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[pendingRegistrations.cleanup]', err && err.message);
   }
 }, 60 * 60 * 1000).unref();
 

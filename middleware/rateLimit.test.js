@@ -1,6 +1,5 @@
 const {
   loginKey,
-  resendKey,
   registerKey,
 } = require('./rateLimit');
 
@@ -44,15 +43,6 @@ describe('rate-limit key generators', () => {
       expect(loginKey({ ip: '1.2.3.4', body: {} })).toMatch(
         /^login\|1\.2\.3\.4\|$/
       );
-    });
-  });
-
-  describe('resendKey', () => {
-    test('uses normalized email only (IP-independent)', () => {
-      const a = resendKey(mk({ email: 'User@Example.com' }, '1.2.3.4'));
-      const b = resendKey(mk({ email: 'user@example.com' }, '5.6.7.8'));
-      expect(a).toBe(b);
-      expect(a).toMatch(/^resend\|user@example\.com$/);
     });
   });
 

@@ -60,16 +60,22 @@ describe('auth routes', () => {
     expect(res.body.error).toBe('invalid_email');
   });
 
-  test('POST /auth/register returns 202 for duplicate emails (no enumeration)', async () => {
-    await request(ctx.app)
+  test('POST /auth/register returns 202 for duplicate (unverified) emails with no enumeration signal', async () => {
+    // Under deferred binding we happily issue a fresh pending row +
+    // email each /register for an unverified email (so clicking the
+    // latest link always works). The non-enumeration guarantee is that
+    // the HTTP response — status, body shape, latency — is
+    // indistinguishable from the first-time case. See the separate
+    // "already verified" test below for the silent branch.
+    const a = await request(ctx.app)
       .post('/auth/register')
       .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
-    const second = await request(ctx.app)
+    const b = await request(ctx.app)
       .post('/auth/register')
       .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
-    expect(second.status).toBe(202);
-    // Only the first registration sends an email; duplicate path is silent.
-    expect(ctx.mailer.outbox).toHaveLength(1);
+    expect(a.status).toBe(202);
+    expect(b.status).toBe(202);
+    expect(a.body).toEqual(b.body);
   });
 
   test('POST /auth/verify-email flips emailVerified; token is single-use', async () => {
@@ -90,15 +96,21 @@ describe('auth routes', () => {
     expect(second.status).toBe(400);
   });
 
-  test('POST /auth/login fails before email is verified', async () => {
+  test('POST /auth/login fails before email is verified (no user row exists pre-verification)', async () => {
+    // Deferred credential binding: /register writes to pending_registrations,
+    // NOT the users table, so login before clicking the verification link
+    // can't match any account and returns invalid_credentials (401). The
+    // email_not_verified (403) path is reserved for the legacy case where
+    // an unverified user row somehow exists (still covered by the users
+    // repo directly).
     await request(ctx.app)
       .post('/auth/register')
       .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
     const res = await request(ctx.app)
       .post('/auth/login')
       .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
-    expect(res.status).toBe(403);
-    expect(res.body.error).toBe('email_not_verified');
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe('invalid_credentials');
   });
 
   test('POST /auth/login after verify issues sid + csrf cookies and returns user', async () => {
@@ -280,23 +292,98 @@ describe('auth routes', () => {
     expect(res.status).toBe(401);
   });
 
-  test('POST /auth/resend-verification is silent for unknown emails', async () => {
+  test('POST /auth/resend-verification no longer exists — /register is the idempotent resend path', async () => {
+    // Codex P2: the old /resend-verification endpoint branched on "does a
+    // user row exist?" and thereby leaked account existence via response
+    // timing. We removed it entirely. A client that needs a fresh link
+    // just re-POSTs /register with the same credentials; the server
+    // responds 202 in constant time whether the account is new,
+    // pending, or already verified.
     const res = await request(ctx.app)
       .post('/auth/resend-verification')
-      .send({ email: 'ghost@example.com' });
-    expect(res.status).toBe(202);
-    expect(ctx.mailer.outbox).toHaveLength(0);
+      .send({ email: 'user@example.com' });
+    expect(res.status).toBe(404);
   });
 
-  test('POST /auth/resend-verification re-sends when user exists and is unverified', async () => {
+  test('/register acts as the resend path for unverified emails', async () => {
     await request(ctx.app)
       .post('/auth/register')
       .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
     expect(ctx.mailer.outbox).toHaveLength(1);
-    const res = await request(ctx.app)
-      .post('/auth/resend-verification')
-      .send({ email: 'user@example.com' });
-    expect(res.status).toBe(202);
+    const again = await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(again.status).toBe(202);
+    // A second pending row was issued with its own token, so a second
+    // email fires. The previously-issued token is still valid (until
+    // purge-on-verify wipes it), but in practice each send gives the user
+    // a fresh working link.
     expect(ctx.mailer.outbox).toHaveLength(2);
+  });
+
+  test('/register is silent (no email sent) when the account is already verified', async () => {
+    // Deferred binding: once an email is verified, /register must NOT send
+    // another verification email to the real account owner, to avoid
+    // confusion and to close off a notification-spam vector. The request
+    // still returns 202 to preserve timing indistinguishability.
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await request(ctx.app).post('/auth/verify-email').send({ token });
+    const outboxBefore = ctx.mailer.outbox.length;
+
+    const res = await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(res.status).toBe(202);
+    expect(ctx.mailer.outbox.length).toBe(outboxBefore);
+  });
+
+  test('deferred binding: attacker-issued token cannot bind to a later victim account', async () => {
+    // The core threat that motivated moving to pending_registrations.
+    // 1. Attacker pre-registers with victim@example.com + attacker's authHash.
+    // 2. Victim later registers the same email with their own authHash.
+    // 3. Victim clicks the link in the email they just received.
+    // 4. The account must end up bound to the VICTIM's authHash, and the
+    //    attacker's pre-issued token must become dead on verify.
+    const ATTACKER = 'deadbeef'.repeat(8);
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: ATTACKER });
+    const attackerToken = ctx.mailer.outbox[0].html.match(
+      /token=([0-9a-f]{64})/
+    )[1];
+
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const victimToken = ctx.mailer.outbox[1].html.match(
+      /token=([0-9a-f]{64})/
+    )[1];
+    expect(victimToken).not.toBe(attackerToken);
+
+    const verify = await request(ctx.app)
+      .post('/auth/verify-email')
+      .send({ token: victimToken });
+    expect(verify.status).toBe(200);
+
+    // Victim can log in with their own authHash.
+    const goodLogin = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(goodLogin.status).toBe(200);
+
+    // Attacker's authHash no longer works.
+    const badLogin = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: ATTACKER });
+    expect(badLogin.status).toBe(401);
+
+    // And the attacker's token is dead (purged by purgeForEmail on verify).
+    const attackerRedeem = await request(ctx.app)
+      .post('/auth/verify-email')
+      .send({ token: attackerToken });
+    expect(attackerRedeem.status).toBe(400);
   });
 });

@@ -1,5 +1,6 @@
 const express = require('express');
 const { z } = require('zod');
+const { normalizeEmail, isValidEmailSyntax } = require('../lib/email');
 
 // Shape of client-provided data. authHash is the 32-byte HKDF output in hex
 // produced by the client from PBKDF2-SHA512(password, email, 600k). The server
@@ -24,10 +25,6 @@ const VerifySchema = z.object({
   token: z.string().regex(/^[0-9a-f]{64}$/),
 });
 
-const ResendSchema = z.object({
-  email: EMAIL_SCHEMA,
-});
-
 function badRequest(res, code, details) {
   return res
     .status(400)
@@ -37,13 +34,14 @@ function badRequest(res, code, details) {
 function createAuthRouter({
   users,
   sessions,
-  verifications,
+  pendingRegistrations,
   mailer,
   sessionMw,
   csrfMw,
   limiters,
   baseUrl,
   frontendUrl,
+  scheduler,
 }) {
   const router = express.Router();
 
@@ -53,76 +51,128 @@ function createAuthRouter({
   // when the user clicks from their mail client.
   const verifyBase = (frontendUrl || baseUrl).replace(/\/$/, '');
 
-  async function sendVerificationEmail(user) {
-    const token = verifications.issue(user.id);
-    const link = `${verifyBase}/verify-email?token=${token}`;
+  // Background-job hook. Defaults to `setImmediate`, but tests inject a
+  // synchronous runner so they can assert on the mailer outbox without
+  // racing ticks.
+  const schedule = scheduler || ((fn) => setImmediate(fn));
+
+  function mailLink(token) {
+    return `${verifyBase}/verify-email?token=${token}`;
+  }
+
+  async function issueAndMail({ email, authHash }) {
     try {
-      await mailer.sendVerification({ to: user.email, link });
+      const token = pendingRegistrations.issue({ email, authHash });
+      await mailer.sendVerification({ to: email, link: mailLink(token) });
     } catch (err) {
-      // Don't block registration on transient mail errors; surface the symptom
-      // in logs and let the user retry via /auth/resend-verification.
       // eslint-disable-next-line no-console
-      console.error('[auth] verification mail failed', err && err.message);
+      console.error('[auth] issueAndMail failed', err && err.message);
     }
   }
 
   // -------------------------------------------------------------------------
   // POST /auth/register
+  //
+  // Deferred credential binding (Codex P1 fix, round 4):
+  //
+  //   OLD flow: POST /register immediately wrote (email, HMAC(authHash)) into
+  //   the users table with email_verified=0. An attacker could pre-register
+  //   the victim's email with the attacker's own authHash and wait for the
+  //   victim to click the verification link.
+  //
+  //   NEW flow: no user row is created at register time. Instead a
+  //   pending_registrations row binds (email, stored_auth) to a freshly
+  //   issued one-shot verification token. The user row is created — already
+  //   verified — only when that specific token is redeemed on /verify-email.
+  //   Multiple concurrent pending rows for the same email are harmless:
+  //   each carries its own stored_auth snapshot, whichever is redeemed
+  //   first "wins" and purgeForEmail wipes the rest.
+  //
+  // Timing:
+  //   The response MUST NOT vary by whether a verified user already exists
+  //   for this email. We therefore always schedule the actual mail send in
+  //   the background and return 202 synchronously. Attackers see constant
+  //   response latency whether the email belongs to an existing account or
+  //   is brand new.
   // -------------------------------------------------------------------------
   router.post('/register', limiters.register, async (req, res) => {
     const parsed = RegisterSchema.safeParse(req.body);
-    if (!parsed.success) return badRequest(res, 'invalid_body', parsed.error.flatten());
+    if (!parsed.success) {
+      return badRequest(res, 'invalid_body', parsed.error.flatten());
+    }
+    const { email, authHash } = parsed.data;
 
-    try {
-      const user = users.create({
-        email: parsed.data.email,
-        authHash: parsed.data.authHash,
-      });
-      await sendVerificationEmail(user);
-      // Respond 202: registered, pending email verification. Never reveal
-      // whether the email was already taken (that check happens in `create`
-      // which throws `email_taken`; see catch below).
-      return res.status(202).json({ status: 'verification_sent' });
-    } catch (err) {
-      if (err.code === 'invalid_email') return badRequest(res, 'invalid_email');
-      if (err.code === 'email_taken') {
-        // Return 202 anyway to avoid email enumeration. Don't re-send the
-        // verification link here either (that's what /auth/resend is for).
-        return res.status(202).json({ status: 'verification_sent' });
+    // Reject syntactically invalid emails synchronously. This path is
+    // safe to surface (non-timing-sensitive): whether "foo" parses as an
+    // email is a pure function of the submitted string, so it cannot leak
+    // account existence. The existence check — "does a verified user
+    // already own this email?" — is what we still do asynchronously
+    // below to keep response timing constant.
+    if (!isValidEmailSyntax(normalizeEmail(email))) {
+      return badRequest(res, 'invalid_email');
+    }
+
+    schedule(async () => {
+      try {
+        const existing = users.findByEmail(email);
+        if (existing && existing.emailVerified) {
+          // Account already exists and is verified; don't spam the owner
+          // with a bogus "confirm your email" message. Silent no-op.
+          return;
+        }
+        await issueAndMail({ email, authHash });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[auth/register.bg]', err && err.message);
       }
-      // eslint-disable-next-line no-console
-      console.error('[auth/register]', err);
-      return res.status(500).json({ error: 'internal' });
-    }
-  });
+    });
 
-  // -------------------------------------------------------------------------
-  // POST /auth/resend-verification
-  // -------------------------------------------------------------------------
-  router.post('/resend-verification', limiters.resend, async (req, res) => {
-    const parsed = ResendSchema.safeParse(req.body);
-    if (!parsed.success) return badRequest(res, 'invalid_body');
-    const user = users.findByEmail(parsed.data.email);
-    if (user && !user.emailVerified) {
-      await sendVerificationEmail(user);
-    }
-    // Always 202 — no enumeration.
     return res.status(202).json({ status: 'verification_sent' });
   });
 
   // -------------------------------------------------------------------------
   // POST /auth/verify-email
-  // Body: { token }. Accepts POST so the magic-link click triggers a CSRF-safe
-  // form/script on the SPA rather than a naked GET (which would be logged in
-  // referrer chains).
+  //
+  // Body: { token }. Redeems a pending_registrations row and creates the
+  // user account already verified. If an account already exists for this
+  // email (another pending for the same email verified first), we surface
+  // 409 and purge remaining pendings so attacker-spawned tokens die.
   // -------------------------------------------------------------------------
   router.post('/verify-email', async (req, res) => {
     const parsed = VerifySchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_token');
-    const result = verifications.redeem(parsed.data.token);
-    if (!result) return badRequest(res, 'invalid_or_expired_token');
-    users.markEmailVerified(result.userId);
-    verifications.clearForUser(result.userId);
+
+    const redeemed = pendingRegistrations.redeem(parsed.data.token);
+    if (!redeemed) return badRequest(res, 'invalid_or_expired_token');
+
+    const { email, storedAuth } = redeemed;
+    const existing = users.findByEmail(email);
+    if (existing && existing.emailVerified) {
+      // Another pending for this email already verified. Wipe any
+      // remaining pendings so stale tokens — including attacker-spawned
+      // ones — can't linger.
+      pendingRegistrations.purgeForEmail(email);
+      return res.status(409).json({ error: 'already_verified' });
+    }
+
+    try {
+      users.createVerifiedWithStoredAuth({ email, storedAuth });
+    } catch (err) {
+      if (err.code === 'email_taken') {
+        // Lost the race to another concurrent verify for the same email.
+        pendingRegistrations.purgeForEmail(email);
+        return res.status(409).json({ error: 'already_verified' });
+      }
+      if (err.code === 'invalid_email') return badRequest(res, 'invalid_email');
+      // eslint-disable-next-line no-console
+      console.error('[auth/verify-email]', err);
+      return res.status(500).json({ error: 'internal' });
+    }
+
+    // Success: purge every other pending for this email so no other token
+    // (including an attacker-spawned one that would bind a different
+    // stored_auth) can ever be redeemed against this now-verified account.
+    pendingRegistrations.purgeForEmail(email);
     return res.json({ status: 'verified' });
   });
 

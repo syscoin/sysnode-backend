@@ -28,11 +28,6 @@ function loginKey(req) {
   return `login|${ipBucket(req)}|${normalizeEmail(raw)}`;
 }
 
-function resendKey(req) {
-  const raw = (req.body && req.body.email) || '';
-  return `resend|${normalizeEmail(raw)}`;
-}
-
 function registerKey(req) {
   return `register|${ipBucket(req)}`;
 }
@@ -45,17 +40,6 @@ function loginLimiter() {
     legacyHeaders: false,
     keyGenerator: loginKey,
     message: { error: 'too_many_attempts' },
-  });
-}
-
-function verifyEmailResendLimiter() {
-  return rateLimit({
-    windowMs: 60 * MINUTE,
-    max: 3,
-    standardHeaders: true,
-    legacyHeaders: false,
-    keyGenerator: resendKey,
-    message: { error: 'too_many_resends' },
   });
 }
 
@@ -76,11 +60,9 @@ function disabled() {
 
 module.exports = {
   loginLimiter,
-  verifyEmailResendLimiter,
   registerLimiter,
   disabled,
   // Exported for direct unit testing.
   loginKey,
-  resendKey,
   registerKey,
 };
