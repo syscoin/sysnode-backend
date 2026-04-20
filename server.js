@@ -28,6 +28,26 @@ const {
 
 const app = express();
 
+// Reverse-proxy awareness. When deployed behind nginx / a load balancer,
+// Express's default `req.ip` is the proxy's socket address, which collapses
+// every real client into a single rate-limit bucket. `TRUST_PROXY` is read
+// verbatim by express.set: it accepts "true"/"false", an IP/CIDR list, or a
+// hop count. Default is `loopback` for local dev; production deployments
+// should set it to the actual proxy hop (e.g. "1" for single nginx in front).
+const rawTrustProxy = process.env.TRUST_PROXY;
+app.set(
+  'trust proxy',
+  rawTrustProxy === undefined
+    ? 'loopback'
+    : rawTrustProxy === 'true'
+      ? true
+      : rawTrustProxy === 'false'
+        ? false
+        : /^\d+$/.test(rawTrustProxy)
+          ? Number(rawTrustProxy)
+          : rawTrustProxy
+);
+
 // Security headers apply everywhere. helmet defaults are safe for JSON APIs.
 app.use(helmet());
 app.use(bodyParser.json({ limit: '256kb' }));
