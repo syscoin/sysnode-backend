@@ -1,80 +1,24 @@
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const cookieParser = require('cookie-parser');
-const helmet = require('helmet');
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
 
-// Load services (timed background workers). These are pre-existing.
-require('./services/sysMain');
-require('./services/masternodeTracker');
+// Load services (timed background workers)
+require("./services/sysMain");
+require("./services/masternodeTracker");
 
-// Legacy public routes (no cookies, no credentials; stats + governance list
-// + masternode list etc. consumed by sysnode-info and third parties).
-const mnStatsRoute = require('./routes/mnStats');
-const masternodesRoute = require('./routes/masternodes');
-const governanceRoute = require('./routes/governance');
-const csvParserRoute = require('./routes/csvParser');
-const mnListRoute = require('./routes/mnList');
-const mnSearchRoute = require('./routes/mnSearch');
-
-// New authenticated subsystem (auth + vault).
-const { openDatabase } = require('./lib/db');
-const { createMailer } = require('./lib/mailer');
-const {
-  buildServices,
-  finalizeSessionMw,
-  mountAuthAndVault,
-} = require('./lib/appFactory');
-
+// Load routes
+const mnStatsRoute = require("./routes/mnStats");
+const masternodesRoute = require("./routes/masternodes");
+const governanceRoute = require("./routes/governance");
+const csvParserRoute = require("./routes/csvParser");
+const mnListRoute = require("./routes/mnList");
+const mnSearchRoute = require("./routes/mnSearch");
 const app = express();
 
-// Security headers apply everywhere. helmet defaults are safe for JSON APIs.
-app.use(helmet());
-app.use(bodyParser.json({ limit: '256kb' }));
-app.use(cookieParser());
+app.use(cors({ origin: "*", optionsSuccessStatus: 200 }));
+app.use(bodyParser.json());
 
-// -----------------------------------------------------------------------------
-// CORS: legacy public data routes keep `origin: *` so existing third-party
-// consumers don't break. Auth and vault use credentialed CORS pinned to the
-// SPA origin (browsers reject `*` with credentials).
-// -----------------------------------------------------------------------------
-const legacyCors = cors({ origin: '*', optionsSuccessStatus: 200 });
-const authCors = cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
-  credentials: true,
-});
-app.use((req, res, next) => {
-  if (req.path.startsWith('/auth') || req.path.startsWith('/vault')) {
-    return authCors(req, res, next);
-  }
-  return legacyCors(req, res, next);
-});
-
-// -----------------------------------------------------------------------------
-// Authenticated subsystem wiring (before legacy routers so /auth and /vault
-// match first; legacy routers register their own specific paths and won't
-// shadow these).
-// -----------------------------------------------------------------------------
-const dbPath = process.env.SYSNODE_DB_PATH || './data/sysnode.db';
-const db = openDatabase(dbPath);
-const mailer = createMailer({
-  transport: process.env.SMTP_HOST ? 'smtp' : 'log',
-  from: process.env.MAIL_FROM || 'no-reply@syscoin.dev',
-});
-const services = finalizeSessionMw(buildServices({ db }));
-
-app.use(['/auth', '/vault'], services.sessionMw.parse);
-
-mountAuthAndVault(app, {
-  services,
-  mailer,
-  baseUrl: process.env.BASE_URL || 'http://localhost:3001',
-});
-
-// -----------------------------------------------------------------------------
-// Legacy public routes: mounted AFTER auth/vault to keep historical path
-// registration exactly as it was before this PR.
-// -----------------------------------------------------------------------------
+// Bind routes
 app.use(mnStatsRoute);
 app.use(masternodesRoute);
 app.use(governanceRoute);
@@ -82,20 +26,7 @@ app.use(csvParserRoute);
 app.use(mnListRoute);
 app.use(mnSearchRoute);
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// Housekeeping: expire stale sessions once per hour.
-setInterval(() => {
-  try {
-    services.sessions.cleanupExpired();
-  } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error('[sessions.cleanup]', err && err.message);
-  }
-}, 60 * 60 * 1000).unref();
-
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
   console.log(`Sysnode backend running on port ${PORT}`);
 });
