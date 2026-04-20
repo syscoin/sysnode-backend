@@ -43,12 +43,19 @@ function createAuthRouter({
   csrfMw,
   limiters,
   baseUrl,
+  frontendUrl,
 }) {
   const router = express.Router();
 
+  // The verification link must land on the frontend (which will POST the
+  // token back to this router). Pointing at `baseUrl` — the backend's own
+  // origin — would hit a route that only accepts POST, producing a dead link
+  // when the user clicks from their mail client.
+  const verifyBase = (frontendUrl || baseUrl).replace(/\/$/, '');
+
   async function sendVerificationEmail(user) {
     const token = verifications.issue(user.id);
-    const link = `${baseUrl.replace(/\/$/, '')}/auth/verify-email?token=${token}`;
+    const link = `${verifyBase}/verify-email?token=${token}`;
     try {
       await mailer.sendVerification({ to: user.email, link });
     } catch (err) {

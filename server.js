@@ -69,6 +69,10 @@ mountAuthAndVault(app, {
   services,
   mailer,
   baseUrl: process.env.BASE_URL || 'http://localhost:3001',
+  frontendUrl:
+    process.env.FRONTEND_URL ||
+    process.env.CORS_ORIGIN ||
+    'http://localhost:3000',
 });
 
 // -----------------------------------------------------------------------------

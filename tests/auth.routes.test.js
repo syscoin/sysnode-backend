@@ -36,6 +36,22 @@ describe('auth routes', () => {
     expect(ctx.mailer.outbox[0].html).toMatch(/verify-email\?token=/);
   });
 
+  test('verification link targets the frontend URL, not the backend endpoint', async () => {
+    // Codex P1: the backend only exposes POST /auth/verify-email. Email
+    // clients click-through triggers a GET, so the link must land on the
+    // SPA which performs the POST. Asserts the link is rooted at the
+    // configured frontendUrl (http://app.test.local in buildTestApp).
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const html = ctx.mailer.outbox[0].html;
+    expect(html).toMatch(
+      /http:\/\/app\.test\.local\/verify-email\?token=[0-9a-f]{64}/
+    );
+    expect(html).not.toMatch(/http:\/\/api\.test\.local/);
+    expect(html).not.toMatch(/\/auth\/verify-email/);
+  });
+
   test('POST /auth/register rejects invalid email shape', async () => {
     const res = await request(ctx.app)
       .post('/auth/register')

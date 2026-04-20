@@ -12,8 +12,9 @@ function buildTestApp(overrides = {}) {
   const built = createApp({
     db,
     mailer,
-    baseUrl: 'http://test.local',
-    corsOrigin: 'http://test.local',
+    baseUrl: 'http://api.test.local',
+    frontendUrl: 'http://app.test.local',
+    corsOrigin: 'http://app.test.local',
     secureCookies: false,
     disableRateLimit: true,
     ...overrides,
