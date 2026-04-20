@@ -19,10 +19,24 @@ describe('rate-limit key generators', () => {
       expect(c).toBe(d);
     });
 
-    test('includes IP so distinct IPs do not share the attacker bucket', () => {
+    test('distinct IPv4 addresses produce distinct keys', () => {
       const a = loginKey(mk({ email: 'user@example.com' }, '1.2.3.4'));
       const b = loginKey(mk({ email: 'user@example.com' }, '5.6.7.8'));
       expect(a).not.toBe(b);
+    });
+
+    test('IPv6 addresses in the same /56 subnet share a bucket (via ipKeyGenerator)', () => {
+      // An attacker rotating addresses inside a single IPv6 allocation MUST
+      // not be able to evade the 5-attempt login bucket. ipKeyGenerator
+      // masks IPv6 to /56, so two addresses that only differ in the host
+      // portion map to the same key.
+      const a = loginKey(
+        mk({ email: 'user@example.com' }, '2001:db8:1234:5678:9abc:def0:1234:5678')
+      );
+      const b = loginKey(
+        mk({ email: 'user@example.com' }, '2001:db8:1234:56ff:ffff:ffff:ffff:ffff')
+      );
+      expect(a).toBe(b);
     });
 
     test('handles missing/empty body gracefully', () => {
@@ -43,11 +57,17 @@ describe('rate-limit key generators', () => {
   });
 
   describe('registerKey', () => {
-    test('is scoped per IP only', () => {
+    test('is scoped per IPv4 only', () => {
       const a = registerKey(mk({ email: 'a@b.com' }, '1.2.3.4'));
       const b = registerKey(mk({ email: 'c@d.com' }, '1.2.3.4'));
       expect(a).toBe(b);
       expect(a).toMatch(/^register\|1\.2\.3\.4$/);
+    });
+
+    test('collapses an IPv6 /56 into a single bucket', () => {
+      const a = registerKey(mk({}, '2001:db8:1234:5600::1'));
+      const b = registerKey(mk({}, '2001:db8:1234:56ff::1'));
+      expect(a).toBe(b);
     });
   });
 });

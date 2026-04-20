@@ -1,4 +1,5 @@
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const { normalizeEmail } = require('../lib/email');
 
 // Per-route limiters for authentication endpoints.
@@ -10,12 +11,21 @@ const { normalizeEmail } = require('../lib/email');
 // bypass the bucket by submitting canonical-equivalent variants (trailing
 // whitespace, different Unicode normalization, mixed case) while still hitting
 // the same account downstream.
+//
+// IP-bucketed keys MUST go through `ipKeyGenerator` rather than using raw
+// `req.ip`. For IPv4 it's a no-op, but for IPv6 it masks down to the /56
+// subnet so a single /64 (or smaller) allocation can't trivially rotate
+// addresses to bypass the limit.
 
 const MINUTE = 60 * 1000;
 
+function ipBucket(req) {
+  return ipKeyGenerator(req.ip || '');
+}
+
 function loginKey(req) {
   const raw = (req.body && req.body.email) || '';
-  return `login|${req.ip}|${normalizeEmail(raw)}`;
+  return `login|${ipBucket(req)}|${normalizeEmail(raw)}`;
 }
 
 function resendKey(req) {
@@ -24,7 +34,7 @@ function resendKey(req) {
 }
 
 function registerKey(req) {
-  return `register|${req.ip}`;
+  return `register|${ipBucket(req)}`;
 }
 
 function loginLimiter() {

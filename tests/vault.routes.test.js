@@ -119,6 +119,27 @@ describe('vault routes', () => {
     expect(res.body.etag).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  test('PUT with If-Match: * is rejected with 412 once a vault exists', async () => {
+    // Matches lib/vaults.test.js: wildcard must only work for first write.
+    const { agent, csrf } = await loggedInAgent(ctx);
+    await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', '*')
+      .send({ blob: 'initial' });
+
+    const wildcard = await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', '*')
+      .send({ blob: 'attempted-clobber' });
+    expect(wildcard.status).toBe(412);
+    expect(wildcard.body.error).toBe('precondition_failed');
+
+    const read = await agent.get('/vault');
+    expect(read.body.blob).toBe('initial');
+  });
+
   test('oversized blob returns 413', async () => {
     const { agent, csrf } = await loggedInAgent(ctx);
     // express.json() limit is 256kb; send something right below that so the
