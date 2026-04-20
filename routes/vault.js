@@ -3,12 +3,13 @@ const { z } = require('zod');
 
 // Vault HTTP interface.
 //
-//   GET  /vault                -> { saltV, blob, etag } or { empty: true }
-//   PUT  /vault  If-Match: <e> -> { saltV, etag }        (first write: *)
+//   GET  /vault                -> { blob, etag, updatedAt } or { empty: true }
+//   PUT  /vault  If-Match: <e> -> { etag }                   (first write: *)
 //
-// The server is blind to contents. All it does is store-and-return the blob
-// alongside the per-user saltV that the client uses (with its master key) to
-// derive vaultKey for AES-GCM.
+// The server is blind to contents. All it does is store-and-return the
+// blob; the client already holds saltV (delivered with /auth/login and
+// /auth/me) and derives vaultKey locally from (master, saltV) to wrap the
+// Data Key inside the blob.
 
 const PutSchema = z.object({
   blob: z.string().min(1),
@@ -22,7 +23,6 @@ function createVaultRouter({ vaults, sessionMw, csrfMw }) {
     if (!row) return res.json({ empty: true });
     res.set('ETag', row.etag);
     return res.json({
-      saltV: row.saltV,
       blob: row.blob,
       etag: row.etag,
       updatedAt: row.updatedAt,
