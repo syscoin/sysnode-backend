@@ -59,7 +59,7 @@ describe('vault routes', () => {
     expect(res.body.error).toBe('csrf_missing');
   });
 
-  test('first PUT /vault creates row, returns saltV + etag', async () => {
+  test('first PUT /vault creates row, returns etag (saltV lives on /auth/me)', async () => {
     const { agent, csrf } = await loggedInAgent(ctx);
     const res = await agent
       .put('/vault')
@@ -67,9 +67,11 @@ describe('vault routes', () => {
       .set('If-Match', '*')
       .send({ blob: 'ciphertext-1' });
     expect(res.status).toBe(200);
-    expect(res.body.saltV).toMatch(/^[0-9a-f]{64}$/);
     expect(res.body.etag).toMatch(/^[0-9a-f]{64}$/);
     expect(res.headers.etag).toBe(res.body.etag);
+    // saltV moved to the users row (migration 004). The vault route no
+    // longer round-trips it; that would duplicate the source of truth.
+    expect(res.body.saltV).toBeUndefined();
   });
 
   test('subsequent PUT requires matching If-Match', async () => {
@@ -101,10 +103,10 @@ describe('vault routes', () => {
       .set('If-Match', originalEtag)
       .send({ blob: 'B' });
     expect(good.status).toBe(200);
-    expect(good.body.saltV).toBe(first.body.saltV);
+    expect(good.body.etag).not.toBe(originalEtag);
   });
 
-  test('GET /vault returns full blob for authenticated user', async () => {
+  test('GET /vault returns full blob + etag for authenticated user', async () => {
     const { agent, csrf } = await loggedInAgent(ctx);
     await agent
       .put('/vault')
@@ -115,8 +117,38 @@ describe('vault routes', () => {
     const res = await agent.get('/vault');
     expect(res.status).toBe(200);
     expect(res.body.blob).toBe('ciphertext-2');
-    expect(res.body.saltV).toMatch(/^[0-9a-f]{64}$/);
     expect(res.body.etag).toMatch(/^[0-9a-f]{64}$/);
+    expect(res.body.saltV).toBeUndefined();
+    // Surface updatedAt so the client can show a "last saved" stamp.
+    expect(typeof res.body.updatedAt).toBe('number');
+  });
+
+  test('saltV is surfaced on /auth/login and /auth/me (not on /vault)', async () => {
+    // Regression guard for migration 004: saltV delivery moved from the
+    // vault endpoints to the auth endpoints. If either auth endpoint
+    // forgets to include saltV, the client cannot derive vaultKey and
+    // first-save silently falls back to an unusable state.
+    const agent = request.agent(ctx.app);
+    await agent
+      .post('/auth/register')
+      .send({ email: 'salt@example.com', authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox
+      .find((m) => m.to === 'salt@example.com')
+      .html.match(/token=([0-9a-f]{64})/)[1];
+    await agent.post('/auth/verify-email').send({ token });
+
+    const login = await agent
+      .post('/auth/login')
+      .send({ email: 'salt@example.com', authHash: SAMPLE_AUTH });
+    expect(login.status).toBe(200);
+    expect(login.body.user.saltV).toMatch(/^[0-9a-f]{64}$/);
+
+    const me = await agent.get('/auth/me');
+    expect(me.status).toBe(200);
+    // The same saltV must round-trip on rehydration — a different
+    // value would correspond to a different user from the client's
+    // perspective (different vaultKey derivation).
+    expect(me.body.user.saltV).toBe(login.body.user.saltV);
   });
 
   test('PUT with If-Match: * is rejected with 412 once a vault exists', async () => {

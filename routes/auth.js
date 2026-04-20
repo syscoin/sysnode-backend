@@ -334,7 +334,20 @@ function createAuthRouter({
     sessionMw.setSessionCookie(res, token, expiresAt);
     csrfMw.issueCookie(res, expiresAt);
     return res.json({
-      user: { id: user.id, email: user.email },
+      // saltV is delivered here (and on /auth/me) so the client has the
+      // per-user vault salt in memory immediately after login, without a
+      // second round-trip. It is not secret (anyone with a valid session
+      // for this account can fetch it) and is required for the client's
+      // HKDF(master, saltV) → vaultKey derivation that in turn wraps the
+      // Data Key inside the encrypted vault blob. Delivered on login
+      // rather than gated behind /vault so an empty-vault first-write
+      // ("create vault") does not need to round-trip for salt material.
+      user: {
+        id: user.id,
+        email: user.email,
+        emailVerified: user.emailVerified,
+        saltV: user.saltV,
+      },
       expiresAt,
     });
   }));
@@ -369,11 +382,17 @@ function createAuthRouter({
   router.get('/me', (req, res) => {
     if (!req.user) return res.status(401).json({ error: 'unauthorized' });
     return res.json({
+      // See /auth/login for the saltV rationale; /auth/me is the
+      // rehydration path (page reload) so it MUST return the same
+      // fields as /auth/login — otherwise a rehydrated client would
+      // silently lose saltV and be unable to unlock the vault until
+      // it re-logs-in.
       user: {
         id: req.user.id,
         email: req.user.email,
         emailVerified: req.user.emailVerified,
         notificationPrefs: req.user.notificationPrefs,
+        saltV: req.user.saltV,
       },
     });
   });

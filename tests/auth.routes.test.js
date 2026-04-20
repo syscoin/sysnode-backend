@@ -125,6 +125,12 @@ describe('auth routes', () => {
       .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
     expect(res.status).toBe(200);
     expect(res.body.user.email).toBe('user@example.com');
+    expect(res.body.user.emailVerified).toBe(true);
+    // saltV must be delivered on /auth/login — the client needs it in
+    // memory immediately to derive vaultKey for vault operations. If
+    // this regresses, the frontend would have no way to decrypt or
+    // encrypt without a second round-trip.
+    expect(res.body.user.saltV).toMatch(/^[0-9a-f]{64}$/);
     const cookies = extractCookies(res);
     expect(cookies.sid).toMatch(/^[0-9a-f]{64}$/);
     expect(cookies.csrf).toMatch(/^[0-9a-f]{64}$/);
@@ -202,6 +208,10 @@ describe('auth routes', () => {
     expect(res.status).toBe(200);
     expect(res.body.user.email).toBe('user@example.com');
     expect(res.body.user.emailVerified).toBe(true);
+    // /auth/me is the rehydration path on page reload; it must return
+    // the same saltV as login or the client silently loses its ability
+    // to derive vaultKey.
+    expect(res.body.user.saltV).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test('GET /auth/me is 401 when not authenticated', async () => {
