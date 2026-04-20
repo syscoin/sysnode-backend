@@ -1,0 +1,39 @@
+{
+  "name": "sysnode",
+  "version": "1.0.0",
+  "description": "Syscoin backend for masternode and governance stats",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@syscoin/syscoin-js": "git+https://github.com/syscoin/syscoind-rpc.git#637a1de10522d1ce34a4e0f283c59b9d55bde814",
+    "axios": "0.27.2",
+    "body-parser": "1.20.2",
+    "cors": "2.8.5",
+    "csv-parser": "3.0.0",
+    "express": "4.18.2",
+    "fs": "0.0.1-security",
+    "geoip-country": "4.1.49",
+    "i18n-iso-countries": "7.5.0",
+    "moment": "2.29.4",
+    "numeral": "2.0.6",
+    "papaparse": "5.4.1",
+    "pm2": "5.3.0",
+    "pretty-ms": "6.0.1",
+    "websocket": "1.0.34"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "syscoin",
+    "masternode",
+    "governance",
+    "express",
+    "backend"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
