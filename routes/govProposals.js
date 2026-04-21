@@ -466,12 +466,63 @@ function createGovProposalsRouter({
 
     // Hashing fields are frozen at prepare time. parent_hash and
     // revision are fixed ('0'/1) for user-submitted top-level
-    // proposals; time comes from our clock so a stale client can't
+    // proposals; time defaults to our clock so a stale client can't
     // backdate a submission to avoid the "expiration" check in Core.
+    //
+    // Codex PR8 round 2 P1: idempotency must key on the time-free
+    // canonical payload (dataHex), NOT proposalHash, because
+    // proposalHash bakes in `time`. Two retries of the same logical
+    // /prepare across a one-second boundary would otherwise produce
+    // different hashes and both land in the DB. If we already have a
+    // `prepared` row for this user with the same dataHex, replay its
+    // frozen fields and skip the insert entirely — this also skips
+    // the RPC pre-flight, which is both redundant (Core already
+    // accepted it once) and subject to rate-limiting on retries.
     const parentHash = '0';
     const revision = 1;
-    const timeUnix = nowSeconds;
 
+    const existingByPayload = submissions.findPreparedByDataHexForUser(
+      userId,
+      canon.dataHex
+    );
+
+    let timeUnix;
+    let proposalHash;
+    let opReturnHex;
+    if (existingByPayload) {
+      timeUnix = existingByPayload.timeUnix;
+      proposalHash = existingByPayload.proposalHash;
+      // Rebuild opReturnHex from the frozen fields; the stored hash
+      // is the big-endian display form, so we rehash rather than
+      // byte-reverse to keep the derivation honest (and to catch
+      // any drift between computeProposalHash and the row).
+      try {
+        opReturnHex = computeProposalHash({
+          parentHash,
+          revision,
+          time: timeUnix,
+          dataHex: existingByPayload.dataHex,
+        }).opReturnBytes.toString('hex');
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[POST /gov/proposals/prepare] rehash error',
+          err
+        );
+        return res.status(500).json({ error: 'internal' });
+      }
+      return res.status(200).json({
+        submission: jsonSubmission(existingByPayload),
+        opReturnHex,
+        canonicalJson: canon.json,
+        payloadBytes: canon.byteLength,
+        collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
+        requiredConfirmations: REQUIRED_CONFIRMATIONS,
+        idempotent: true,
+      });
+    }
+
+    timeUnix = nowSeconds;
     let hash;
     try {
       hash = computeProposalHash({
@@ -486,8 +537,8 @@ function createGovProposalsRouter({
       console.error('[POST /gov/proposals/prepare] hash error', err);
       return res.status(500).json({ error: 'internal' });
     }
-    const proposalHash = hash.displayHex;
-    const opReturnHex = hash.opReturnBytes.toString('hex');
+    proposalHash = hash.displayHex;
+    opReturnHex = hash.opReturnBytes.toString('hex');
 
     // RPC pre-flight: give Core the exact dataHex we'll later submit.
     // If Core complains now, the user can fix it before paying 150
@@ -549,22 +600,8 @@ function createGovProposalsRouter({
       }
     }
 
-    // Idempotency: return existing 'prepared' row for the same hash.
-    const existing = submissions.findByProposalHashForUser(
-      userId,
-      proposalHash
-    );
-    if (existing && existing.status === 'prepared') {
-      return res.status(200).json({
-        submission: jsonSubmission(existing),
-        opReturnHex,
-        canonicalJson: canon.json,
-        payloadBytes: canon.byteLength,
-        collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
-        requiredConfirmations: REQUIRED_CONFIRMATIONS,
-        idempotent: true,
-      });
-    }
+    // (Payload-keyed idempotency handled above via
+    // findPreparedByDataHexForUser — Codex PR8 round 2 P1.)
 
     // Draft consumption: default to "yes" if a draftId is supplied
     // and belongs to the user. The frontend explicitly opts out with

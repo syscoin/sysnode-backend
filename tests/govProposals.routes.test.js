@@ -38,7 +38,7 @@ const { _resetPepperForTests } = require('../lib/kdf');
 const SAMPLE_AUTH =
   'a4f8b3c1d9e7f2a5b1c6d8e4f7a9b2c5d1e8f4a7b3c9d5e1f6a2b8c4d7e3f5a9';
 
-function buildApp({ gObjectCheck = null } = {}) {
+function buildApp({ gObjectCheck = null, nowRef = null } = {}) {
   _resetPepperForTests();
   process.env.SYSNODE_AUTH_PEPPER = 'd'.repeat(64);
   process.env.NODE_ENV = 'test';
@@ -104,6 +104,7 @@ function buildApp({ gObjectCheck = null } = {}) {
       csrfMw,
       rpc: gObjectCheck ? { gObjectCheck } : {},
       runAtomic,
+      ...(nowRef ? { now: () => nowRef.value } : {}),
     })
   );
 
@@ -493,6 +494,50 @@ describe('POST /gov/proposals/prepare', () => {
       time: res.body.submission.timeUnix,
       dataHex: res.body.submission.dataHex,
     });
+  });
+
+  test('idempotency is keyed on dataHex, not proposalHash — retries across a second boundary still collapse (Codex round 2 P1)', async () => {
+    // proposalHash bakes in `time`, so two retries of the same
+    // logical /prepare that happen to straddle a one-second
+    // boundary hash differently. A hash-only idempotency check
+    // would create duplicate prepared rows for what is
+    // semantically the same submission. Payload-keyed idempotency
+    // (lookup by user_id + data_hex on `prepared` rows) must
+    // collapse them to one row with stable hash/time.
+    const nowRef = { value: 1_800_000_000_000 }; // ms
+    ctx = buildApp({ nowRef });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const nowSec = Math.floor(nowRef.value / 1000);
+    const body = validProposalBody({
+      startEpoch: nowSec + 3600,
+      endEpoch: nowSec + 3600 * 24 * 30,
+    });
+
+    const r1 = await agent
+      .post('/gov/proposals/prepare')
+      .set('X-CSRF-Token', csrf)
+      .send(body);
+    expect(r1.status).toBe(201);
+
+    // Advance wall clock by >1s so a second /prepare computes a
+    // fresh `time` and therefore a *different* proposalHash if
+    // idempotency is hash-keyed.
+    nowRef.value += 2500;
+
+    const r2 = await agent
+      .post('/gov/proposals/prepare')
+      .set('X-CSRF-Token', csrf)
+      .send(body);
+    expect(r2.status).toBe(200);
+    expect(r2.body.idempotent).toBe(true);
+    expect(r2.body.submission.id).toBe(r1.body.submission.id);
+    expect(r2.body.submission.proposalHash).toBe(r1.body.submission.proposalHash);
+    expect(r2.body.submission.timeUnix).toBe(r1.body.submission.timeUnix);
+    // And — crucially — there's exactly one row in the DB.
+    const rows = ctx.submissions.listForUser(
+      ctx.users.findByEmail('user@example.com').id
+    );
+    expect(rows).toHaveLength(1);
   });
 
   test('hash is deterministic: same inputs → same proposalHash', async () => {
