@@ -472,7 +472,12 @@ describe('POST /gov/vote — receipts integration', () => {
       const { agent, csrf } = await loggedInAgent(ctx, 'carol@example.com');
       const uid = await userIdFor(ctx, 'carol@example.com');
       // Seed a confirmed receipt for entry 0 so decideRelay
-      // short-circuits it on the next POST.
+      // short-circuits it on the next POST. We also stamp
+      // verified_at so decideRelay treats the confirmation as
+      // authoritative — an unverified 'confirmed' row (never happens
+      // via the reconciler, but possible here via raw upsert) is
+      // intentionally treated as stale so a silent vote suppression
+      // can't happen.
       ctx.voteReceipts.upsert({
         userId: uid,
         collateralHash: H2,
@@ -483,6 +488,11 @@ describe('POST /gov/vote — receipts integration', () => {
         voteTime: Math.floor(Date.now() / 1000),
         status: 'confirmed',
       });
+      ctx.db
+        .prepare(
+          `UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`
+        )
+        .run(Date.now(), uid);
       const res = await agent
         .post('/gov/vote')
         .set('X-CSRF-Token', csrf)
@@ -502,6 +512,51 @@ describe('POST /gov/vote — receipts integration', () => {
       });
       expect(byIdx[1]).toMatchObject({ ok: true });
       expect(byIdx[1].skipped).toBeUndefined();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('stale-confirmed: a confirmation older than the freshness window falls through to relay', async () => {
+    // Codex-review guard: without a freshness check, a user who
+    // changed their vote from another wallet would have their
+    // subsequent submission here silently suppressed ("already on
+    // chain") even though the chain has since been updated. When
+    // verified_at is older than the freshness window we MUST relay
+    // to give the current intent a chance to actually reach Core.
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'freya@example.com');
+      const uid = await userIdFor(ctx, 'freya@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: Math.floor(Date.now() / 1000),
+        status: 'confirmed',
+      });
+      // Stamp verified_at far in the past (1 hour) — well beyond
+      // the default 5-minute freshness window.
+      ctx.db
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
+        .run(Date.now() - 60 * 60 * 1000, uid);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      // Every entry (including the one with the stale-confirmed
+      // receipt at index 0) hit the RPC.
+      const rpcOutpoints = calls.map((c) => `${c[0]}:${c[1]}`).sort();
+      expect(rpcOutpoints).toEqual([`${H2}:0`, `${H3}:1`].sort());
+      // And no row was reported as "already_on_chain" — the stale
+      // row was relayed, not short-circuited.
+      for (const r of res.body.results) {
+        expect(r.skipped).not.toBe('already_on_chain');
+      }
     } finally {
       ctx.db.close();
     }
