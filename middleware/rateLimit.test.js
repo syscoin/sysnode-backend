@@ -1,10 +1,13 @@
 const {
   loginKey,
   registerKey,
+  voteKey,
 } = require('./rateLimit');
 
-function mk(body, ip = '1.2.3.4') {
-  return { ip, body };
+function mk(body, ip = '1.2.3.4', user) {
+  const req = { ip, body };
+  if (user) req.user = user;
+  return req;
 }
 
 describe('rate-limit key generators', () => {
@@ -58,6 +61,26 @@ describe('rate-limit key generators', () => {
       const a = registerKey(mk({}, '2001:db8:1234:5600::1'));
       const b = registerKey(mk({}, '2001:db8:1234:56ff::1'));
       expect(a).toBe(b);
+    });
+  });
+
+  describe('voteKey', () => {
+    test('buckets by authenticated user.id when present', () => {
+      const a = voteKey(mk({}, '1.2.3.4', { id: 42 }));
+      const b = voteKey(mk({}, '9.9.9.9', { id: 42 }));
+      expect(a).toBe(b);
+      expect(a).toBe('vote|u42');
+    });
+
+    test('two distinct users on the same IP get distinct buckets', () => {
+      const a = voteKey(mk({}, '1.2.3.4', { id: 1 }));
+      const b = voteKey(mk({}, '1.2.3.4', { id: 2 }));
+      expect(a).not.toBe(b);
+    });
+
+    test('falls back to IP bucket when the user is missing (defense in depth)', () => {
+      const a = voteKey(mk({}, '1.2.3.4'));
+      expect(a).toMatch(/^vote\|ip\|1\.2\.3\.4$/);
     });
   });
 });

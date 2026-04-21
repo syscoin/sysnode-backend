@@ -17,7 +17,7 @@ const csvParserRoute = require('./routes/csvParser');
 const mnListRoute = require('./routes/mnList');
 const mnSearchRoute = require('./routes/mnSearch');
 
-// New authenticated subsystem (auth + vault).
+// New authenticated subsystem (auth + vault + gov).
 const { openDatabase } = require('./lib/db');
 const { createMailer } = require('./lib/mailer');
 const { selectMailTransport } = require('./lib/mailTransport');
@@ -27,6 +27,8 @@ const {
   finalizeSessionMw,
   mountAuthAndVault,
 } = require('./lib/appFactory');
+const dataStore = require('./data/dataStore');
+const { client, rpcServices } = require('./services/rpcClient');
 
 const app = express();
 
@@ -101,6 +103,24 @@ mountAuthAndVault(app, {
     process.env.FRONTEND_URL ||
     process.env.CORS_ORIGIN ||
     'http://localhost:3000',
+  // Read the live tracker array fresh on every call rather than
+  // snapshotting it here — the tracker REASSIGNS `masternodesArr`
+  // every 10s (`data.masternodesArr = []`), so a captured reference
+  // would go stale after the first refresh. `dataStore.masternodesArr`
+  // is a property access and therefore always returns the current value.
+  masternodesProvider: () => dataStore.masternodesArr,
+  voteRaw: (collateralHash, collateralIndex, governanceHash, signal, outcome, time, voteSig) =>
+    rpcServices(client.callRpc)
+      .voteRaw(
+        collateralHash,
+        collateralIndex,
+        governanceHash,
+        signal,
+        outcome,
+        time,
+        voteSig
+      )
+      .call(true),
 });
 
 // -----------------------------------------------------------------------------
