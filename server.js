@@ -64,15 +64,25 @@ app.use(cookieParser());
 // authenticated voting surface; it carries cookies + the X-CSRF-Token
 // header and MUST go through `authCors` or browsers will block the
 // preflight.
+//
+// CRITICAL: the prefix match MUST be on a path boundary — i.e. "exactly
+// `/gov`" or "starts with `/gov/`". A naive `startsWith('/gov')` also
+// catches the legacy public endpoints `/govlist` and `/govbyhash`
+// (routes/governance.js), which are historically served under
+// `origin: '*'` and must keep working for third-party consumers that
+// are not on the configured CORS_ORIGIN. Same argument applies to
+// `/auth` / `/vault`, though today those prefixes have no legacy
+// collisions; we enforce the boundary everywhere to stay safe as the
+// legacy surface evolves.
 // -----------------------------------------------------------------------------
 const legacyCors = cors({ origin: '*', optionsSuccessStatus: 200 });
 const authCors = cors({
   origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
   credentials: true,
 });
-const CREDENTIALED_PREFIXES = ['/auth', '/vault', '/gov'];
+const { isCredentialedPath } = require('./lib/credentialedPaths');
 app.use((req, res, next) => {
-  if (CREDENTIALED_PREFIXES.some((p) => req.path.startsWith(p))) {
+  if (isCredentialedPath(req.path)) {
     return authCors(req, res, next);
   }
   return legacyCors(req, res, next);
