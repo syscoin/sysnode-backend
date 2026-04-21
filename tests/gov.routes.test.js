@@ -12,7 +12,10 @@ const H3 = 'c'.repeat(64);
 // 65 raw bytes = 88 base64 chars with padding. Real signatures are
 // produced client-side; for HTTP plumbing tests we only need
 // something that passes validateVoteBody.
-const SIG = 'A'.repeat(86) + '==';
+// Canonical 65-byte base64 sig (all zero bytes). See gov.test.js for
+// the full rationale; short version: "A".repeat(86)+"==" decodes to
+// 64 bytes and is rejected by the strict validator.
+const SIG = Buffer.alloc(65).toString('base64');
 
 function extractCookies(res) {
   const raw = res.headers['set-cookie'] || [];

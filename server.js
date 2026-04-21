@@ -59,16 +59,20 @@ app.use(cookieParser());
 
 // -----------------------------------------------------------------------------
 // CORS: legacy public data routes keep `origin: *` so existing third-party
-// consumers don't break. Auth and vault use credentialed CORS pinned to the
-// SPA origin (browsers reject `*` with credentials).
+// consumers don't break. Auth, vault, and gov use credentialed CORS pinned
+// to the SPA origin (browsers reject `*` with credentials). /gov is the
+// authenticated voting surface; it carries cookies + the X-CSRF-Token
+// header and MUST go through `authCors` or browsers will block the
+// preflight.
 // -----------------------------------------------------------------------------
 const legacyCors = cors({ origin: '*', optionsSuccessStatus: 200 });
 const authCors = cors({
   origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
   credentials: true,
 });
+const CREDENTIALED_PREFIXES = ['/auth', '/vault', '/gov'];
 app.use((req, res, next) => {
-  if (req.path.startsWith('/auth') || req.path.startsWith('/vault')) {
+  if (CREDENTIALED_PREFIXES.some((p) => req.path.startsWith(p))) {
     return authCors(req, res, next);
   }
   return legacyCors(req, res, next);
@@ -93,7 +97,11 @@ const mailer = createMailer({
 });
 const services = finalizeSessionMw(buildServices({ db }));
 
-app.use(['/auth', '/vault'], services.sessionMw.parse);
+// Session parsing must cover every route that reads `req.user`. /gov
+// uses `requireAuth` in its router; without parse running here first
+// `req.user` would always be undefined and every authenticated caller
+// would see a 401.
+app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 
 mountAuthAndVault(app, {
   services,
