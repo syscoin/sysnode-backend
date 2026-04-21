@@ -52,7 +52,12 @@ async function loggedInAgent(ctx, email = 'user@example.com') {
 // route code holding a stale reference. Our tests mirror that with a
 // mutable `state` object whose `masternodes` property can be swapped
 // between requests.
-function buildApp({ masternodes = [], voteRaw } = {}) {
+function buildApp({
+  masternodes = [],
+  voteRaw,
+  getCurrentVotes,
+  invalidateCurrentVotes,
+} = {}) {
   const state = { masternodes };
   const calls = [];
   const rawFn =
@@ -64,6 +69,8 @@ function buildApp({ masternodes = [], voteRaw } = {}) {
   const ctx = buildTestApp({
     masternodesProvider: () => state.masternodes,
     voteRaw: rawFn,
+    getCurrentVotes,
+    invalidateCurrentVotes,
   });
   return { ctx, state, calls };
 }
@@ -381,6 +388,875 @@ describe('POST /gov/vote', () => {
         );
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/^duplicate_entry:/);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+describe('POST /gov/vote — receipts integration', () => {
+  function vote(proposal, overrides = {}) {
+    return {
+      proposalHash: proposal,
+      voteOutcome: 'yes',
+      voteSignal: 'funding',
+      time: Math.floor(Date.now() / 1000),
+      entries: [
+        { collateralHash: H2, collateralIndex: 0, voteSig: SIG },
+        { collateralHash: H3, collateralIndex: 1, voteSig: SIG },
+      ],
+      ...overrides,
+    };
+  }
+
+  async function userIdFor(ctx, email) {
+    // The users repo exposes `findByEmail` via ctx.users, which we
+    // can reach from the appFactory return value.
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('successful votes persist receipts with status=relayed', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'alice@example.com');
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1))
+        .expect(200);
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      const receipts = ctx.voteReceipts.listForProposal(uid, H1);
+      expect(receipts).toHaveLength(2);
+      const statuses = receipts.map((r) => r.status).sort();
+      expect(statuses).toEqual(['relayed', 'relayed']);
+      for (const r of receipts) {
+        expect(r.voteOutcome).toBe('yes');
+        expect(r.voteSignal).toBe('funding');
+        expect(r.lastError).toBeNull();
+        expect(r.verifiedAt).toBeNull();
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('failed votes persist receipts with status=failed and the classified code', async () => {
+    const voteRaw = jest.fn().mockImplementation((hash) => {
+      if (hash === H2) return Promise.resolve('ok');
+      return Promise.reject(new Error('Failure to verify vote.'));
+    });
+    const { ctx } = buildApp({ voteRaw });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'bob@example.com');
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      const uid = await userIdFor(ctx, 'bob@example.com');
+      const all = ctx.voteReceipts.listForProposal(uid, H1);
+      const byOutpoint = Object.fromEntries(
+        all.map((r) => [`${r.collateralHash}:${r.collateralIndex}`, r])
+      );
+      expect(byOutpoint[`${H2}:0`]).toMatchObject({
+        status: 'relayed',
+        lastError: null,
+      });
+      expect(byOutpoint[`${H3}:1`]).toMatchObject({
+        status: 'failed',
+        lastError: 'signature_invalid',
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('already-on-chain short-circuit: second vote with same outcome skips voteraw', async () => {
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'carol@example.com');
+      const uid = await userIdFor(ctx, 'carol@example.com');
+      // Seed a confirmed receipt for entry 0 so decideRelay
+      // short-circuits it on the next POST. We also stamp
+      // verified_at so decideRelay treats the confirmation as
+      // authoritative — an unverified 'confirmed' row (never happens
+      // via the reconciler, but possible here via raw upsert) is
+      // intentionally treated as stale so a silent vote suppression
+      // can't happen.
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: Math.floor(Date.now() / 1000),
+        status: 'confirmed',
+      });
+      ctx.db
+        .prepare(
+          `UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`
+        )
+        .run(Date.now(), uid);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      // Only the non-confirmed entry hit the RPC.
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0]).toBe(H3);
+      // Response flags the skipped row so the UI can render
+      // "already on-chain" instead of the neutral "accepted".
+      const byIdx = Object.fromEntries(
+        res.body.results.map((r) => [r.collateralIndex, r])
+      );
+      expect(byIdx[0]).toMatchObject({
+        ok: true,
+        skipped: 'already_on_chain',
+      });
+      expect(byIdx[1]).toMatchObject({ ok: true });
+      expect(byIdx[1].skipped).toBeUndefined();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('stale-confirmed: a confirmation older than the freshness window falls through to relay', async () => {
+    // Codex-review guard: without a freshness check, a user who
+    // changed their vote from another wallet would have their
+    // subsequent submission here silently suppressed ("already on
+    // chain") even though the chain has since been updated. When
+    // verified_at is older than the freshness window we MUST relay
+    // to give the current intent a chance to actually reach Core.
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'freya@example.com');
+      const uid = await userIdFor(ctx, 'freya@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: Math.floor(Date.now() / 1000),
+        status: 'confirmed',
+      });
+      // Stamp verified_at far in the past (1 hour) — well beyond
+      // the default 5-minute freshness window.
+      ctx.db
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
+        .run(Date.now() - 60 * 60 * 1000, uid);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      // Every entry (including the one with the stale-confirmed
+      // receipt at index 0) hit the RPC.
+      const rpcOutpoints = calls.map((c) => `${c[0]}:${c[1]}`).sort();
+      expect(rpcOutpoints).toEqual([`${H2}:0`, `${H3}:1`].sort());
+      // And no row was reported as "already_on_chain" — the stale
+      // row was relayed, not short-circuited.
+      for (const r of res.body.results) {
+        expect(r.skipped).not.toBe('already_on_chain');
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('POST /gov/vote invalidates the current-votes cache for the proposal', async () => {
+    // Codex-review guard: without cache invalidation, /gov/receipts
+    // called shortly after a vote relay would reconcile against a
+    // pre-relay snapshot (TTL ~2 min), delaying the
+    // relayed→confirmed transition or, worse, re-confirming an old
+    // outcome after a vote change. Asserting the route calls the
+    // injected invalidator with the proposal hash pins the wiring.
+    const invalidateCurrentVotes = jest.fn();
+    const { ctx } = buildApp({ invalidateCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'iris@example.com');
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1))
+        .expect(200);
+      expect(invalidateCurrentVotes).toHaveBeenCalledTimes(1);
+      expect(invalidateCurrentVotes).toHaveBeenCalledWith(H1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('invalidateCurrentVotes throwing does not fail the vote response', async () => {
+    // The invalidator is a best-effort cache eviction — if it throws
+    // (e.g. the cache was disposed during a shutdown race), the user's
+    // vote response MUST still succeed with the relay results.
+    const invalidateCurrentVotes = jest.fn(() => {
+      throw new Error('boom');
+    });
+    const { ctx } = buildApp({ invalidateCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'jules@example.com');
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(2);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('recently-relayed short-circuit: duplicate submit within 60s is deduped', async () => {
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'dan@example.com');
+      // First vote — goes through normally.
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1))
+        .expect(200);
+      expect(calls).toHaveLength(2);
+      calls.length = 0;
+      // Second identical vote in the same tick — both entries
+      // should now short-circuit.
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      expect(calls).toHaveLength(0);
+      expect(
+        res.body.results.every((r) => r.skipped === 'recently_relayed')
+      ).toBe(true);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('vote-change path relays afresh and UPSERTs the receipt in place', async () => {
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'eve@example.com');
+      // First vote: yes.
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1, { voteOutcome: 'yes' }))
+        .expect(200);
+      calls.length = 0;
+      // Flip to no. Both entries should relay again (not skip)
+      // because the outcome is different.
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1, { voteOutcome: 'no' }));
+      expect(res.status).toBe(200);
+      expect(calls).toHaveLength(2);
+      expect(
+        res.body.results.every((r) => r.ok && !r.skipped)
+      ).toBe(true);
+      const uid = await userIdFor(ctx, 'eve@example.com');
+      const receipts = ctx.voteReceipts.listForProposal(uid, H1);
+      expect(receipts).toHaveLength(2);
+      // Both receipts now reflect the new outcome — the UPSERT
+      // replaced the previous yes rows in place, not inserted new
+      // ones (the UNIQUE constraint would have blocked that anyway).
+      expect(receipts.every((r) => r.voteOutcome === 'no')).toBe(true);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /gov/receipts
+//
+// These tests exercise the shape of the response (reconciled vs stored),
+// the freshness-skip optimisation, the ?refresh=1 override, and the
+// graceful-degradation behaviour when the reconcile RPC is unavailable.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// GET /gov/receipts is a PURE READ: no RPC, no DB writes, no reconcile.
+// Reconciliation lives on POST /gov/receipts/reconcile (CSRF-protected,
+// tests directly below this describe block).
+// ---------------------------------------------------------------------------
+
+describe('GET /gov/receipts', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app).get(
+        `/gov/receipts?proposalHash=${H1}`
+      );
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('400 invalid_proposal_hash when query param missing or malformed', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const missing = await agent.get('/gov/receipts');
+      expect(missing.status).toBe(400);
+      expect(missing.body.error).toBe('invalid_proposal_hash');
+      const malformed = await agent.get('/gov/receipts?proposalHash=nope');
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe('invalid_proposal_hash');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty + reconciled:false when user has no receipts', async () => {
+    const { ctx } = buildApp({ getCurrentVotes: jest.fn() });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ receipts: [], reconciled: false });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns stored rows as-is and NEVER calls getCurrentVotes', async () => {
+    // Codex-review guard: GET must NOT trigger RPC. A CSRF-exempt
+    // GET that performs RPC + DB writes would let a cross-site
+    // top-level navigation or <img> tag silently trigger server-
+    // side state changes on behalf of the authenticated user.
+    const getCurrentVotes = jest.fn(async () => [
+      {
+        voteHash: 'f'.repeat(64),
+        collateralHash: H2,
+        collateralIndex: 0,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+      },
+    ]);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent } = await loggedInAgent(ctx, 'alice@example.com');
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(false);
+      expect(res.body.updated).toBeUndefined();
+      expect(res.body.reconcileError).toBeUndefined();
+      expect(res.body.receipts).toHaveLength(1);
+      // Status is untouched — GET did NOT reconcile.
+      expect(res.body.receipts[0]).toMatchObject({ status: 'relayed' });
+      expect(getCurrentVotes).not.toHaveBeenCalled();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('synchronous listForProposal throw is handled as 500 internal', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx, 'hank@example.com');
+      const orig = ctx.voteReceipts.listForProposal;
+      ctx.voteReceipts.listForProposal = () => {
+        throw new Error('disk gone');
+      };
+      try {
+        const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      } finally {
+        ctx.voteReceipts.listForProposal = orig;
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('does not leak receipts across users', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
+      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
+      const aId = await userIdFor(ctx, 'a@example.com');
+      ctx.voteReceipts.upsert({
+        userId: aId,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const aRes = await aAgent.get(`/gov/receipts?proposalHash=${H1}`);
+      const bRes = await bAgent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(aRes.body.receipts).toHaveLength(1);
+      expect(bRes.body.receipts).toHaveLength(0);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /gov/receipts/reconcile
+//
+// State-changing reconcile path. CSRF-protected; may call
+// `gobject_getcurrentvotes` and may write `status` + `verified_at`
+// to vote_receipts. Historically lived on GET /gov/receipts but
+// was split out so CSRF-exempt GETs remain side-effect-free.
+// ---------------------------------------------------------------------------
+
+describe('POST /gov/receipts/reconcile', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app)
+        .post('/gov/receipts/reconcile')
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('403 csrf_missing when authenticated without CSRF token', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('csrf_missing');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('400 invalid_proposal_hash when body.proposalHash is missing / malformed', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const missing = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({});
+      expect(missing.status).toBe(400);
+      expect(missing.body.error).toBe('invalid_proposal_hash');
+      const malformed = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: 'nope' });
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe('invalid_proposal_hash');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty + reconciled:false when user has no receipts', async () => {
+    const getCurrentVotes = jest.fn();
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ receipts: [], reconciled: false });
+      expect(getCurrentVotes).not.toHaveBeenCalled();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('reconciles on demand: flips relayed → confirmed when RPC reports the vote', async () => {
+    const getCurrentVotes = jest.fn(async () => [
+      {
+        voteHash: 'f'.repeat(64),
+        collateralHash: H2,
+        collateralIndex: 0,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+      },
+    ]);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'alice@example.com');
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(true);
+      expect(res.body.updated).toBe(1);
+      expect(res.body.receipts).toHaveLength(1);
+      expect(res.body.receipts[0]).toMatchObject({
+        status: 'confirmed',
+        voteOutcome: 'yes',
+      });
+      expect(res.body.receipts[0].verifiedAt).toEqual(expect.any(Number));
+      expect(getCurrentVotes).toHaveBeenCalledTimes(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('future-stamped verified_at is NOT treated as fresh (forces reconcile)', async () => {
+    const getCurrentVotes = jest.fn(async () => []);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'greta@example.com');
+      const uid = await userIdFor(ctx, 'greta@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.db
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
+        .run(Date.now() + 60 * 60 * 1000, uid);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(200);
+      expect(getCurrentVotes).toHaveBeenCalledTimes(1);
+      expect(res.body.reconciled).toBe(true);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('skips RPC when every receipt is confirmed and freshly verified', async () => {
+    const getCurrentVotes = jest.fn();
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'bob@example.com');
+      const uid = await userIdFor(ctx, 'bob@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.db
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
+        .run(Date.now(), uid);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(false);
+      expect(res.body.receipts).toHaveLength(1);
+      expect(getCurrentVotes).not.toHaveBeenCalled();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('refresh:true forces reconciliation even when freshness window is intact', async () => {
+    const getCurrentVotes = jest.fn(async () => []);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'carol@example.com');
+      const uid = await userIdFor(ctx, 'carol@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.db
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
+        .run(Date.now(), uid);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1, refresh: true });
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(true);
+      expect(getCurrentVotes).toHaveBeenCalledTimes(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns stored rows with reconcileError when RPC fails', async () => {
+    const getCurrentVotes = jest.fn(async () => {
+      throw new Error('connection refused');
+    });
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const { agent, csrf } = await loggedInAgent(ctx, 'dan@example.com');
+        const uid = await userIdFor(ctx, 'dan@example.com');
+        ctx.voteReceipts.upsert({
+          userId: uid,
+          collateralHash: H2,
+          collateralIndex: 0,
+          proposalHash: H1,
+          voteOutcome: 'yes',
+          voteSignal: 'funding',
+          voteTime: 1_700_000_000,
+          status: 'relayed',
+        });
+        const res = await agent
+          .post('/gov/receipts/reconcile')
+          .set('X-CSRF-Token', csrf)
+          .send({ proposalHash: H1 });
+        expect(res.status).toBe(200);
+        expect(res.body.reconciled).toBe(false);
+        expect(res.body.reconcileError).toBe('rpc_failed');
+        expect(res.body.receipts).toHaveLength(1);
+        expect(res.body.receipts[0].status).toBe('relayed');
+      } finally {
+        warnSpy.mockRestore();
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns stored rows with reconciled:false when getCurrentVotes is not wired', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'eve@example.com');
+      const uid = await userIdFor(ctx, 'eve@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(false);
+      expect(res.body.reconcileError).toBeUndefined();
+      expect(res.body.receipts).toHaveLength(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('synchronous listForProposal throw is handled as 500 internal', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'hank@example.com');
+      const orig = ctx.voteReceipts.listForProposal;
+      ctx.voteReceipts.listForProposal = () => {
+        throw new Error('disk gone');
+      };
+      try {
+        const res = await agent
+          .post('/gov/receipts/reconcile')
+          .set('X-CSRF-Token', csrf)
+          .send({ proposalHash: H1 });
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      } finally {
+        ctx.voteReceipts.listForProposal = orig;
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /gov/receipts/summary
+//
+// Pure SELECT rollup — no RPC, no reconciliation. Asserts shape,
+// per-user isolation, and that it handles the no-receipts case.
+// ---------------------------------------------------------------------------
+
+describe('GET /gov/receipts/summary', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app).get('/gov/receipts/summary');
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty array when user has no receipts', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/receipts/summary');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ summary: [] });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('aggregates status counts per proposal', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx, 'alice@example.com');
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      // H1: 2 confirmed yes, 1 failed
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H3,
+        collateralIndex: 1,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 1,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'failed',
+        lastError: 'signature_invalid',
+      });
+      // H2: 1 relayed
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 2,
+        proposalHash: H2,
+        voteOutcome: 'no',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_001,
+        status: 'relayed',
+      });
+      const res = await agent.get('/gov/receipts/summary');
+      expect(res.status).toBe(200);
+      expect(res.body.summary).toHaveLength(2);
+      const byProposal = Object.fromEntries(
+        res.body.summary.map((r) => [r.proposalHash, r])
+      );
+      expect(byProposal[H1]).toMatchObject({
+        total: 3,
+        confirmed: 2,
+        failed: 1,
+        relayed: 0,
+        stale: 0,
+        confirmedYes: 2,
+        confirmedNo: 0,
+      });
+      expect(byProposal[H2]).toMatchObject({
+        total: 1,
+        relayed: 1,
+        confirmed: 0,
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('does not leak summaries across users', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
+      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
+      const aId = await userIdFor(ctx, 'a@example.com');
+      ctx.voteReceipts.upsert({
+        userId: aId,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      const aRes = await aAgent.get('/gov/receipts/summary');
+      const bRes = await bAgent.get('/gov/receipts/summary');
+      expect(aRes.body.summary).toHaveLength(1);
+      expect(bRes.body.summary).toHaveLength(0);
     } finally {
       ctx.db.close();
     }

@@ -29,6 +29,21 @@ const {
 } = require('./lib/appFactory');
 const dataStore = require('./data/dataStore');
 const { client, rpcServices } = require('./services/rpcClient');
+const { createCurrentVotesCache } = require('./lib/voteReceipts');
+
+// Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
+// hitting GET /gov/receipts for the same proposal share one RPC; a
+// successful response is memoized for the cache's default TTL (2
+// minutes), aligned with the receipts freshness window so the two
+// layers decay together.
+//
+// The RPC name on syscoin-js is resolved dynamically via the stub's
+// `callee.name.toLowerCase()` trick — camelCase `gObject_getCurrentVotes`
+// maps to snake_case `gobject_getcurrentvotes` at call time.
+const currentVotesCache = createCurrentVotesCache({
+  callRpc: (proposalHash) =>
+    rpcServices(client.callRpc).gObject_getCurrentVotes(proposalHash).call(),
+});
 
 const app = express();
 
@@ -139,6 +154,9 @@ mountAuthAndVault(app, {
         voteSig
       )
       .call(true),
+  getCurrentVotes: (proposalHash) => currentVotesCache.get(proposalHash),
+  invalidateCurrentVotes: (proposalHash) =>
+    currentVotesCache.invalidate(proposalHash),
 });
 
 // -----------------------------------------------------------------------------
