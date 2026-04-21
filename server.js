@@ -32,6 +32,7 @@ const { client, rpcServices } = require('./services/rpcClient');
 const { createCurrentVotesCache } = require('./lib/voteReceipts');
 const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
+const { createProposalDispatcher } = require('./lib/proposalDispatcher');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -141,6 +142,40 @@ const services = finalizeSessionMw(buildServices({ db }));
 // would see a 401.
 app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 
+// Proposal RPC adapter.
+//
+// The governance-proposals code (dispatcher + prepare pre-flight) speaks
+// a camelCase surface on purpose — see lib/proposalDispatcher.js for
+// the full rationale. @syscoin/syscoin-js exposes snake_case methods
+// (`gObject_submit`, `gObject_check`, `getRawTransaction`) that return
+// a "stub" you `.call()` to actually fire, so we build the adapter
+// here once and inject it into appFactory.
+//
+// Every adapter function returns a Promise that resolves to the parsed
+// RPC result or rejects with the upstream Error. We pass `true` to
+// `.call()` only where a truthy/verbose response is needed.
+const proposalRpc = {
+  async getRawTransaction(txid, verbose) {
+    return rpcServices(client.callRpc)
+      .getRawTransaction(txid, verbose ? 1 : 0)
+      .call();
+  },
+  async gObjectSubmit(parentHash, revision, time, dataHex, feeTxid) {
+    return rpcServices(client.callRpc)
+      .gObject_submit(parentHash, String(revision), String(time), dataHex, feeTxid)
+      .call(true);
+  },
+  async gObjectCheck(parentHash, revision, time, dataHex) {
+    // gObject_check is a read-only validation endpoint (no state
+    // mutation, no fee). We swallow "Not Implemented" style errors
+    // at the route layer (see routes/govProposals.js) so that older
+    // Core builds degrade silently to "skip pre-flight".
+    return rpcServices(client.callRpc)
+      .gObject_check(parentHash, String(revision), String(time), dataHex)
+      .call();
+  },
+};
+
 mountAuthAndVault(app, {
   services,
   mailer,
@@ -167,6 +202,7 @@ mountAuthAndVault(app, {
   getCurrentVotes: (proposalHash) => currentVotesCache.get(proposalHash),
   invalidateCurrentVotes: (proposalHash) =>
     currentVotesCache.invalidate(proposalHash),
+  proposalRpc,
 });
 
 // -----------------------------------------------------------------------------
@@ -269,6 +305,65 @@ setTimeout(() => {
       console.error('[reminder] tick failed', err && err.message);
     });
   }, 60 * 60 * 1000).unref();
+}, 5 * 60 * 1000).unref();
+
+// -----------------------------------------------------------------------------
+// Proposal dispatcher (PR 8).
+//
+// Walks `awaiting_collateral` submissions: bumps confirmation counts
+// from getRawTransaction, fires gObject_submit once >= 6 confs, and
+// transitions rows to `submitted` or `failed`. The mailer hooks
+// resolve the submission's user and send the corresponding template.
+//
+// Same cadence philosophy as the reminder dispatcher: first tick a
+// few minutes after boot (lets the RPC warm up) and then once a
+// minute — fast enough that the 6-conf threshold is observed within
+// about a block of real confirmation, slow enough to be polite to
+// the RPC node (N rows → N getRawTransaction calls per tick). The
+// timer is .unref()'d so it never keeps the process alive on its own.
+// -----------------------------------------------------------------------------
+const proposalDispatcher = createProposalDispatcher({
+  submissions: services.proposalSubmissions,
+  rpc: proposalRpc,
+  onSubmitted: async ({ submission }) => {
+    const user = services.users.findById(submission.userId);
+    if (!user || !user.email) return;
+    await mailer.sendProposalSubmitted({
+      to: user.email,
+      proposalName: submission.name,
+      governanceHash: submission.governanceHash,
+      collateralTxid: submission.collateralTxid,
+      submissionId: submission.id,
+    });
+  },
+  onFailed: async ({ submission }) => {
+    const user = services.users.findById(submission.userId);
+    if (!user || !user.email) return;
+    await mailer.sendProposalFailed({
+      to: user.email,
+      proposalName: submission.name,
+      failReason: submission.failReason,
+      failDetail: submission.failDetail,
+      submissionId: submission.id,
+    });
+  },
+  log: (level, event, meta) => {
+    // eslint-disable-next-line no-console
+    console.log(`[proposal] ${level} ${event}`, meta || '');
+  },
+});
+
+setTimeout(() => {
+  proposalDispatcher.tick().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error('[proposal] initial tick failed', err && err.message);
+  });
+  setInterval(() => {
+    proposalDispatcher.tick().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error('[proposal] tick failed', err && err.message);
+    });
+  }, 60 * 1000).unref();
 }, 5 * 60 * 1000).unref();
 
 const PORT = process.env.PORT || 8080;
