@@ -400,6 +400,42 @@ describe('auth routes', () => {
     expect(stillOld.status).toBe(200);
   });
 
+  test('POST /auth/change-password: vault-presence check runs inside the transaction (Codex round-2 P2)', async () => {
+    // The handler must not decide "no vault → plain rotation" based
+    // on a read that happens BEFORE the auth-rotation transaction.
+    // If it did, a concurrent writer that created the user's first
+    // vault row between that read and our COMMIT would leave the
+    // vault wrapped under the OLD password. Collapsing the check
+    // into the same transaction as updateAuthHash eliminates that
+    // window (better-sqlite3 serializes in-process; SQLite's write
+    // lock serializes across processes).
+    //
+    // This test instruments `vaults.get` to record whether
+    // `db.inTransaction` is true at call time, then drives a normal
+    // /change-password (no vault row yet). The check MUST have run
+    // inside an open transaction.
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const originalGet = ctx.vaults.get.bind(ctx.vaults);
+    const getTxStates = [];
+    ctx.vaults.get = (...args) => {
+      getTxStates.push(ctx.db.inTransaction);
+      return originalGet(...args);
+    };
+    try {
+      const NEW =
+        'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+      const res = await agent
+        .post('/auth/change-password')
+        .set('X-CSRF-Token', csrf)
+        .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: NEW });
+      expect(res.status).toBe(200);
+      expect(getTxStates.length).toBeGreaterThanOrEqual(1);
+      expect(getTxStates.every((inTx) => inTx === true)).toBe(true);
+    } finally {
+      ctx.vaults.get = originalGet;
+    }
+  });
+
   test('POST /auth/change-password: user with NO vault row can omit `vault` (plain auth rotation)', async () => {
     // The historical behavior — a user who registered but never
     // imported voting keys has no vault row. Rotating their password

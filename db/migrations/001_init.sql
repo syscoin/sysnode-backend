@@ -7,6 +7,16 @@
 -- stays intact so that *post-launch* schema changes can be added as
 -- new migration files.
 --
+-- Reviewer / automated-review guidance:
+--   Until v1 ships, this file is the schema. Any rename, column
+--   addition, or constraint change that lands BEFORE launch belongs
+--   here, edited in place. Do NOT propose a forward ALTER TABLE
+--   migration as a "safer" alternative — there is no deployed
+--   database to migrate from, so a forward migration would only add
+--   file-count noise while describing a history that never existed.
+--   Once v1 is in production, this rule inverts and every schema
+--   change becomes a new 002+ file.
+--
 -- Table overview
 -- --------------
 -- users
@@ -117,13 +127,24 @@ CREATE INDEX idx_tracked_mn_user ON tracked_masternodes(user_id);
 CREATE INDEX idx_tracked_mn_outpoint
   ON tracked_masternodes(collateral_txid, collateral_vout);
 
+-- vote_reminder_log
+--   Idempotency table for the reminder dispatcher. One row per
+--   (user, governance cycle, bucket) — NOT per individual proposal —
+--   because a single cycle bundles every proposal sharing a closing
+--   window, and the product rule is "at most one reminder per cycle
+--   per bucket regardless of proposal count". The dispatcher writes
+--   a cycle identifier (e.g. `cycle:<voting_deadline_unix>`) into
+--   scope_key; the UNIQUE constraint is what makes the tick
+--   replay-safe. Column is `scope_key` from day one (not renamed
+--   from `proposal_hash`) — see the pre-launch editing rule in the
+--   header of this file.
 CREATE TABLE vote_reminder_log (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  proposal_hash   TEXT    NOT NULL,
+  scope_key       TEXT    NOT NULL,
   bucket          TEXT    NOT NULL,
   sent_at         INTEGER NOT NULL,
-  UNIQUE(user_id, proposal_hash, bucket)
+  UNIQUE(user_id, scope_key, bucket)
 );
 
 CREATE INDEX idx_vote_reminder_sent ON vote_reminder_log(sent_at);

@@ -548,13 +548,18 @@ function createAuthRouter({
       //     entirely (plain auth rotation). If the client still sends
       //     a vault in this state, we pass it through as a first-write
       //     (ifMatch='*' from the client side is expected).
-      const existingVault =
-        vaults && typeof vaults.get === 'function'
-          ? vaults.get(req.user.id)
-          : null;
-      if (existingVault && !parsed.data.vault) {
-        return res.status(409).json({ error: 'vault_rewrap_required' });
-      }
+      //
+      // The vault-presence check lives INSIDE the runAtomic() block
+      // below (not here). Why: in a multi-worker deployment, a second
+      // request could create this user's first vault row between a
+      // pre-transaction SELECT and the COMMIT of the auth rotation,
+      // at which point this handler would have already decided "no
+      // vault — plain rotation" and would commit a new authHash that
+      // cannot open the vault the peer just wrote. Holding the check
+      // inside the same transaction as updateAuthHash collapses that
+      // window to zero (better-sqlite3 serializes writes in-process;
+      // across processes, SQLite's write lock serializes the commit).
+      // Codex round-2 P2.
 
       // Atomic rotation of auth state + (optional) vault wrap.
       //
@@ -562,10 +567,12 @@ function createAuthRouter({
       // rolls back the whole thing so the only observable outcomes are
       // "fully rotated" or "no change":
       //
-      //   1. users.updateAuthHash      (new password authHash)
-      //   2. vaults.put (if provided)  (rewrapped blob under new vaultKey)
-      //   3. sessions.revokeAllForUser (kicks other devices)
-      //   4. sessions.issue            (fresh session for this device)
+      //   1. vault presence check      (409 if vault exists but client
+      //                                 omitted the rewrap)
+      //   2. users.updateAuthHash      (new password authHash)
+      //   3. vaults.put (if provided)  (rewrapped blob under new vaultKey)
+      //   4. sessions.revokeAllForUser (kicks other devices)
+      //   5. sessions.issue            (fresh session for this device)
       //
       // Order note: we rewrap the vault BEFORE rotating the authHash
       // so that if the vault.put throws (etag_mismatch, blob_too_large),
@@ -580,6 +587,19 @@ function createAuthRouter({
       let token, expiresAt, newVaultEtag;
       try {
         ({ token, expiresAt, newVaultEtag } = runAtomic(() => {
+          // In-transaction vault-presence check. Throws a tagged
+          // error that the outer catch translates to 409; the throw
+          // rolls back the transaction before any state is written.
+          const existingVault =
+            vaults && typeof vaults.get === 'function'
+              ? vaults.get(req.user.id)
+              : null;
+          if (existingVault && !parsed.data.vault) {
+            const err = new Error('vault_rewrap_required');
+            err.code = 'vault_rewrap_required';
+            throw err;
+          }
+
           let resultEtag = null;
           if (parsed.data.vault) {
             // put() throws on etag_mismatch / etag_required /
@@ -603,6 +623,9 @@ function createAuthRouter({
       } catch (err) {
         // Map vault errors back to the same HTTP shape the /vault
         // route uses, so clients can reuse their existing handlers.
+        if (err && err.code === 'vault_rewrap_required') {
+          return res.status(409).json({ error: 'vault_rewrap_required' });
+        }
         if (err && err.code === 'etag_mismatch') {
           return res.status(412).json({ error: 'precondition_failed' });
         }
