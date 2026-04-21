@@ -16,13 +16,53 @@ const RegisterSchema = z.object({
 
 const LoginSchema = RegisterSchema;
 
+// PR 7 — password change now rotates the vault wrap atomically.
+//
+// The client re-derives the new vaultKey from (newPassword, email,
+// saltV), fetches the current vault blob + etag, re-wraps the inner
+// Data Key under the new vaultKey (byte-identical payload), and
+// submits the rewrapped blob here alongside the new authHash. The
+// server performs the auth rotation AND the vault write inside a
+// single DB transaction, so either both land or neither does. That
+// closes the "stored_auth rewritten but vault still wrapped under the
+// old key" lockout window the envelope.js comment warns about
+// (see sysnode-info/src/lib/crypto/envelope.js:12–16).
+//
+// Clients without a vault row (registered but never imported keys)
+// can omit the `vault` field. The handler detects that case and
+// refuses password change if the user actually has an existing vault
+// that was not rewrapped, rather than silently leaving them locked
+// out.
 const ChangePasswordSchema = z.object({
   oldAuthHash: HEX_32_SCHEMA,
   newAuthHash: HEX_32_SCHEMA,
+  vault: z
+    .object({
+      blob: z.string().min(1),
+      // If-Match equivalent. Echo the etag the client observed on its
+      // most recent GET /vault. For first-write rotations (empty
+      // vault), send '*' explicitly.
+      ifMatch: z.string().min(1),
+    })
+    .optional(),
 });
 
 const VerifySchema = z.object({
   token: z.string().regex(/^[0-9a-f]{64}$/),
+});
+
+// PR 7 — account deletion (GDPR "right to erasure").
+//
+// Requires the user to re-prove possession of the current password
+// (same `oldAuthHash` re-derivation the client already performs for
+// /change-password). A hijacked session alone is NOT enough to nuke
+// the account — the attacker would also need the password.
+//
+// Body is intentionally minimal (no confirmation tokens, email
+// echoes, etc.): the UI handles the "are you sure" ceremony, the
+// server's job is to validate credentials and erase durably.
+const DeleteAccountSchema = z.object({
+  oldAuthHash: HEX_32_SCHEMA,
 });
 
 function badRequest(res, code, details) {
@@ -51,6 +91,7 @@ function createAuthRouter({
   users,
   sessions,
   pendingRegistrations,
+  vaults,
   mailer,
   sessionMw,
   csrfMw,
@@ -62,6 +103,14 @@ function createAuthRouter({
 }) {
   if (typeof runAtomic !== 'function') {
     throw new Error('createAuthRouter: runAtomic is required');
+  }
+  // `vaults` is optional in principle (some test harnesses mount auth
+  // alone without a vault store), but /auth/change-password refuses to
+  // serve when it is missing and the caller requests a vault-bearing
+  // rotation. A plain auth-only rotation (no vault in the body AND no
+  // vault row) still works without it.
+  if (vaults && typeof vaults.put !== 'function') {
+    throw new Error('createAuthRouter: vaults.put must be a function');
   }
   const router = express.Router();
 
@@ -398,6 +447,61 @@ function createAuthRouter({
   });
 
   // -------------------------------------------------------------------------
+  // GET /auth/prefs / PUT /auth/prefs
+  //
+  // Thin wrappers over notification_prefs. GET is redundant with the
+  // `notificationPrefs` field on /auth/me but exists as a tight,
+  // cacheable endpoint the UI can poll after a PUT without refetching
+  // the full user record (which includes saltV and emailVerified).
+  //
+  // PUT is validated by the whitelist below. We explicitly do NOT
+  // accept arbitrary JSON into notification_prefs — the column is
+  // opaque to the DB schema, but letting the client write any shape
+  // would make it a de-facto property bag that server code would
+  // grow dependencies on. Every preference the UI can toggle must
+  // first be added here.
+  //
+  // Whitelist today:
+  //   voteReminders.enabled  (bool)  — opt-out of governance reminders
+  //
+  // Merging: PUT is a full-document overwrite of the whitelisted
+  // namespaces, NOT a deep merge. If the client sends
+  // { voteReminders: { enabled: false } } we write exactly that. The
+  // client is responsible for echoing any other namespaces it wants
+  // to preserve (today none exist, so it's a non-issue). We document
+  // this explicitly so a future pref added here doesn't silently get
+  // wiped by an older client.
+  const PrefsSchema = z
+    .object({
+      voteReminders: z
+        .object({
+          enabled: z.boolean(),
+        })
+        .strict()
+        .optional(),
+    })
+    .strict();
+
+  router.get('/prefs', sessionMw.requireAuth, (req, res) => {
+    return res.json({ notificationPrefs: req.user.notificationPrefs || {} });
+  });
+
+  router.put(
+    '/prefs',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    (req, res) => {
+      const parsed = PrefsSchema.safeParse(req.body);
+      if (!parsed.success) return badRequest(res, 'invalid_body');
+      // Persist exactly the whitelisted shape.
+      users.updateNotificationPrefs(req.user.id, parsed.data);
+      // Echo back the stored value so the caller can update local
+      // state without a follow-up GET.
+      return res.json({ notificationPrefs: parsed.data });
+    }
+  );
+
+  // -------------------------------------------------------------------------
   // POST /auth/change-password
   // Client re-derives both old & new authHash from old/new passwords and
   // submits both. Server verifies old, rewrites stored_auth, invalidates
@@ -429,32 +533,90 @@ function createAuthRouter({
       if (!confirmed) {
         return res.status(401).json({ error: 'invalid_credentials' });
       }
-      // Atomic rotation of auth state (Codex round-10 P2).
+
+      // Decide whether this request is a vault-bearing rotation or a
+      // plain auth rotation. The contract is:
       //
-      // Without a transaction, the three writes here could leave the
-      // account in torn states on mid-sequence failure:
-      //   (a) updateAuthHash succeeds, revokeAllForUser fails → user's
-      //       password rotated but old sessions on other devices are
-      //       still live (silent auth bypass window).
-      //   (b) both succeed, sessions.issue fails → every session
-      //       revoked including the current one, user gets 500 but is
-      //       silently signed out from everywhere.
-      // Wrapping in a transaction rolls all three back on any throw,
-      // so the only observable outcomes are "fully rotated" or "no
-      // change". The client can retry safely.
+      //   - If the user currently has a vault row, the client MUST
+      //     rewrap and submit it alongside. Omitting the vault would
+      //     leave the user with a new password whose derived vaultKey
+      //     cannot open the still-old-wrapped blob → permanent
+      //     lockout. We refuse with 409 so the client can re-fetch,
+      //     rewrap, and retry instead of soft-failing.
+      //
+      //   - If the user has no vault row, the client MAY omit `vault`
+      //     entirely (plain auth rotation). If the client still sends
+      //     a vault in this state, we pass it through as a first-write
+      //     (ifMatch='*' from the client side is expected).
+      const existingVault =
+        vaults && typeof vaults.get === 'function'
+          ? vaults.get(req.user.id)
+          : null;
+      if (existingVault && !parsed.data.vault) {
+        return res.status(409).json({ error: 'vault_rewrap_required' });
+      }
+
+      // Atomic rotation of auth state + (optional) vault wrap.
+      //
+      // Writes performed inside the transaction, any of which throwing
+      // rolls back the whole thing so the only observable outcomes are
+      // "fully rotated" or "no change":
+      //
+      //   1. users.updateAuthHash      (new password authHash)
+      //   2. vaults.put (if provided)  (rewrapped blob under new vaultKey)
+      //   3. sessions.revokeAllForUser (kicks other devices)
+      //   4. sessions.issue            (fresh session for this device)
+      //
+      // Order note: we rewrap the vault BEFORE rotating the authHash
+      // so that if the vault.put throws (etag_mismatch, blob_too_large),
+      // the auth is never touched. Concretely that means a stale
+      // client — "I thought my old vault etag was X" — surfaces as a
+      // 412 without their password being changed under them.
       //
       // Side-effect note: setSessionCookie + csrfMw.issueCookie live
       // OUTSIDE the transaction (they only set response headers, no DB
-      // writes). They must run after the transaction commits, using the
-      // token/expiresAt produced inside.
-      const { token, expiresAt } = runAtomic(() => {
-        users.updateAuthHash(req.user.id, parsed.data.newAuthHash);
-        sessions.revokeAllForUser(req.user.id);
-        return sessions.issue(req.user.id, {
-          userAgent: req.get('user-agent') || null,
-          ip: req.ip,
-        });
-      });
+      // writes). They must run after the transaction commits, using
+      // the token/expiresAt produced inside.
+      let token, expiresAt, newVaultEtag;
+      try {
+        ({ token, expiresAt, newVaultEtag } = runAtomic(() => {
+          let resultEtag = null;
+          if (parsed.data.vault) {
+            // put() throws on etag_mismatch / etag_required /
+            // invalid_blob / blob_too_large — all of which roll back
+            // the transaction here before we touch auth state. Caught
+            // below and translated into HTTP status codes.
+            const putOut = vaults.put(req.user.id, {
+              blob: parsed.data.vault.blob,
+              ifMatch: parsed.data.vault.ifMatch,
+            });
+            resultEtag = putOut && putOut.etag;
+          }
+          users.updateAuthHash(req.user.id, parsed.data.newAuthHash);
+          sessions.revokeAllForUser(req.user.id);
+          const s = sessions.issue(req.user.id, {
+            userAgent: req.get('user-agent') || null,
+            ip: req.ip,
+          });
+          return { ...s, newVaultEtag: resultEtag };
+        }));
+      } catch (err) {
+        // Map vault errors back to the same HTTP shape the /vault
+        // route uses, so clients can reuse their existing handlers.
+        if (err && err.code === 'etag_mismatch') {
+          return res.status(412).json({ error: 'precondition_failed' });
+        }
+        if (err && err.code === 'etag_required') {
+          return res.status(428).json({ error: 'if_match_required' });
+        }
+        if (err && err.code === 'blob_too_large') {
+          return res.status(413).json({ error: 'blob_too_large' });
+        }
+        if (err && err.code === 'invalid_blob') {
+          return res.status(400).json({ error: 'invalid_blob' });
+        }
+        throw err;
+      }
       sessionMw.setSessionCookie(res, token, expiresAt);
       csrfMw.issueCookie(res, expiresAt);
       try {
@@ -468,7 +630,102 @@ function createAuthRouter({
         // eslint-disable-next-line no-console
         console.error('[auth/change-password] mail failed', err && err.message);
       }
-      return res.json({ status: 'ok', expiresAt });
+      // Include `newVaultEtag` ONLY when the caller submitted a vault
+      // (otherwise it's null and omitting it from the response keeps
+      // the auth-only rotation response identical to the legacy shape).
+      const body = { status: 'ok', expiresAt };
+      if (newVaultEtag) body.newVaultEtag = newVaultEtag;
+      return res.json(body);
+    })
+  );
+
+  // -------------------------------------------------------------------------
+  // DELETE /auth/account
+  //
+  // GDPR "right to erasure" endpoint. Permanently removes the user's
+  // account and every row dependent on it. The caller must:
+  //
+  //   - be authenticated on a valid session (sessionMw.requireAuth)
+  //   - pass the CSRF token (csrfMw.require)
+  //   - re-prove the current password (oldAuthHash in the body)
+  //
+  // The password re-proof is the important bit: without it, a stolen
+  // session cookie alone could be used to irrecoverably delete an
+  // account. With it, the attacker would also need the password, at
+  // which point they could already change it or drain the vault — so
+  // the re-proof raises the bar to match the sensitivity of the
+  // operation.
+  //
+  // Deletion is atomic:
+  //
+  //   1. pendingRegistrations.purgeForEmail (not cascaded — keyed by
+  //      email, not user_id; leftover tokens would let the account be
+  //      silently re-registered by whoever still holds the magic link).
+  //   2. users.deleteById, which cascades via FK ON DELETE to
+  //      sessions, vaults, email_verifications, tracked_masternodes,
+  //      vote_reminder_log, vote_receipts. The cascade semantics are
+  //      documented in db/migrations/001_init.sql.
+  //
+  // Response: 204 No Content (nothing useful to echo back — the row
+  // no longer exists). The session cookie and CSRF cookie are
+  // cleared on the response so the client lands on an anonymous
+  // state immediately.
+  //
+  // We do NOT send a "your account was deleted" email. The request
+  // is user-initiated and acknowledged by the UI; sending an email
+  // to a now-nonexistent user's former address risks overreach for
+  // a user who explicitly asked us to stop storing their data.
+  router.delete(
+    '/account',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    asyncHandler(async (req, res) => {
+      const parsed = DeleteAccountSchema.safeParse(req.body);
+      if (!parsed.success) return badRequest(res, 'invalid_body');
+
+      let confirmed;
+      try {
+        confirmed = users.verifyAuth(req.user.email, parsed.data.oldAuthHash);
+      } catch (err) {
+        if (err && err.code === 'kdf_config') {
+          // eslint-disable-next-line no-console
+          console.error(
+            '[auth/delete-account] kdf config error',
+            err.message
+          );
+          return res.status(503).json({ error: 'server_misconfigured' });
+        }
+        throw err;
+      }
+      if (!confirmed) {
+        return res.status(401).json({ error: 'invalid_credentials' });
+      }
+
+      const userId = req.user.id;
+      const userEmail = req.user.email;
+      runAtomic(() => {
+        if (
+          pendingRegistrations &&
+          typeof pendingRegistrations.purgeForEmail === 'function'
+        ) {
+          pendingRegistrations.purgeForEmail(userEmail);
+        }
+        const changed = users.deleteById(userId);
+        if (changed === 0) {
+          // Extremely unlikely — requireAuth just resolved this user
+          // milliseconds ago. Concurrent delete (second tab?) races
+          // converge to the same "already gone" outcome, which we
+          // treat as success.
+        }
+      });
+
+      // Clear cookies unconditionally — the DB transaction succeeded,
+      // so the user is definitely gone; any remaining `sid` / `csrf`
+      // on the client would point at a cascaded-away sessions row and
+      // confuse the next request.
+      sessionMw.clearSessionCookie(res);
+      csrfMw.clearCookie(res);
+      return res.status(204).end();
     })
   );
 

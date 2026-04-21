@@ -37,8 +37,11 @@
 --   lives on the user row (see above).
 --
 -- tracked_masternodes, vote_reminder_log
---   Opt-in vote-reminder machinery. Populated only when the user turns
---   on voteReminders in notification_prefs.
+--   Opt-in vote-reminder machinery. vote_reminder_log is written by
+--   the governance reminder dispatcher the moment an email goes out,
+--   keyed by (user_id, scope_key, bucket) for idempotency across
+--   dispatcher ticks. scope_key is dispatcher-owned; see the table
+--   definition below for today's format.
 --
 -- pending_registrations
 --   Holds /auth/register submissions (email + HMAC'd stored_auth) until
@@ -117,13 +120,29 @@ CREATE INDEX idx_tracked_mn_user ON tracked_masternodes(user_id);
 CREATE INDEX idx_tracked_mn_outpoint
   ON tracked_masternodes(collateral_txid, collateral_vout);
 
+-- vote_reminder_log — idempotency log for the governance reminder
+-- dispatcher. A row is inserted the moment an email is sent so that a
+-- subsequent tick (hourly) for the same (user, scope_key, bucket) does
+-- NOT re-send.
+--
+-- `scope_key` is an opaque idempotency key whose format is owned by the
+-- dispatcher. Today that is `cycle:<voting_deadline_unix>` — one cycle
+-- spans all proposals sharing a closing window, so a user receives at
+-- most one reminder per (cycle, bucket) regardless of how many
+-- proposals are in the cycle. We keep the column generic rather than
+-- tying it to a proposal hash so future dispatchers can scope by
+-- other granularities (per-proposal, per-superblock, per-user-MN)
+-- without a schema migration.
+--
+-- `bucket` today is one of 'days_before' | 'final_24h' (see
+-- lib/reminderDispatcher.js).
 CREATE TABLE vote_reminder_log (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  proposal_hash   TEXT    NOT NULL,
+  scope_key       TEXT    NOT NULL,
   bucket          TEXT    NOT NULL,
   sent_at         INTEGER NOT NULL,
-  UNIQUE(user_id, proposal_hash, bucket)
+  UNIQUE(user_id, scope_key, bucket)
 );
 
 CREATE INDEX idx_vote_reminder_sent ON vote_reminder_log(sent_at);

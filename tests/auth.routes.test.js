@@ -302,6 +302,367 @@ describe('auth routes', () => {
     expect(res.status).toBe(401);
   });
 
+  // ---------------------------------------------------------------------
+  // PR 7 — atomic vault rewrap inside /auth/change-password
+  // ---------------------------------------------------------------------
+  //
+  // The previous /change-password rotated stored_auth only. That left
+  // a torn-state window: the user's new password derives a new
+  // vaultKey, but the stored vault blob is still wrapped under the
+  // old vaultKey → permanent lockout until they restore the old
+  // password (which is now gone). PR 7 closes the window by
+  // requiring the client to submit the rewrapped blob + observed
+  // etag alongside the new authHash, and rolling the auth rotation
+  // + vault.put + session revocation into a single transaction.
+
+  async function registerAndLogin(ctx, email = 'user@example.com') {
+    // Small fixture helper: register → verify → login → return the
+    // authenticated agent and the CSRF token.
+    const agent = request.agent(ctx.app);
+    await agent.post('/auth/register').send({ email, authHash: SAMPLE_AUTH });
+    const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+    await agent.post('/auth/verify-email').send({ token });
+    const loginRes = await agent
+      .post('/auth/login')
+      .send({ email, authHash: SAMPLE_AUTH });
+    const csrf = extractCookies(loginRes).csrf;
+    return { agent, csrf };
+  }
+
+  test('POST /auth/change-password (with vault): updates both auth AND vault atomically', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+
+    // Seed a vault so there is something to rewrap. First-write uses
+    // ifMatch='*'. The blob can be any non-empty string; this route
+    // never introspects it.
+    const putRes = await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', '*')
+      .send({ blob: 'original-blob' });
+    expect(putRes.status).toBe(200);
+    const originalEtag = putRes.body.etag;
+    expect(originalEtag).toMatch(/^[0-9a-f]{64}$/);
+
+    const NEW =
+      'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+    const cp = await agent
+      .post('/auth/change-password')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        oldAuthHash: SAMPLE_AUTH,
+        newAuthHash: NEW,
+        vault: { blob: 'rewrapped-blob', ifMatch: originalEtag },
+      });
+    expect(cp.status).toBe(200);
+    // Response shape includes the new etag so the client can commit
+    // its in-memory vaultKey/etag without a follow-up GET /vault.
+    expect(cp.body.newVaultEtag).toMatch(/^[0-9a-f]{64}$/);
+    expect(cp.body.newVaultEtag).not.toBe(originalEtag);
+
+    // Vault row now has the rewrapped blob + a brand-new etag.
+    const row = ctx.vaults.get(
+      ctx.users.findByEmail('user@example.com').id
+    );
+    expect(row.blob).toBe('rewrapped-blob');
+    expect(row.etag).toBe(cp.body.newVaultEtag);
+
+    // And the new password is what now logs in.
+    const newLogin = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: NEW });
+    expect(newLogin.status).toBe(200);
+  });
+
+  test('POST /auth/change-password: user with existing vault AND no vault body → 409 (prevents silent lockout)', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', '*')
+      .send({ blob: 'some-vault' });
+
+    const NEW =
+      'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+    const res = await agent
+      .post('/auth/change-password')
+      .set('X-CSRF-Token', csrf)
+      // No `vault` field. We must refuse: rotating auth without
+      // rewrapping would lock the user out of their vault forever.
+      .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: NEW });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('vault_rewrap_required');
+
+    // And the password is NOT changed (old login still works).
+    const stillOld = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(stillOld.status).toBe(200);
+  });
+
+  test('POST /auth/change-password: user with NO vault row can omit `vault` (plain auth rotation)', async () => {
+    // The historical behavior — a user who registered but never
+    // imported voting keys has no vault row. Rotating their password
+    // does not require a rewrap; submitting without `vault` is valid.
+    const { agent, csrf } = await registerAndLogin(ctx);
+
+    const NEW =
+      'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+    const res = await agent
+      .post('/auth/change-password')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: NEW });
+    expect(res.status).toBe(200);
+    // No vault was submitted → response shape matches the legacy
+    // auth-only rotation (no newVaultEtag key).
+    expect(res.body.newVaultEtag).toBeUndefined();
+  });
+
+  test('POST /auth/change-password: stale etag → 412 and rolls back auth rotation', async () => {
+    // Critical atomicity invariant: a bad etag must NOT leave the
+    // account half-rotated. We stage a stale etag, attempt the
+    // change, and assert that (a) the 412 surfaces verbatim from the
+    // vault contract and (b) the old password still works.
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const put1 = await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', '*')
+      .send({ blob: 'v1' });
+    const etag1 = put1.body.etag;
+    // Second writer bumps the etag.
+    const put2 = await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', etag1)
+      .send({ blob: 'v2' });
+    expect(put2.status).toBe(200);
+
+    const NEW =
+      'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+    const res = await agent
+      .post('/auth/change-password')
+      .set('X-CSRF-Token', csrf)
+      // Use etag1 — stale.
+      .send({
+        oldAuthHash: SAMPLE_AUTH,
+        newAuthHash: NEW,
+        vault: { blob: 'rewrapped', ifMatch: etag1 },
+      });
+    expect(res.status).toBe(412);
+
+    // Auth was NOT rotated — the transaction rolled back.
+    const stillOld = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(stillOld.status).toBe(200);
+  });
+
+  // ---------------------------------------------------------------------
+  // PR 7 — /auth/prefs
+  // ---------------------------------------------------------------------
+
+  test('GET /auth/prefs returns {} for a fresh account (default opt-in semantics live on the client)', async () => {
+    const { agent } = await registerAndLogin(ctx);
+    const res = await agent.get('/auth/prefs');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ notificationPrefs: {} });
+  });
+
+  test('PUT /auth/prefs persists the opt-out toggle and GET echoes it back', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const put = await agent
+      .put('/auth/prefs')
+      .set('X-CSRF-Token', csrf)
+      .send({ voteReminders: { enabled: false } });
+    expect(put.status).toBe(200);
+    expect(put.body).toEqual({
+      notificationPrefs: { voteReminders: { enabled: false } },
+    });
+
+    const get = await agent.get('/auth/prefs');
+    expect(get.body).toEqual({
+      notificationPrefs: { voteReminders: { enabled: false } },
+    });
+
+    // And /auth/me's embedded copy stays consistent.
+    const me = await agent.get('/auth/me');
+    expect(me.body.user.notificationPrefs).toEqual({
+      voteReminders: { enabled: false },
+    });
+  });
+
+  test('PUT /auth/prefs rejects unknown keys (strict whitelist)', async () => {
+    // The contract is "prefs the server knows about". Rejecting
+    // unknown keys prevents the column from becoming a dumping
+    // ground for client-side state that server code would start
+    // relying on, and catches typos that would silently no-op.
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const res = await agent
+      .put('/auth/prefs')
+      .set('X-CSRF-Token', csrf)
+      .send({ voteReminders: { enabled: true }, totallyFake: 1 });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_body');
+  });
+
+  test('PUT /auth/prefs rejects wrong types on whitelisted keys', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const res = await agent
+      .put('/auth/prefs')
+      .set('X-CSRF-Token', csrf)
+      .send({ voteReminders: { enabled: 'yes-please' } });
+    expect(res.status).toBe(400);
+  });
+
+  test('PUT /auth/prefs requires CSRF and auth', async () => {
+    const agent = request.agent(ctx.app);
+    // Unauthenticated
+    const anon = await agent.put('/auth/prefs').send({
+      voteReminders: { enabled: false },
+    });
+    expect(anon.status).toBe(401);
+  });
+
+  // ---------------------------------------------------------------------
+  // PR 7 — DELETE /auth/account (GDPR right to erasure)
+  // ---------------------------------------------------------------------
+  //
+  // Contract:
+  //   - Requires an authenticated session AND a matching CSRF token.
+  //   - Requires re-proof of the current password (oldAuthHash).
+  //   - Erases the users row; FK cascades wipe sessions, vaults,
+  //     email_verifications, tracked_masternodes, vote_reminder_log,
+  //     and vote_receipts.
+  //   - Purges pending_registrations by email so a stale verification
+  //     link from the deleted account can't be redeemed to silently
+  //     re-register.
+  //   - Clears sid + csrf cookies on the response.
+  //   - Responds 204.
+
+  test('DELETE /auth/account requires an authenticated session', async () => {
+    const anon = await request(ctx.app)
+      .delete('/auth/account')
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    expect(anon.status).toBe(401);
+  });
+
+  test('DELETE /auth/account requires CSRF', async () => {
+    const { agent } = await registerAndLogin(ctx);
+    const noCsrf = await agent
+      .delete('/auth/account')
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    expect(noCsrf.status).toBe(403);
+    expect(noCsrf.body.error).toBe('csrf_missing');
+  });
+
+  test('DELETE /auth/account rejects wrong password with 401 and leaves state intact', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const res = await agent
+      .delete('/auth/account')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: 'deadbeef'.repeat(8) });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe('invalid_credentials');
+    // User still exists.
+    expect(ctx.users.findByEmail('user@example.com')).not.toBeNull();
+  });
+
+  test('DELETE /auth/account validates body shape', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const res = await agent
+      .delete('/auth/account')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: 'not-hex' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_body');
+  });
+
+  test('DELETE /auth/account erases user, cascades dependents, and clears cookies', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const userId = ctx.users.findByEmail('user@example.com').id;
+
+    // Seed a vault so we can verify the cascade wipes it.
+    await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .set('If-Match', '*')
+      .send({ blob: 'keys' });
+
+    // And store a preference so prefs state is non-default too.
+    await agent
+      .put('/auth/prefs')
+      .set('X-CSRF-Token', csrf)
+      .send({ voteReminders: { enabled: false } });
+
+    const del = await agent
+      .delete('/auth/account')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+
+    expect(del.status).toBe(204);
+    // Response body is empty (204 No Content).
+    expect(del.text).toBe('');
+
+    // Cookies cleared on the response so the browser lands anonymous.
+    const rawCookies = del.headers['set-cookie'] || [];
+    expect(rawCookies.some((c) => /^sid=;/.test(c) || /^sid=;/.test(c))).toBe(
+      true
+    );
+    expect(rawCookies.some((c) => /^csrf=;/.test(c))).toBe(true);
+
+    // The user row is gone, along with the vault row (FK cascade).
+    expect(ctx.users.findById(userId)).toBeNull();
+    expect(ctx.vaults.get(userId)).toBeNull();
+
+    // Sessions for this user are cascaded away too — we can no longer
+    // use the stale cookies to reach any authenticated endpoint.
+    const afterDelete = await agent.get('/auth/me');
+    expect(afterDelete.status).toBe(401);
+
+    // And a fresh login with the old credentials fails (the user
+    // doesn't exist anymore) rather than resurrecting the account.
+    const relogin = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(relogin.status).toBe(401);
+  });
+
+  test('DELETE /auth/account purges pending_registrations so a stale link cannot re-register', async () => {
+    // Register + verify + login + delete, then force a fresh pending
+    // registration row issued BEFORE deletion (simulating a user who
+    // clicked re-register, then deleted the account before verifying).
+    // The dispatcher's safety net is that deleteById purges pending
+    // rows keyed by the user's email; any leftover token would
+    // otherwise redeem into a recreated users row.
+    const { agent, csrf } = await registerAndLogin(ctx);
+
+    // Provoke a second pending_registrations row (re-register path).
+    await request(ctx.app)
+      .post('/auth/register')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    // Grab the token on the most recent outbox message.
+    const lastMsg = ctx.mailer.outbox[ctx.mailer.outbox.length - 1];
+    const staleToken = lastMsg.html.match(/token=([0-9a-f]{64})/)[1];
+
+    // Delete the account.
+    const del = await agent
+      .delete('/auth/account')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    expect(del.status).toBe(204);
+
+    // Attempting to redeem the stale token now fails — no pending row
+    // remains to promote into a users row. This is the critical GDPR
+    // guarantee: we don't want an unverified magic link to resurrect
+    // the account the user asked to erase.
+    const redeem = await request(ctx.app)
+      .post('/auth/verify-email')
+      .send({ token: staleToken });
+    expect(redeem.status).toBe(400);
+    expect(ctx.users.findByEmail('user@example.com')).toBeNull();
+  });
+
   test('POST /auth/resend-verification no longer exists — /register is the idempotent resend path', async () => {
     // Codex P2: the old /resend-verification endpoint branched on "does a
     // user row exist?" and thereby leaked account existence via response
