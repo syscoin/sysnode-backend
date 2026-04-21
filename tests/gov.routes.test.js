@@ -52,7 +52,7 @@ async function loggedInAgent(ctx, email = 'user@example.com') {
 // route code holding a stale reference. Our tests mirror that with a
 // mutable `state` object whose `masternodes` property can be swapped
 // between requests.
-function buildApp({ masternodes = [], voteRaw } = {}) {
+function buildApp({ masternodes = [], voteRaw, getCurrentVotes } = {}) {
   const state = { masternodes };
   const calls = [];
   const rawFn =
@@ -64,6 +64,7 @@ function buildApp({ masternodes = [], voteRaw } = {}) {
   const ctx = buildTestApp({
     masternodesProvider: () => state.masternodes,
     voteRaw: rawFn,
+    getCurrentVotes,
   });
   return { ctx, state, calls };
 }
@@ -381,6 +382,576 @@ describe('POST /gov/vote', () => {
         );
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/^duplicate_entry:/);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+describe('POST /gov/vote — receipts integration', () => {
+  function vote(proposal, overrides = {}) {
+    return {
+      proposalHash: proposal,
+      voteOutcome: 'yes',
+      voteSignal: 'funding',
+      time: Math.floor(Date.now() / 1000),
+      entries: [
+        { collateralHash: H2, collateralIndex: 0, voteSig: SIG },
+        { collateralHash: H3, collateralIndex: 1, voteSig: SIG },
+      ],
+      ...overrides,
+    };
+  }
+
+  async function userIdFor(ctx, email) {
+    // The users repo exposes `findByEmail` via ctx.users, which we
+    // can reach from the appFactory return value.
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('successful votes persist receipts with status=relayed', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'alice@example.com');
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1))
+        .expect(200);
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      const receipts = ctx.voteReceipts.listForProposal(uid, H1);
+      expect(receipts).toHaveLength(2);
+      const statuses = receipts.map((r) => r.status).sort();
+      expect(statuses).toEqual(['relayed', 'relayed']);
+      for (const r of receipts) {
+        expect(r.voteOutcome).toBe('yes');
+        expect(r.voteSignal).toBe('funding');
+        expect(r.lastError).toBeNull();
+        expect(r.verifiedAt).toBeNull();
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('failed votes persist receipts with status=failed and the classified code', async () => {
+    const voteRaw = jest.fn().mockImplementation((hash) => {
+      if (hash === H2) return Promise.resolve('ok');
+      return Promise.reject(new Error('Failure to verify vote.'));
+    });
+    const { ctx } = buildApp({ voteRaw });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'bob@example.com');
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      const uid = await userIdFor(ctx, 'bob@example.com');
+      const all = ctx.voteReceipts.listForProposal(uid, H1);
+      const byOutpoint = Object.fromEntries(
+        all.map((r) => [`${r.collateralHash}:${r.collateralIndex}`, r])
+      );
+      expect(byOutpoint[`${H2}:0`]).toMatchObject({
+        status: 'relayed',
+        lastError: null,
+      });
+      expect(byOutpoint[`${H3}:1`]).toMatchObject({
+        status: 'failed',
+        lastError: 'signature_invalid',
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('already-on-chain short-circuit: second vote with same outcome skips voteraw', async () => {
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'carol@example.com');
+      const uid = await userIdFor(ctx, 'carol@example.com');
+      // Seed a confirmed receipt for entry 0 so decideRelay
+      // short-circuits it on the next POST.
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: Math.floor(Date.now() / 1000),
+        status: 'confirmed',
+      });
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      // Only the non-confirmed entry hit the RPC.
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0]).toBe(H3);
+      // Response flags the skipped row so the UI can render
+      // "already on-chain" instead of the neutral "accepted".
+      const byIdx = Object.fromEntries(
+        res.body.results.map((r) => [r.collateralIndex, r])
+      );
+      expect(byIdx[0]).toMatchObject({
+        ok: true,
+        skipped: 'already_on_chain',
+      });
+      expect(byIdx[1]).toMatchObject({ ok: true });
+      expect(byIdx[1].skipped).toBeUndefined();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('recently-relayed short-circuit: duplicate submit within 60s is deduped', async () => {
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'dan@example.com');
+      // First vote — goes through normally.
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1))
+        .expect(200);
+      expect(calls).toHaveLength(2);
+      calls.length = 0;
+      // Second identical vote in the same tick — both entries
+      // should now short-circuit.
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      expect(calls).toHaveLength(0);
+      expect(
+        res.body.results.every((r) => r.skipped === 'recently_relayed')
+      ).toBe(true);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('vote-change path relays afresh and UPSERTs the receipt in place', async () => {
+    const { ctx, calls } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'eve@example.com');
+      // First vote: yes.
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1, { voteOutcome: 'yes' }))
+        .expect(200);
+      calls.length = 0;
+      // Flip to no. Both entries should relay again (not skip)
+      // because the outcome is different.
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1, { voteOutcome: 'no' }));
+      expect(res.status).toBe(200);
+      expect(calls).toHaveLength(2);
+      expect(
+        res.body.results.every((r) => r.ok && !r.skipped)
+      ).toBe(true);
+      const uid = await userIdFor(ctx, 'eve@example.com');
+      const receipts = ctx.voteReceipts.listForProposal(uid, H1);
+      expect(receipts).toHaveLength(2);
+      // Both receipts now reflect the new outcome — the UPSERT
+      // replaced the previous yes rows in place, not inserted new
+      // ones (the UNIQUE constraint would have blocked that anyway).
+      expect(receipts.every((r) => r.voteOutcome === 'no')).toBe(true);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /gov/receipts
+//
+// These tests exercise the shape of the response (reconciled vs stored),
+// the freshness-skip optimisation, the ?refresh=1 override, and the
+// graceful-degradation behaviour when the reconcile RPC is unavailable.
+// ---------------------------------------------------------------------------
+
+describe('GET /gov/receipts', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app).get(
+        `/gov/receipts?proposalHash=${H1}`
+      );
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('400 invalid_proposal_hash when query param missing or malformed', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const missing = await agent.get('/gov/receipts');
+      expect(missing.status).toBe(400);
+      expect(missing.body.error).toBe('invalid_proposal_hash');
+      const malformed = await agent.get('/gov/receipts?proposalHash=nope');
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe('invalid_proposal_hash');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty + reconciled:false when user has no receipts', async () => {
+    const { ctx } = buildApp({
+      getCurrentVotes: jest.fn(),
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ receipts: [], reconciled: false });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('reconciles on demand: flips relayed → confirmed when RPC reports the vote', async () => {
+    const getCurrentVotes = jest.fn(async () => [
+      {
+        voteHash: 'f'.repeat(64),
+        collateralHash: H2,
+        collateralIndex: 0,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+      },
+    ]);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'alice@example.com');
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      // CSRF isn't required for GETs but the cookie still exists;
+      // pass the session-authenticated agent through.
+      void csrf;
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(true);
+      expect(res.body.updated).toBe(1);
+      expect(res.body.receipts).toHaveLength(1);
+      expect(res.body.receipts[0]).toMatchObject({
+        status: 'confirmed',
+        voteOutcome: 'yes',
+      });
+      expect(res.body.receipts[0].verifiedAt).toEqual(expect.any(Number));
+      expect(getCurrentVotes).toHaveBeenCalledTimes(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('skips RPC when every receipt is confirmed and freshly verified', async () => {
+    const getCurrentVotes = jest.fn();
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent } = await loggedInAgent(ctx, 'bob@example.com');
+      const uid = await userIdFor(ctx, 'bob@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      // Force verified_at into the freshness window (just now).
+      ctx.db
+        .prepare(
+          `UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`
+        )
+        .run(Date.now(), uid);
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(false);
+      expect(res.body.receipts).toHaveLength(1);
+      expect(getCurrentVotes).not.toHaveBeenCalled();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('?refresh=1 forces reconciliation even when freshness window is intact', async () => {
+    const getCurrentVotes = jest.fn(async () => []);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent } = await loggedInAgent(ctx, 'carol@example.com');
+      const uid = await userIdFor(ctx, 'carol@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.db
+        .prepare(
+          `UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`
+        )
+        .run(Date.now(), uid);
+      const res = await agent.get(
+        `/gov/receipts?proposalHash=${H1}&refresh=1`
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(true);
+      expect(getCurrentVotes).toHaveBeenCalledTimes(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns stored rows with reconcileError when RPC fails', async () => {
+    const getCurrentVotes = jest.fn(async () => {
+      throw new Error('connection refused');
+    });
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      // Suppress the warn from the route — it's expected for this
+      // case and would otherwise muddy the test output.
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const { agent } = await loggedInAgent(ctx, 'dan@example.com');
+        const uid = await userIdFor(ctx, 'dan@example.com');
+        ctx.voteReceipts.upsert({
+          userId: uid,
+          collateralHash: H2,
+          collateralIndex: 0,
+          proposalHash: H1,
+          voteOutcome: 'yes',
+          voteSignal: 'funding',
+          voteTime: 1_700_000_000,
+          status: 'relayed',
+        });
+        const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+        expect(res.status).toBe(200);
+        expect(res.body.reconciled).toBe(false);
+        expect(res.body.reconcileError).toBe('rpc_failed');
+        expect(res.body.receipts).toHaveLength(1);
+        expect(res.body.receipts[0].status).toBe('relayed');
+      } finally {
+        warnSpy.mockRestore();
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns stored rows with reconciled:false when getCurrentVotes is not wired', async () => {
+    // No getCurrentVotes provided — route should still serve the DB
+    // state without error. Freshness short-circuit does not apply
+    // because the receipt is not confirmed.
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx, 'eve@example.com');
+      const uid = await userIdFor(ctx, 'eve@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(false);
+      expect(res.body.reconcileError).toBeUndefined();
+      expect(res.body.receipts).toHaveLength(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('does not leak receipts across users', async () => {
+    const getCurrentVotes = jest.fn(async () => []);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
+      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
+      const aId = await userIdFor(ctx, 'a@example.com');
+      ctx.voteReceipts.upsert({
+        userId: aId,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const aRes = await aAgent.get(`/gov/receipts?proposalHash=${H1}`);
+      const bRes = await bAgent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(aRes.body.receipts).toHaveLength(1);
+      expect(bRes.body.receipts).toHaveLength(0);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /gov/receipts/summary
+//
+// Pure SELECT rollup — no RPC, no reconciliation. Asserts shape,
+// per-user isolation, and that it handles the no-receipts case.
+// ---------------------------------------------------------------------------
+
+describe('GET /gov/receipts/summary', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app).get('/gov/receipts/summary');
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty array when user has no receipts', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/receipts/summary');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ summary: [] });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('aggregates status counts per proposal', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx, 'alice@example.com');
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      // H1: 2 confirmed yes, 1 failed
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H3,
+        collateralIndex: 1,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 1,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'failed',
+        lastError: 'signature_invalid',
+      });
+      // H2: 1 relayed
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 2,
+        proposalHash: H2,
+        voteOutcome: 'no',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_001,
+        status: 'relayed',
+      });
+      const res = await agent.get('/gov/receipts/summary');
+      expect(res.status).toBe(200);
+      expect(res.body.summary).toHaveLength(2);
+      const byProposal = Object.fromEntries(
+        res.body.summary.map((r) => [r.proposalHash, r])
+      );
+      expect(byProposal[H1]).toMatchObject({
+        total: 3,
+        confirmed: 2,
+        failed: 1,
+        relayed: 0,
+        stale: 0,
+        confirmedYes: 2,
+        confirmedNo: 0,
+      });
+      expect(byProposal[H2]).toMatchObject({
+        total: 1,
+        relayed: 1,
+        confirmed: 0,
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('does not leak summaries across users', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
+      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
+      const aId = await userIdFor(ctx, 'a@example.com');
+      ctx.voteReceipts.upsert({
+        userId: aId,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      const aRes = await aAgent.get('/gov/receipts/summary');
+      const bRes = await bAgent.get('/gov/receipts/summary');
+      expect(aRes.body.summary).toHaveLength(1);
+      expect(bRes.body.summary).toHaveLength(0);
     } finally {
       ctx.db.close();
     }

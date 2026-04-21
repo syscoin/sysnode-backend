@@ -45,6 +45,18 @@
 --   the email is verified, at which point the users row is created from
 --   the pending row. This prevents an attacker from pre-binding their
 --   own credential to a victim's email before the victim verifies.
+--
+-- vote_receipts
+--   One row per (user, masternode, proposal) pairing. Records each
+--   governance vote the user asked us to relay: its outcome/signal, the
+--   nTime captured in the signed preimage, the relay status, and a
+--   verified_at stamp populated by the on-demand reconciler. A vote
+--   change is an UPDATE (unique on user_id + outpoint + proposal), so
+--   the row always reflects the user's most recent intent rather than
+--   their history. We do NOT store the 65-byte voteSig — signatures are
+--   short-lived under Core's time window, and keeping them server-side
+--   expands attack surface with zero replay value; a retry regenerates
+--   a fresh sig client-side from the vault.
 
 CREATE TABLE users (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,3 +141,32 @@ CREATE INDEX idx_pending_registrations_email
 
 CREATE INDEX idx_pending_registrations_expires
   ON pending_registrations(expires_at);
+
+-- vote_receipts: persistent record of each governance vote we relayed on
+-- behalf of a user, scoped per (user, MN, proposal). Populated by
+-- /gov/vote on both successful and failed `voteraw` calls so the UI can
+-- distinguish "already relayed" from "needs retry", and the on-demand
+-- reconciler can flip rows to 'confirmed' or 'stale' after comparing
+-- against Core's gobject_getcurrentvotes. UNIQUE on (user, outpoint,
+-- proposal) makes a vote change an UPDATE in place rather than a new
+-- row; receipts track current intent, not history.
+CREATE TABLE vote_receipts (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  collateral_txid  TEXT    NOT NULL,
+  collateral_vout  INTEGER NOT NULL,
+  proposal_hash    TEXT    NOT NULL,
+  vote_outcome     TEXT    NOT NULL,
+  vote_signal      TEXT    NOT NULL,
+  vote_time        INTEGER NOT NULL,
+  status           TEXT    NOT NULL,
+  last_error       TEXT,
+  submitted_at     INTEGER NOT NULL,
+  verified_at      INTEGER,
+  UNIQUE(user_id, collateral_txid, collateral_vout, proposal_hash)
+);
+
+CREATE INDEX idx_receipts_user_proposal
+  ON vote_receipts(user_id, proposal_hash);
+CREATE INDEX idx_receipts_user_recent
+  ON vote_receipts(user_id, submitted_at DESC);
