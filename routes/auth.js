@@ -534,6 +534,25 @@ function createAuthRouter({
         return res.status(401).json({ error: 'invalid_credentials' });
       }
 
+      // Optional-vaults contract guard. createAuthRouter documents
+      // `vaults` as optional (auth-only harnesses may omit it), but
+      // a vault-bearing rotation fundamentally cannot be served
+      // without a vault repo — the in-transaction vaults.put would
+      // dereference undefined and surface a 500 instead of a
+      // deterministic API error. Fail fast with the same 503 code
+      // used for other config-level failures (kdf_config above).
+      // Codex round-2 P3.
+      if (
+        parsed.data.vault &&
+        !(vaults && typeof vaults.put === 'function')
+      ) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[auth/change-password] vault repo unavailable but client sent vault body'
+        );
+        return res.status(503).json({ error: 'server_misconfigured' });
+      }
+
       // Decide whether this request is a vault-bearing rotation or a
       // plain auth rotation. The contract is:
       //

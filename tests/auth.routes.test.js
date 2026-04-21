@@ -436,6 +436,72 @@ describe('auth routes', () => {
     }
   });
 
+  test('POST /auth/change-password: vault-bearing request with no vault repo fails fast with 503 (Codex round-2 P3)', async () => {
+    // createAuthRouter documents `vaults` as optional (auth-only
+    // harnesses can mount without it). A vault-bearing rotation
+    // fundamentally cannot be served in that mode, and the
+    // in-transaction vaults.put dereference would otherwise throw
+    // a TypeError → 500. The guard must instead surface a
+    // deterministic 503 server_misconfigured. We simulate the
+    // missing-repo mode by deleting the live `put` method from
+    // the shared repo reference the router closed over at
+    // construction time.
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const originalPut = ctx.vaults.put.bind(ctx.vaults);
+    delete ctx.vaults.put;
+    try {
+      const NEW =
+        'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+      const suppressError = jest
+        .spyOn(console, 'error')
+        .mockImplementation(() => {});
+      const res = await agent
+        .post('/auth/change-password')
+        .set('X-CSRF-Token', csrf)
+        .send({
+          oldAuthHash: SAMPLE_AUTH,
+          newAuthHash: NEW,
+          vault: { blob: 'abc', ifMatch: '*' },
+        });
+      suppressError.mockRestore();
+      expect(res.status).toBe(503);
+      expect(res.body.error).toBe('server_misconfigured');
+
+      // Auth was NOT rotated — old password still logs in.
+      const stillOld = await request(ctx.app)
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      expect(stillOld.status).toBe(200);
+    } finally {
+      ctx.vaults.put = originalPut;
+    }
+  });
+
+  test('POST /auth/change-password: auth-only rotation still works when vault repo is absent (Codex round-2 P3)', async () => {
+    // Companion case — the optional-vaults contract says an
+    // auth-only rotation (no vault row, no vault in body) MUST
+    // still succeed when the repo is omitted. Proves the P3 guard
+    // is targeted at the vault-bearing path only.
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const originalPut = ctx.vaults.put.bind(ctx.vaults);
+    const originalGet = ctx.vaults.get.bind(ctx.vaults);
+    delete ctx.vaults.put;
+    delete ctx.vaults.get;
+    try {
+      const NEW =
+        'b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4b1c2d3e4';
+      const res = await agent
+        .post('/auth/change-password')
+        .set('X-CSRF-Token', csrf)
+        .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: NEW });
+      expect(res.status).toBe(200);
+      expect(res.body.newVaultEtag).toBeUndefined();
+    } finally {
+      ctx.vaults.put = originalPut;
+      ctx.vaults.get = originalGet;
+    }
+  });
+
   test('POST /auth/change-password: user with NO vault row can omit `vault` (plain auth rotation)', async () => {
     // The historical behavior — a user who registered but never
     // imported voting keys has no vault row. Rotating their password
