@@ -1392,6 +1392,17 @@ describe('GET /gov/receipts/recent', () => {
 
       const res3 = await agent.get('/gov/receipts/recent?limit=-5');
       expect(res3.status).toBe(400);
+
+      // Partially-numeric and scientific-notation strings also
+      // 400 rather than silently coercing to an integer value.
+      // Previously Number.parseInt('2abc') → 2 and Number
+      // .parseInt('1.5') → 1, masking client bugs.
+      const res4 = await agent.get('/gov/receipts/recent?limit=2abc');
+      expect(res4.status).toBe(400);
+      const res5 = await agent.get('/gov/receipts/recent?limit=1.5');
+      expect(res5.status).toBe(400);
+      const res6 = await agent.get('/gov/receipts/recent?limit=1e3');
+      expect(res6.status).toBe(400);
     } finally {
       ctx.db.close();
     }

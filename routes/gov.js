@@ -421,8 +421,15 @@ function createGovRouter({
       const rawLimit = req.query && req.query.limit;
       let limit = 10;
       if (typeof rawLimit === 'string' && rawLimit.length > 0) {
-        const parsed = Number.parseInt(rawLimit, 10);
-        if (!Number.isInteger(parsed) || parsed <= 0) {
+        // Strict digits-only validation: Number.parseInt would
+        // happily accept "2abc" → 2, "1.5" → 1, "1e3" → 1, and
+        // silently mask client bugs. The route contract promises
+        // an integer in [1, 50] and that's what we enforce here.
+        if (!/^\d+$/.test(rawLimit)) {
+          return res.status(400).json({ error: 'invalid_limit' });
+        }
+        const parsed = Number(rawLimit);
+        if (!Number.isSafeInteger(parsed) || parsed <= 0) {
           return res.status(400).json({ error: 'invalid_limit' });
         }
         limit = Math.min(parsed, 50);
