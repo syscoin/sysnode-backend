@@ -52,7 +52,12 @@ async function loggedInAgent(ctx, email = 'user@example.com') {
 // route code holding a stale reference. Our tests mirror that with a
 // mutable `state` object whose `masternodes` property can be swapped
 // between requests.
-function buildApp({ masternodes = [], voteRaw, getCurrentVotes } = {}) {
+function buildApp({
+  masternodes = [],
+  voteRaw,
+  getCurrentVotes,
+  invalidateCurrentVotes,
+} = {}) {
   const state = { masternodes };
   const calls = [];
   const rawFn =
@@ -65,6 +70,7 @@ function buildApp({ masternodes = [], voteRaw, getCurrentVotes } = {}) {
     masternodesProvider: () => state.masternodes,
     voteRaw: rawFn,
     getCurrentVotes,
+    invalidateCurrentVotes,
   });
   return { ctx, state, calls };
 }
@@ -562,6 +568,50 @@ describe('POST /gov/vote — receipts integration', () => {
     }
   });
 
+  test('POST /gov/vote invalidates the current-votes cache for the proposal', async () => {
+    // Codex-review guard: without cache invalidation, /gov/receipts
+    // called shortly after a vote relay would reconcile against a
+    // pre-relay snapshot (TTL ~2 min), delaying the
+    // relayed→confirmed transition or, worse, re-confirming an old
+    // outcome after a vote change. Asserting the route calls the
+    // injected invalidator with the proposal hash pins the wiring.
+    const invalidateCurrentVotes = jest.fn();
+    const { ctx } = buildApp({ invalidateCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'iris@example.com');
+      await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1))
+        .expect(200);
+      expect(invalidateCurrentVotes).toHaveBeenCalledTimes(1);
+      expect(invalidateCurrentVotes).toHaveBeenCalledWith(H1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('invalidateCurrentVotes throwing does not fail the vote response', async () => {
+    // The invalidator is a best-effort cache eviction — if it throws
+    // (e.g. the cache was disposed during a shutdown race), the user's
+    // vote response MUST still succeed with the relay results.
+    const invalidateCurrentVotes = jest.fn(() => {
+      throw new Error('boom');
+    });
+    const { ctx } = buildApp({ invalidateCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx, 'jules@example.com');
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(vote(H1));
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(2);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
   test('recently-relayed short-circuit: duplicate submit within 60s is deduped', async () => {
     const { ctx, calls } = buildApp();
     try {
@@ -885,6 +935,31 @@ describe('GET /gov/receipts', () => {
       expect(res.body.reconciled).toBe(false);
       expect(res.body.reconcileError).toBeUndefined();
       expect(res.body.receipts).toHaveLength(1);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('synchronous listForProposal throw is handled as 500 internal', async () => {
+    // Codex-review guard: the handler is async, and Express 4 does
+    // not auto-forward rejections from async handlers to error
+    // middleware. A synchronous throw from the DB read must still
+    // yield a deterministic JSON error response, not a hung request
+    // or an unformatted HTML error page.
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx, 'hank@example.com');
+      const orig = ctx.voteReceipts.listForProposal;
+      ctx.voteReceipts.listForProposal = () => {
+        throw new Error('disk gone');
+      };
+      try {
+        const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      } finally {
+        ctx.voteReceipts.listForProposal = orig;
+      }
     } finally {
       ctx.db.close();
     }

@@ -155,6 +155,8 @@ mountAuthAndVault(app, {
       )
       .call(true),
   getCurrentVotes: (proposalHash) => currentVotesCache.get(proposalHash),
+  invalidateCurrentVotes: (proposalHash) =>
+    currentVotesCache.invalidate(proposalHash),
 });
 
 // -----------------------------------------------------------------------------

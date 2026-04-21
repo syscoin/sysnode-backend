@@ -74,6 +74,7 @@ function createGovRouter({
   csrfMw,
   receipts = null,
   getCurrentVotes = null,
+  invalidateCurrentVotes = null,
   receiptsFreshnessMs = DEFAULT_RECEIPTS_FRESHNESS_MS,
   voteLimiter = (_req, _res, next) => next(),
   nowMs = () => Date.now(),
@@ -157,6 +158,30 @@ function createGovRouter({
           receipts,
           userId: req.user && req.user.id,
         });
+        // Invalidate the cached gobject_getcurrentvotes snapshot for
+        // this proposal so the next /gov/receipts read observes the
+        // votes we just relayed (or the chain state that followed
+        // a vote change). Without this, the reconciler could keep
+        // reading a pre-relay snapshot for up to TTL and either
+        // delay the 'relayed'→'confirmed' transition or, on a
+        // vote change, re-confirm the old outcome that is still
+        // present in the stale snapshot. Invalidate regardless of
+        // per-entry outcome: skip results didn't hit the chain
+        // but other entries in the same batch likely did, and the
+        // cost of a single cache drop is negligible.
+        if (typeof invalidateCurrentVotes === 'function') {
+          try {
+            invalidateCurrentVotes(parsed.proposalHash);
+          } catch (cacheErr) {
+            // Never let a cache-eviction issue fail the user's
+            // vote submission.
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[POST /gov/vote] invalidateCurrentVotes threw',
+              cacheErr && cacheErr.message
+            );
+          }
+        }
         return res.json(out);
       } catch (err) {
         // relayVotes only rejects on wiring bugs (no voteRaw passed).
@@ -210,7 +235,21 @@ function createGovRouter({
       }
       const userId = req.user && req.user.id;
       const propLower = proposalHash.toLowerCase();
-      const stored = receipts.listForProposal(userId, propLower);
+
+      // Wrap the whole body. Express 4 does NOT auto-forward
+      // rejections from async handlers, so any synchronous throw
+      // from listForProposal / reconcileForProposal (e.g. a
+      // transient SQLite failure, a closed DB handle) would
+      // otherwise hang the request until the client times out.
+      // Catch-all returns a stable JSON 500 shape instead.
+      let stored;
+      try {
+        stored = receipts.listForProposal(userId, propLower);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[GET /gov/receipts] listForProposal failed', err);
+        return res.status(500).json({ error: 'internal' });
+      }
       if (stored.length === 0) {
         return res.json({ receipts: [], reconciled: false });
       }
