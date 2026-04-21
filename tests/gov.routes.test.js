@@ -1262,3 +1262,174 @@ describe('GET /gov/receipts/summary', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// GET /gov/receipts/recent
+//
+// "Your activity" backing route — the N most-recent receipts across all
+// proposals for the calling user, ordered by submitted_at DESC. Pure
+// SELECT; no RPC.
+// ---------------------------------------------------------------------------
+
+describe('GET /gov/receipts/recent', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app).get('/gov/receipts/recent');
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty list when the user has no receipts', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/receipts/recent');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ receipts: [] });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('defaults to 10 and returns rows in submitted_at DESC', async () => {
+    // Use an injected monotonic clock so every upsert stamps a
+    // distinct submitted_at. Without this, two upserts inside the
+    // same millisecond would tie and the ORDER BY submitted_at
+    // DESC ordering would depend on insertion-order (stable on
+    // better-sqlite3 but brittle to assert against).
+    let tick = 1_700_000_000_000;
+    const { ctx } = buildApp();
+    // Rebuild the receipts repo with a tick clock so we can predict
+    // submitted_at for each upsert.
+    const { createVoteReceiptsRepo } = require('../lib/voteReceipts');
+    ctx.voteReceipts = createVoteReceiptsRepo(ctx.db, {
+      now: () => {
+        tick += 1;
+        return tick;
+      },
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const uid = await userIdFor(ctx, 'user@example.com');
+      for (let i = 0; i < 12; i += 1) {
+        ctx.voteReceipts.upsert({
+          userId: uid,
+          collateralHash: H2,
+          collateralIndex: i,
+          proposalHash: H1,
+          voteOutcome: 'yes',
+          voteSignal: 'funding',
+          voteTime: 1_700_000_000 + i,
+          status: 'confirmed',
+        });
+      }
+      const res = await agent.get('/gov/receipts/recent');
+      expect(res.status).toBe(200);
+      // NOTE: the route's repo in appFactory is the one that
+      // handles the request, not the local `ctx.voteReceipts` we
+      // swapped above — the listRecent it exposes is bound to the
+      // same db. Upserts above wrote to that db; the route will
+      // read them back.
+      expect(res.body.receipts).toHaveLength(10);
+      // Most recent first: submittedAt strictly non-increasing.
+      const submitted = res.body.receipts.map((r) => r.submittedAt);
+      for (let i = 1; i < submitted.length; i += 1) {
+        expect(submitted[i]).toBeLessThanOrEqual(submitted[i - 1]);
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('respects a custom limit and clamps to 50', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const uid = await userIdFor(ctx, 'user@example.com');
+      for (let i = 0; i < 4; i += 1) {
+        ctx.voteReceipts.upsert({
+          userId: uid,
+          collateralHash: H2,
+          collateralIndex: i,
+          proposalHash: H1,
+          voteOutcome: 'yes',
+          voteSignal: 'funding',
+          voteTime: 1_700_000_000 + i,
+          status: 'confirmed',
+        });
+      }
+      const res1 = await agent.get('/gov/receipts/recent?limit=2');
+      expect(res1.body.receipts).toHaveLength(2);
+
+      // Values over 50 silently clamp so a client can ask for
+      // "everything" without coordinating with the server ceiling.
+      const res2 = await agent.get('/gov/receipts/recent?limit=500');
+      expect(res2.status).toBe(200);
+      expect(res2.body.receipts.length).toBeLessThanOrEqual(50);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('rejects invalid limit values with 400', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/receipts/recent?limit=abc');
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'invalid_limit' });
+
+      const res2 = await agent.get('/gov/receipts/recent?limit=0');
+      expect(res2.status).toBe(400);
+
+      const res3 = await agent.get('/gov/receipts/recent?limit=-5');
+      expect(res3.status).toBe(400);
+
+      // Partially-numeric and scientific-notation strings also
+      // 400 rather than silently coercing to an integer value.
+      // Previously Number.parseInt('2abc') → 2 and Number
+      // .parseInt('1.5') → 1, masking client bugs.
+      const res4 = await agent.get('/gov/receipts/recent?limit=2abc');
+      expect(res4.status).toBe(400);
+      const res5 = await agent.get('/gov/receipts/recent?limit=1.5');
+      expect(res5.status).toBe(400);
+      const res6 = await agent.get('/gov/receipts/recent?limit=1e3');
+      expect(res6.status).toBe(400);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('does not leak receipts across users', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
+      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
+      const aId = await userIdFor(ctx, 'a@example.com');
+      ctx.voteReceipts.upsert({
+        userId: aId,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      const aRes = await aAgent.get('/gov/receipts/recent');
+      const bRes = await bAgent.get('/gov/receipts/recent');
+      expect(aRes.body.receipts).toHaveLength(1);
+      expect(bRes.body.receipts).toHaveLength(0);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});

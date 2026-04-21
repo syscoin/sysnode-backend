@@ -390,6 +390,62 @@ function createGovRouter({
     }
   );
 
+  // -------------------------------------------------------------------
+  // GET /gov/receipts/recent?limit=<1..50>
+  //
+  // Returns the user's most recent receipts across ALL proposals,
+  // ordered by submitted_at DESC. Drives the "Your activity" card on
+  // the authenticated Governance page.
+  //
+  // PURE READ — no RPC, no reconciliation. The rows reflect whatever
+  // the reconciler last wrote; the UI is expected to pair each entry
+  // with its proposal from the governance feed to render titles.
+  //
+  // The `limit` query param is clamped to [1, 50]. The backing helper
+  // caps at 100 as a hard ceiling, but we expose a tighter limit at
+  // the route layer because the UI's card is intentionally small and
+  // larger limits would only inflate payload size without use.
+  //
+  // Response shape:
+  //   { receipts: [{ id, proposalHash, collateralHash, collateralIndex,
+  //                  voteOutcome, voteSignal, voteTime, status,
+  //                  lastError, submittedAt, verifiedAt }, ...] }
+  // -------------------------------------------------------------------
+  router.get(
+    '/receipts/recent',
+    sessionMw.requireAuth,
+    (req, res) => {
+      if (!receipts) {
+        return res.json({ receipts: [] });
+      }
+      const rawLimit = req.query && req.query.limit;
+      let limit = 10;
+      if (typeof rawLimit === 'string' && rawLimit.length > 0) {
+        // Strict digits-only validation: Number.parseInt would
+        // happily accept "2abc" → 2, "1.5" → 1, "1e3" → 1, and
+        // silently mask client bugs. The route contract promises
+        // an integer in [1, 50] and that's what we enforce here.
+        if (!/^\d+$/.test(rawLimit)) {
+          return res.status(400).json({ error: 'invalid_limit' });
+        }
+        const parsed = Number(rawLimit);
+        if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+          return res.status(400).json({ error: 'invalid_limit' });
+        }
+        limit = Math.min(parsed, 50);
+      }
+      const userId = req.user && req.user.id;
+      try {
+        const rows = receipts.listRecent(userId, limit);
+        return res.json({ receipts: rows });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[GET /gov/receipts/recent] listRecent failed', err);
+        return res.status(500).json({ error: 'internal' });
+      }
+    }
+  );
+
   return router;
 }
 
