@@ -109,8 +109,21 @@ function createAuthRouter({
   // serve when it is missing and the caller requests a vault-bearing
   // rotation. A plain auth-only rotation (no vault in the body AND no
   // vault row) still works without it.
-  if (vaults && typeof vaults.put !== 'function') {
-    throw new Error('createAuthRouter: vaults.put must be a function');
+  //
+  // When `vaults` IS provided it must be a complete repo — /change-
+  // password uses both `.put` (to rewrap the blob) and `.get` (to
+  // enforce the vault_rewrap_required 409 inside the transaction).
+  // Accepting a partial repo with `put` but no `get` would silently
+  // bypass the 409 guard — a vault-bearing user could rotate their
+  // password without rewrapping and lock themselves out of their
+  // vault. Fail fast at construction instead. Codex round-2 P3.
+  if (vaults) {
+    if (typeof vaults.put !== 'function') {
+      throw new Error('createAuthRouter: vaults.put must be a function');
+    }
+    if (typeof vaults.get !== 'function') {
+      throw new Error('createAuthRouter: vaults.get must be a function');
+    }
   }
   const router = express.Router();
 
@@ -609,10 +622,9 @@ function createAuthRouter({
           // In-transaction vault-presence check. Throws a tagged
           // error that the outer catch translates to 409; the throw
           // rolls back the transaction before any state is written.
-          const existingVault =
-            vaults && typeof vaults.get === 'function'
-              ? vaults.get(req.user.id)
-              : null;
+          // The factory has already validated that `vaults`, if set,
+          // exposes both .get and .put, so no defensive typeof here.
+          const existingVault = vaults ? vaults.get(req.user.id) : null;
           if (existingVault && !parsed.data.vault) {
             const err = new Error('vault_rewrap_required');
             err.code = 'vault_rewrap_required';
