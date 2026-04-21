@@ -496,7 +496,21 @@ function createGovProposalsRouter({
     // when it calls gObject_submit.
     if (typeof rpc.gObjectCheck === 'function') {
       try {
-        const resp = await rpc.gObjectCheck(canon.dataHex);
+        // The production adapter in server.js has the full Core
+        // signature `(parentHash, revision, time, dataHex)`. Earlier
+        // iterations of this route passed only `dataHex`, which
+        // silently shifted args so `dataHex` became `parentHash` and
+        // the real payload was `undefined` — invalid-params errors
+        // then matched the /invalid/ classifier below and masqueraded
+        // as 422 core_rejected on perfectly valid proposals. Always
+        // forward the full canonical argument tuple we just hashed.
+        // (Codex PR8 round 1 P1.)
+        const resp = await rpc.gObjectCheck(
+          parentHash,
+          revision,
+          timeUnix,
+          canon.dataHex
+        );
         const result =
           resp && typeof resp === 'object' && 'result' in resp
             ? resp.result

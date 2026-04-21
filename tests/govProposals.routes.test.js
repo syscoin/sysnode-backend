@@ -444,8 +444,8 @@ describe('POST /gov/proposals/prepare', () => {
   test('happy path: creates submission, returns hash/canonical/fee', async () => {
     const calls = [];
     ctx = buildApp({
-      gObjectCheck: async (dataHex) => {
-        calls.push(dataHex);
+      gObjectCheck: async (parentHash, revision, time, dataHex) => {
+        calls.push({ parentHash, revision, time, dataHex });
         return { result: { Object: 'success' } };
       },
     });
@@ -484,7 +484,15 @@ describe('POST /gov/proposals/prepare', () => {
     );
     expect(res.body.requiredConfirmations).toBe(REQUIRED_CONFIRMATIONS);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toBe(res.body.submission.dataHex);
+    // Codex PR8 round 1 P1: pre-flight must pass the full Core
+    // argument tuple (parent_hash, revision, time, data_hex) — any
+    // other shape silently shifts args under the production adapter.
+    expect(calls[0]).toEqual({
+      parentHash: '0',
+      revision: 1,
+      time: res.body.submission.timeUnix,
+      dataHex: res.body.submission.dataHex,
+    });
   });
 
   test('hash is deterministic: same inputs → same proposalHash', async () => {
