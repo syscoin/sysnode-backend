@@ -217,14 +217,23 @@ function createGovRouter({
 
       const refresh = req.query && req.query.refresh === '1';
       const t = nowMs();
+      // Freshness window must require NON-NEGATIVE age: a
+      // verified_at that is strictly in the future is a bad sample
+      // (host clock skewed forward when the reconciler ran, then
+      // corrected backwards). If we accepted the resulting negative
+      // age, we would keep short-circuiting reconciliation and
+      // returning stale 'confirmed' rows indefinitely. The cheapest
+      // correct behavior is to treat any future-stamped receipt as
+      // NOT fresh so we fall through to the RPC path and let the
+      // reconciler re-stamp verified_at with the current clock.
       const allFresh =
         !refresh &&
-        stored.every(
-          (r) =>
-            r.status === 'confirmed' &&
-            Number.isInteger(r.verifiedAt) &&
-            t - r.verifiedAt < receiptsFreshnessMs
-        );
+        stored.every((r) => {
+          if (r.status !== 'confirmed') return false;
+          if (!Number.isInteger(r.verifiedAt)) return false;
+          const age = t - r.verifiedAt;
+          return age >= 0 && age < receiptsFreshnessMs;
+        });
       if (allFresh || typeof getCurrentVotes !== 'function') {
         return res.json({
           receipts: stored,

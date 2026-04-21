@@ -724,6 +724,44 @@ describe('GET /gov/receipts', () => {
     }
   });
 
+  test('future-stamped verified_at is NOT treated as fresh (forces reconcile)', async () => {
+    // Codex-review guard: if the host clock was ahead when the
+    // reconciler last stamped verified_at and later corrected
+    // backwards, the stored timestamp is strictly greater than
+    // `now`. A naive `t - verified_at < freshness` window accepts
+    // the resulting negative age and silently pins the receipt as
+    // fresh forever. Require age >= 0 so the next read falls
+    // through to the RPC and lets the reconciler re-stamp.
+    const getCurrentVotes = jest.fn(async () => []);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent } = await loggedInAgent(ctx, 'greta@example.com');
+      const uid = await userIdFor(ctx, 'greta@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'confirmed',
+      });
+      // Stamp verified_at 1 hour in the future (simulates host
+      // clock skew followed by a backwards correction).
+      ctx.db
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
+        .run(Date.now() + 60 * 60 * 1000, uid);
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      // Reconciliation MUST have run despite the fake-future stamp.
+      expect(getCurrentVotes).toHaveBeenCalledTimes(1);
+      expect(res.body.reconciled).toBe(true);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
   test('skips RPC when every receipt is confirmed and freshly verified', async () => {
     const getCurrentVotes = jest.fn();
     const { ctx } = buildApp({ getCurrentVotes });
