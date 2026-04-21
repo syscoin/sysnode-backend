@@ -196,32 +196,38 @@ function createGovRouter({
   );
 
   // -------------------------------------------------------------------
-  // GET /gov/receipts?proposalHash=<64-hex>[&refresh=1]
+  // GET /gov/receipts?proposalHash=<64-hex>
   //
-  // Returns the user's stored receipts for the proposal, reconciling
-  // them against `gobject_getcurrentvotes` on demand before reply.
+  // PURE READ — returns the user's stored receipts for the proposal.
+  // No RPC, no reconciliation, no DB writes.
   //
-  // Response shape:
-  //   { receipts: [...], reconciled: boolean, reconcileError?: string }
+  // The original implementation of this route also ran
+  // `reconcileForProposal` (which performs DB writes + may issue
+  // `gobject_getcurrentvotes`), but that made a CSRF-exempt GET
+  // state-changing: a cross-site top-level navigation or <img> tag
+  // against an authenticated user would silently trigger RPC traffic
+  // and `verified_at` / status bookkeeping writes. Reconciliation
+  // only ever converges to authoritative chain state so the impact
+  // is bounded (the attacker can't flip your vote), but it still
+  // violates the "GET = side-effect-free" trust model the rest of
+  // the API relies on.
   //
-  // reconciled=true means we observed current on-chain state this
-  // request (either via RPC or via the per-process cache). false means
-  // we short-circuited on the freshness window (`verified_at` of every
-  // row is inside receiptsFreshnessMs and all rows are 'confirmed') or
-  // the route was mounted without `getCurrentVotes`, i.e. the UI is
-  // looking at the last known DB state. `?refresh=1` forces a
-  // reconcile regardless of freshness.
+  // Reconciliation now lives on POST /gov/receipts/reconcile, which
+  // goes through the same CSRF double-submit protection as
+  // /gov/vote. This GET stays safe to call from anywhere and the
+  // UI calls POST explicitly when it wants fresh chain state.
   //
-  // reconcileError is only set if reconciliation was ATTEMPTED and
-  // failed (RPC outage / shape mismatch). In that case we still
-  // respond 200 with the pre-reconcile receipts — the UI can render
-  // the rows it has and surface a soft warning instead of blocking
-  // the user on a transient node issue.
+  // Response shape (stable across the split):
+  //   { receipts: [...], reconciled: false }
+  //
+  // `reconciled` stays in the payload for backward compatibility
+  // and is always `false` on GET — it's the POST /reconcile route's
+  // job to set `true`.
   // -------------------------------------------------------------------
   router.get(
     '/receipts',
     sessionMw.requireAuth,
-    async (req, res) => {
+    (req, res) => {
       if (!receipts) {
         // Route was mounted without the receipts repo — in the
         // degraded PR5 wiring there's nothing to return. Surface
@@ -235,36 +241,84 @@ function createGovRouter({
       }
       const userId = req.user && req.user.id;
       const propLower = proposalHash.toLowerCase();
+      try {
+        const stored = receipts.listForProposal(userId, propLower);
+        return res.json({ receipts: stored, reconciled: false });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[GET /gov/receipts] listForProposal failed', err);
+        return res.status(500).json({ error: 'internal' });
+      }
+    }
+  );
 
-      // Wrap the whole body. Express 4 does NOT auto-forward
-      // rejections from async handlers, so any synchronous throw
-      // from listForProposal / reconcileForProposal (e.g. a
-      // transient SQLite failure, a closed DB handle) would
-      // otherwise hang the request until the client times out.
-      // Catch-all returns a stable JSON 500 shape instead.
+  // -------------------------------------------------------------------
+  // POST /gov/receipts/reconcile
+  //
+  // Reconciles the user's stored receipts for a proposal against
+  // `gobject_getcurrentvotes`. State-changing (may update receipt
+  // `status` + `verified_at`), so CSRF-protected and rate-limited
+  // via the same session/CSRF model as /gov/vote.
+  //
+  // Body: { proposalHash: 64-hex, refresh?: boolean }
+  //
+  // Response shape:
+  //   { receipts: [...], reconciled: boolean, updated?: number,
+  //     reconcileError?: 'rpc_failed' | 'reconcile_failed' }
+  //
+  // `reconciled: true` means we observed current on-chain state
+  // this request (either via RPC or via the per-process cache).
+  // `reconciled: false` means we short-circuited on the freshness
+  // window (`verified_at` of every row is inside
+  // receiptsFreshnessMs AND every row is 'confirmed') or the route
+  // was mounted without `getCurrentVotes`. `refresh: true` forces a
+  // reconcile regardless of freshness.
+  //
+  // `reconcileError` is only set if reconciliation was ATTEMPTED and
+  // failed (RPC outage / shape mismatch). In that case we still
+  // respond 200 with the pre-reconcile receipts so the UI can
+  // render the rows it has and surface a soft warning instead of
+  // blocking the user on a transient node issue.
+  // -------------------------------------------------------------------
+  router.post(
+    '/receipts/reconcile',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    async (req, res) => {
+      if (!receipts) {
+        return res.json({ receipts: [], reconciled: false });
+      }
+      const body = (req.body && typeof req.body === 'object') ? req.body : {};
+      const proposalHash = typeof body.proposalHash === 'string'
+        ? body.proposalHash
+        : '';
+      if (!HEX64.test(proposalHash)) {
+        return res.status(400).json({ error: 'invalid_proposal_hash' });
+      }
+      const refresh = body.refresh === true;
+      const userId = req.user && req.user.id;
+      const propLower = proposalHash.toLowerCase();
+
       let stored;
       try {
         stored = receipts.listForProposal(userId, propLower);
       } catch (err) {
         // eslint-disable-next-line no-console
-        console.error('[GET /gov/receipts] listForProposal failed', err);
+        console.error(
+          '[POST /gov/receipts/reconcile] listForProposal failed',
+          err
+        );
         return res.status(500).json({ error: 'internal' });
       }
       if (stored.length === 0) {
         return res.json({ receipts: [], reconciled: false });
       }
 
-      const refresh = req.query && req.query.refresh === '1';
       const t = nowMs();
-      // Freshness window must require NON-NEGATIVE age: a
-      // verified_at that is strictly in the future is a bad sample
-      // (host clock skewed forward when the reconciler ran, then
-      // corrected backwards). If we accepted the resulting negative
-      // age, we would keep short-circuiting reconciliation and
-      // returning stale 'confirmed' rows indefinitely. The cheapest
-      // correct behavior is to treat any future-stamped receipt as
-      // NOT fresh so we fall through to the RPC path and let the
-      // reconciler re-stamp verified_at with the current clock.
+      // See the previous iteration of this route for the detailed
+      // rationale: freshness requires NON-NEGATIVE age so a
+      // future-stamped verified_at (host clock skew then correction)
+      // doesn't pin rows as fresh indefinitely.
       const allFresh =
         !refresh &&
         stored.every((r) => {
@@ -274,10 +328,7 @@ function createGovRouter({
           return age >= 0 && age < receiptsFreshnessMs;
         });
       if (allFresh || typeof getCurrentVotes !== 'function') {
-        return res.json({
-          receipts: stored,
-          reconciled: false,
-        });
+        return res.json({ receipts: stored, reconciled: false });
       }
 
       try {
@@ -297,7 +348,7 @@ function createGovRouter({
           : 'reconcile_failed';
         // eslint-disable-next-line no-console
         console.warn(
-          `[GET /gov/receipts] reconcile ${code}`,
+          `[POST /gov/receipts/reconcile] reconcile ${code}`,
           err && err.message
         );
         return res.json({

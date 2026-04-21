@@ -683,6 +683,12 @@ describe('POST /gov/vote — receipts integration', () => {
 // graceful-degradation behaviour when the reconcile RPC is unavailable.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// GET /gov/receipts is a PURE READ: no RPC, no DB writes, no reconcile.
+// Reconciliation lives on POST /gov/receipts/reconcile (CSRF-protected,
+// tests directly below this describe block).
+// ---------------------------------------------------------------------------
+
 describe('GET /gov/receipts', () => {
   async function userIdFor(ctx, email) {
     const row = ctx.users.findByEmail(email);
@@ -717,14 +723,180 @@ describe('GET /gov/receipts', () => {
   });
 
   test('returns empty + reconciled:false when user has no receipts', async () => {
-    const { ctx } = buildApp({
-      getCurrentVotes: jest.fn(),
-    });
+    const { ctx } = buildApp({ getCurrentVotes: jest.fn() });
     try {
       const { agent } = await loggedInAgent(ctx);
       const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ receipts: [], reconciled: false });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns stored rows as-is and NEVER calls getCurrentVotes', async () => {
+    // Codex-review guard: GET must NOT trigger RPC. A CSRF-exempt
+    // GET that performs RPC + DB writes would let a cross-site
+    // top-level navigation or <img> tag silently trigger server-
+    // side state changes on behalf of the authenticated user.
+    const getCurrentVotes = jest.fn(async () => [
+      {
+        voteHash: 'f'.repeat(64),
+        collateralHash: H2,
+        collateralIndex: 0,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+      },
+    ]);
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent } = await loggedInAgent(ctx, 'alice@example.com');
+      const uid = await userIdFor(ctx, 'alice@example.com');
+      ctx.voteReceipts.upsert({
+        userId: uid,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(res.status).toBe(200);
+      expect(res.body.reconciled).toBe(false);
+      expect(res.body.updated).toBeUndefined();
+      expect(res.body.reconcileError).toBeUndefined();
+      expect(res.body.receipts).toHaveLength(1);
+      // Status is untouched — GET did NOT reconcile.
+      expect(res.body.receipts[0]).toMatchObject({ status: 'relayed' });
+      expect(getCurrentVotes).not.toHaveBeenCalled();
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('synchronous listForProposal throw is handled as 500 internal', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx, 'hank@example.com');
+      const orig = ctx.voteReceipts.listForProposal;
+      ctx.voteReceipts.listForProposal = () => {
+        throw new Error('disk gone');
+      };
+      try {
+        const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+        expect(res.status).toBe(500);
+        expect(res.body.error).toBe('internal');
+      } finally {
+        ctx.voteReceipts.listForProposal = orig;
+      }
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('does not leak receipts across users', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
+      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
+      const aId = await userIdFor(ctx, 'a@example.com');
+      ctx.voteReceipts.upsert({
+        userId: aId,
+        collateralHash: H2,
+        collateralIndex: 0,
+        proposalHash: H1,
+        voteOutcome: 'yes',
+        voteSignal: 'funding',
+        voteTime: 1_700_000_000,
+        status: 'relayed',
+      });
+      const aRes = await aAgent.get(`/gov/receipts?proposalHash=${H1}`);
+      const bRes = await bAgent.get(`/gov/receipts?proposalHash=${H1}`);
+      expect(aRes.body.receipts).toHaveLength(1);
+      expect(bRes.body.receipts).toHaveLength(0);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /gov/receipts/reconcile
+//
+// State-changing reconcile path. CSRF-protected; may call
+// `gobject_getcurrentvotes` and may write `status` + `verified_at`
+// to vote_receipts. Historically lived on GET /gov/receipts but
+// was split out so CSRF-exempt GETs remain side-effect-free.
+// ---------------------------------------------------------------------------
+
+describe('POST /gov/receipts/reconcile', () => {
+  async function userIdFor(ctx, email) {
+    const row = ctx.users.findByEmail(email);
+    return row && row.id;
+  }
+
+  test('401 when unauthenticated', async () => {
+    const { ctx } = buildApp();
+    try {
+      const res = await request(ctx.app)
+        .post('/gov/receipts/reconcile')
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('403 csrf_missing when authenticated without CSRF token', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('csrf_missing');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('400 invalid_proposal_hash when body.proposalHash is missing / malformed', async () => {
+    const { ctx } = buildApp();
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const missing = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({});
+      expect(missing.status).toBe(400);
+      expect(missing.body.error).toBe('invalid_proposal_hash');
+      const malformed = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: 'nope' });
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error).toBe('invalid_proposal_hash');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('returns empty + reconciled:false when user has no receipts', async () => {
+    const getCurrentVotes = jest.fn();
+    const { ctx } = buildApp({ getCurrentVotes });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ receipts: [], reconciled: false });
+      expect(getCurrentVotes).not.toHaveBeenCalled();
     } finally {
       ctx.db.close();
     }
@@ -755,10 +927,10 @@ describe('GET /gov/receipts', () => {
         voteTime: 1_700_000_000,
         status: 'relayed',
       });
-      // CSRF isn't required for GETs but the cookie still exists;
-      // pass the session-authenticated agent through.
-      void csrf;
-      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
       expect(res.status).toBe(200);
       expect(res.body.reconciled).toBe(true);
       expect(res.body.updated).toBe(1);
@@ -775,17 +947,10 @@ describe('GET /gov/receipts', () => {
   });
 
   test('future-stamped verified_at is NOT treated as fresh (forces reconcile)', async () => {
-    // Codex-review guard: if the host clock was ahead when the
-    // reconciler last stamped verified_at and later corrected
-    // backwards, the stored timestamp is strictly greater than
-    // `now`. A naive `t - verified_at < freshness` window accepts
-    // the resulting negative age and silently pins the receipt as
-    // fresh forever. Require age >= 0 so the next read falls
-    // through to the RPC and lets the reconciler re-stamp.
     const getCurrentVotes = jest.fn(async () => []);
     const { ctx } = buildApp({ getCurrentVotes });
     try {
-      const { agent } = await loggedInAgent(ctx, 'greta@example.com');
+      const { agent, csrf } = await loggedInAgent(ctx, 'greta@example.com');
       const uid = await userIdFor(ctx, 'greta@example.com');
       ctx.voteReceipts.upsert({
         userId: uid,
@@ -797,14 +962,14 @@ describe('GET /gov/receipts', () => {
         voteTime: 1_700_000_000,
         status: 'confirmed',
       });
-      // Stamp verified_at 1 hour in the future (simulates host
-      // clock skew followed by a backwards correction).
       ctx.db
         .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
         .run(Date.now() + 60 * 60 * 1000, uid);
-      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
       expect(res.status).toBe(200);
-      // Reconciliation MUST have run despite the fake-future stamp.
       expect(getCurrentVotes).toHaveBeenCalledTimes(1);
       expect(res.body.reconciled).toBe(true);
     } finally {
@@ -816,7 +981,7 @@ describe('GET /gov/receipts', () => {
     const getCurrentVotes = jest.fn();
     const { ctx } = buildApp({ getCurrentVotes });
     try {
-      const { agent } = await loggedInAgent(ctx, 'bob@example.com');
+      const { agent, csrf } = await loggedInAgent(ctx, 'bob@example.com');
       const uid = await userIdFor(ctx, 'bob@example.com');
       ctx.voteReceipts.upsert({
         userId: uid,
@@ -828,13 +993,13 @@ describe('GET /gov/receipts', () => {
         voteTime: 1_700_000_000,
         status: 'confirmed',
       });
-      // Force verified_at into the freshness window (just now).
       ctx.db
-        .prepare(
-          `UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`
-        )
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
         .run(Date.now(), uid);
-      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
       expect(res.status).toBe(200);
       expect(res.body.reconciled).toBe(false);
       expect(res.body.receipts).toHaveLength(1);
@@ -844,11 +1009,11 @@ describe('GET /gov/receipts', () => {
     }
   });
 
-  test('?refresh=1 forces reconciliation even when freshness window is intact', async () => {
+  test('refresh:true forces reconciliation even when freshness window is intact', async () => {
     const getCurrentVotes = jest.fn(async () => []);
     const { ctx } = buildApp({ getCurrentVotes });
     try {
-      const { agent } = await loggedInAgent(ctx, 'carol@example.com');
+      const { agent, csrf } = await loggedInAgent(ctx, 'carol@example.com');
       const uid = await userIdFor(ctx, 'carol@example.com');
       ctx.voteReceipts.upsert({
         userId: uid,
@@ -861,13 +1026,12 @@ describe('GET /gov/receipts', () => {
         status: 'confirmed',
       });
       ctx.db
-        .prepare(
-          `UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`
-        )
+        .prepare(`UPDATE vote_receipts SET verified_at = ? WHERE user_id = ?`)
         .run(Date.now(), uid);
-      const res = await agent.get(
-        `/gov/receipts?proposalHash=${H1}&refresh=1`
-      );
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1, refresh: true });
       expect(res.status).toBe(200);
       expect(res.body.reconciled).toBe(true);
       expect(getCurrentVotes).toHaveBeenCalledTimes(1);
@@ -882,11 +1046,9 @@ describe('GET /gov/receipts', () => {
     });
     const { ctx } = buildApp({ getCurrentVotes });
     try {
-      // Suppress the warn from the route — it's expected for this
-      // case and would otherwise muddy the test output.
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       try {
-        const { agent } = await loggedInAgent(ctx, 'dan@example.com');
+        const { agent, csrf } = await loggedInAgent(ctx, 'dan@example.com');
         const uid = await userIdFor(ctx, 'dan@example.com');
         ctx.voteReceipts.upsert({
           userId: uid,
@@ -898,7 +1060,10 @@ describe('GET /gov/receipts', () => {
           voteTime: 1_700_000_000,
           status: 'relayed',
         });
-        const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+        const res = await agent
+          .post('/gov/receipts/reconcile')
+          .set('X-CSRF-Token', csrf)
+          .send({ proposalHash: H1 });
         expect(res.status).toBe(200);
         expect(res.body.reconciled).toBe(false);
         expect(res.body.reconcileError).toBe('rpc_failed');
@@ -913,12 +1078,9 @@ describe('GET /gov/receipts', () => {
   });
 
   test('returns stored rows with reconciled:false when getCurrentVotes is not wired', async () => {
-    // No getCurrentVotes provided — route should still serve the DB
-    // state without error. Freshness short-circuit does not apply
-    // because the receipt is not confirmed.
     const { ctx } = buildApp();
     try {
-      const { agent } = await loggedInAgent(ctx, 'eve@example.com');
+      const { agent, csrf } = await loggedInAgent(ctx, 'eve@example.com');
       const uid = await userIdFor(ctx, 'eve@example.com');
       ctx.voteReceipts.upsert({
         userId: uid,
@@ -930,7 +1092,10 @@ describe('GET /gov/receipts', () => {
         voteTime: 1_700_000_000,
         status: 'relayed',
       });
-      const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+      const res = await agent
+        .post('/gov/receipts/reconcile')
+        .set('X-CSRF-Token', csrf)
+        .send({ proposalHash: H1 });
       expect(res.status).toBe(200);
       expect(res.body.reconciled).toBe(false);
       expect(res.body.reconcileError).toBeUndefined();
@@ -941,51 +1106,23 @@ describe('GET /gov/receipts', () => {
   });
 
   test('synchronous listForProposal throw is handled as 500 internal', async () => {
-    // Codex-review guard: the handler is async, and Express 4 does
-    // not auto-forward rejections from async handlers to error
-    // middleware. A synchronous throw from the DB read must still
-    // yield a deterministic JSON error response, not a hung request
-    // or an unformatted HTML error page.
     const { ctx } = buildApp();
     try {
-      const { agent } = await loggedInAgent(ctx, 'hank@example.com');
+      const { agent, csrf } = await loggedInAgent(ctx, 'hank@example.com');
       const orig = ctx.voteReceipts.listForProposal;
       ctx.voteReceipts.listForProposal = () => {
         throw new Error('disk gone');
       };
       try {
-        const res = await agent.get(`/gov/receipts?proposalHash=${H1}`);
+        const res = await agent
+          .post('/gov/receipts/reconcile')
+          .set('X-CSRF-Token', csrf)
+          .send({ proposalHash: H1 });
         expect(res.status).toBe(500);
         expect(res.body.error).toBe('internal');
       } finally {
         ctx.voteReceipts.listForProposal = orig;
       }
-    } finally {
-      ctx.db.close();
-    }
-  });
-
-  test('does not leak receipts across users', async () => {
-    const getCurrentVotes = jest.fn(async () => []);
-    const { ctx } = buildApp({ getCurrentVotes });
-    try {
-      const { agent: aAgent } = await loggedInAgent(ctx, 'a@example.com');
-      const { agent: bAgent } = await loggedInAgent(ctx, 'b@example.com');
-      const aId = await userIdFor(ctx, 'a@example.com');
-      ctx.voteReceipts.upsert({
-        userId: aId,
-        collateralHash: H2,
-        collateralIndex: 0,
-        proposalHash: H1,
-        voteOutcome: 'yes',
-        voteSignal: 'funding',
-        voteTime: 1_700_000_000,
-        status: 'relayed',
-      });
-      const aRes = await aAgent.get(`/gov/receipts?proposalHash=${H1}`);
-      const bRes = await bAgent.get(`/gov/receipts?proposalHash=${H1}`);
-      expect(aRes.body.receipts).toHaveLength(1);
-      expect(bRes.body.receipts).toHaveLength(0);
     } finally {
       ctx.db.close();
     }
