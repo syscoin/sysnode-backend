@@ -644,6 +644,55 @@ function createGovProposalsRouter({
         return row;
       });
     } catch (err) {
+      // Codex PR8 round 3 P2: two concurrent /prepare requests with
+      // the same canonical payload would both miss the pre-read
+      // above (`findPreparedByDataHexForUser`) and both attempt to
+      // insert. The partial unique index
+      // `idx_proposal_submissions_user_payload_prepared`
+      // (user_id, data_hex) WHERE status='prepared' will reject the
+      // second insert with SQLITE_CONSTRAINT_UNIQUE. Re-read the
+      // row the winner created and return it as an idempotent 200,
+      // so the loser sees the same canonical envelope as the winner.
+      const msg = String((err && err.message) || err);
+      const constraintHit =
+        (err && (err.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+          err.code === 'SQLITE_CONSTRAINT')) ||
+        /UNIQUE constraint failed/i.test(msg);
+      if (constraintHit) {
+        const winner = submissions.findPreparedByDataHexForUser(
+          userId,
+          canon.dataHex
+        );
+        if (winner) {
+          let winnerOpReturnHex;
+          try {
+            winnerOpReturnHex = computeProposalHash({
+              parentHash,
+              revision,
+              time: winner.timeUnix,
+              dataHex: winner.dataHex,
+            }).opReturnBytes.toString('hex');
+          } catch (rehashErr) {
+            // eslint-disable-next-line no-console
+            console.error(
+              '[POST /gov/proposals/prepare] rehash after race error',
+              rehashErr
+            );
+            return res.status(500).json({ error: 'internal' });
+          }
+          return res.status(200).json({
+            submission: jsonSubmission(winner),
+            opReturnHex: winnerOpReturnHex,
+            canonicalJson: canon.json,
+            payloadBytes: canon.byteLength,
+            collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
+            requiredConfirmations: REQUIRED_CONFIRMATIONS,
+            idempotent: true,
+          });
+        }
+        // Constraint fired but no winner row found — extremely odd
+        // (e.g. another index clashed). Fall through to a generic 500.
+      }
       // eslint-disable-next-line no-console
       console.error('[POST /gov/proposals/prepare] persist error', err);
       return res.status(500).json({ error: 'internal' });

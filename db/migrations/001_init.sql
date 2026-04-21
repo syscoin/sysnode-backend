@@ -311,6 +311,21 @@ CREATE UNIQUE INDEX idx_proposal_submissions_collateral_txid
   ON proposal_submissions(collateral_txid)
   WHERE collateral_txid IS NOT NULL;
 
+-- Codex PR8 round 3 P2: enforce /prepare idempotency at the DB layer.
+-- The route reads by (user_id, data_hex, status='prepared') and then
+-- inserts; without this partial unique index, two concurrent requests
+-- with identical payload can both miss the read and both insert,
+-- producing duplicate `prepared` rows for the same logical proposal.
+-- Once the row moves past `prepared` (the user attaches collateral,
+-- or it ends up `submitted`/`failed`), the partial predicate no
+-- longer matches and a subsequent retry with the same dataHex is
+-- free to create a fresh `prepared` row — which is the correct UX:
+-- the old submission is locked to a specific collateral txid, and a
+-- re-prepare is the user explicitly asking for a clean second take.
+CREATE UNIQUE INDEX idx_proposal_submissions_user_payload_prepared
+  ON proposal_submissions(user_id, data_hex)
+  WHERE status = 'prepared';
+
 -- Governance hash is likewise unique once set — it IS the proposal's
 -- on-chain identity. A NULL is expected for rows not yet submitted.
 CREATE UNIQUE INDEX idx_proposal_submissions_governance_hash

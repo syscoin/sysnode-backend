@@ -540,6 +540,60 @@ describe('POST /gov/proposals/prepare', () => {
     expect(rows).toHaveLength(1);
   });
 
+  test(
+    'concurrent prepare race: DB unique index + constraint fallback collapses to a single row (Codex round 3 P2)',
+    async () => {
+      // Simulate a true interleave: the pre-read in /prepare misses
+      // (the competing /prepare hasn't been committed yet from the
+      // caller's perspective), so the route proceeds to INSERT. The
+      // partial unique index `idx_proposal_submissions_user_payload_prepared`
+      // rejects the second INSERT with SQLITE_CONSTRAINT_UNIQUE;
+      // the route's catch block re-reads via findPreparedByDataHexForUser
+      // and responds 200 idempotent with the winner's submission.
+      //
+      // We mimic the interleave by stubbing
+      // `submissions.findPreparedByDataHexForUser` to return null on
+      // the *pre-read* only for the second request, while the DB
+      // state contains the first prepared row.
+      ctx = buildApp();
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const body = validProposalBody();
+
+      const r1 = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(body);
+      expect(r1.status).toBe(201);
+
+      // Monkey-patch the submissions object shared with the router:
+      // force the pre-read miss once, then restore.
+      const realFind = ctx.submissions.findPreparedByDataHexForUser;
+      let miss = true;
+      ctx.submissions.findPreparedByDataHexForUser = (...args) => {
+        if (miss) {
+          miss = false;
+          return null;
+        }
+        return realFind.apply(ctx.submissions, args);
+      };
+
+      const r2 = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(body);
+
+      ctx.submissions.findPreparedByDataHexForUser = realFind;
+
+      expect(r2.status).toBe(200);
+      expect(r2.body.idempotent).toBe(true);
+      expect(r2.body.submission.id).toBe(r1.body.submission.id);
+      const rows = ctx.submissions.listForUser(
+        ctx.users.findByEmail('user@example.com').id
+      );
+      expect(rows).toHaveLength(1);
+    }
+  );
+
   test('hash is deterministic: same inputs → same proposalHash', async () => {
     ctx = buildApp();
     // Two different users preparing the same proposal text — because
