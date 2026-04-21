@@ -30,6 +30,8 @@ const {
 const dataStore = require('./data/dataStore');
 const { client, rpcServices } = require('./services/rpcClient');
 const { createCurrentVotesCache } = require('./lib/voteReceipts');
+const { createReminderLog } = require('./lib/reminderLog');
+const { createReminderDispatcher } = require('./lib/reminderDispatcher');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -116,9 +118,20 @@ const db = openDatabase(dbPath);
 // every login into a 401 (Codex round-7 P1 on pepper) or dropping mail
 // to stdout (Codex round-6 P1 on SMTP).
 assertPepperConfigured();
+// The frontend (e.g. https://sysnode.info) is the origin we link to in
+// outgoing emails. The backend API lives on a different origin
+// (https://syscoin.dev today) and only serves JSON, so links must be
+// built against FRONTEND_URL. This value is shared between appFactory
+// (for the email-verification link) and the mailer itself (for vote-
+// reminder CTAs) — compute it once here.
+const PUBLIC_BASE_URL =
+  process.env.FRONTEND_URL ||
+  process.env.CORS_ORIGIN ||
+  'http://localhost:3000';
 const mailer = createMailer({
   transport: selectMailTransport(),
   from: process.env.MAIL_FROM || 'no-reply@syscoin.dev',
+  publicBaseUrl: PUBLIC_BASE_URL,
 });
 const services = finalizeSessionMw(buildServices({ db }));
 
@@ -132,10 +145,7 @@ mountAuthAndVault(app, {
   services,
   mailer,
   baseUrl: process.env.BASE_URL || 'http://localhost:3001',
-  frontendUrl:
-    process.env.FRONTEND_URL ||
-    process.env.CORS_ORIGIN ||
-    'http://localhost:3000',
+  frontendUrl: PUBLIC_BASE_URL,
   // Read the live tracker array fresh on every call rather than
   // snapshotting it here — the tracker REASSIGNS `masternodesArr`
   // every 10s (`data.masternodesArr = []`), so a captured reference
@@ -190,6 +200,76 @@ setInterval(() => {
     console.error('[pendingRegistrations.cleanup]', err && err.message);
   }
 }, 60 * 60 * 1000).unref();
+
+// Governance reminder dispatcher (PR 7).
+//
+// Fires hourly. The dispatcher itself decides whether any email is
+// owed on a given tick by comparing the current time to the earliest
+// proposal deadline. Users who have voted in the current cycle are
+// skipped by the dispatcher's internal gating; users who have opted
+// out of reminders in notification_prefs are never considered.
+//
+// We intentionally source active proposals from `gObject_list` RPC
+// on each tick rather than reading a cached view: the tick cadence
+// is hourly and the RPC is cheap, so adding a cache layer only
+// inflates the code surface. If reminders ever graduate to sub-hour
+// cadence, wrap this with a short-lived memo.
+//
+// Mailer is the same instance wired into /auth above (line ~121);
+// createMailer is idempotent in the 'log' / 'memory' transports and
+// fine to share for 'smtp' since nodemailer pools internally. We
+// deliberately reuse rather than re-create to avoid a double-pooled
+// SMTP connection for what is semantically one mail pipeline.
+const reminderLog = createReminderLog(db);
+const reminderDispatcher = createReminderDispatcher({
+  users: services.users,
+  voteReceipts: services.voteReceipts,
+  reminderLog,
+  mailer,
+  // Shape: [{ hash, endEpoch }]. gObject_list returns a map keyed by
+  // gov-object hash, with `DataString` containing the per-proposal
+  // JSON that has end_epoch (unix seconds). We project here rather
+  // than inside the dispatcher because the RPC shape is a
+  // server-side concern (the dispatcher contract is the normalized
+  // shape).
+  getActiveProposals: async () => {
+    const raw = await rpcServices(client.callRpc).gObject_list().call();
+    const out = [];
+    for (const key of Object.keys(raw)) {
+      const entry = raw[key];
+      let data;
+      try {
+        data = JSON.parse(entry.DataString);
+      } catch {
+        continue;
+      }
+      const endEpoch = Number(data && data.end_epoch);
+      if (!Number.isFinite(endEpoch) || endEpoch <= 0) continue;
+      out.push({ hash: entry.Hash, endEpoch });
+    }
+    return out;
+  },
+  log: (level, event, meta) => {
+    // eslint-disable-next-line no-console
+    console.log(`[reminder] ${level} ${event}`, meta || '');
+  },
+});
+
+// First tick 5 minutes after boot (lets the RPC warm up), then hourly.
+// We `unref()` both so the dispatcher never keeps the event loop alive
+// on its own — if the HTTP server shuts down, the process exits.
+setTimeout(() => {
+  reminderDispatcher.tick().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error('[reminder] initial tick failed', err && err.message);
+  });
+  setInterval(() => {
+    reminderDispatcher.tick().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error('[reminder] tick failed', err && err.message);
+    });
+  }, 60 * 60 * 1000).unref();
+}, 5 * 60 * 1000).unref();
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
