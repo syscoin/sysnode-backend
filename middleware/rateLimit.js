@@ -32,6 +32,21 @@ function registerKey(req) {
   return `register|${ipBucket(req)}`;
 }
 
+// Per-user bucket for /gov/vote. IP alone is wrong here: a shared-IP
+// office can legitimately vote from many accounts in one hour, and a
+// user on a mobile IPv6 prefix can churn through addresses faster
+// than the register bucket's /56 masking catches. We bucket by the
+// authenticated user.id (set by sessionMw.requireAuth before this
+// limiter runs) and fall back to IP for defense in depth — a
+// pre-auth miss here should never happen in production, but the
+// fallback keeps the limiter safe if someone mounts it without the
+// auth middleware.
+function voteKey(req) {
+  const uid = req.user && req.user.id != null ? String(req.user.id) : null;
+  if (uid) return `vote|u${uid}`;
+  return `vote|ip|${ipBucket(req)}`;
+}
+
 function loginLimiter() {
   return rateLimit({
     windowMs: 15 * MINUTE,
@@ -54,6 +69,22 @@ function registerLimiter() {
   });
 }
 
+// /gov/vote: 60 POSTs per hour per user. A proposal cycle has a few
+// dozen active proposals; a user who votes on every proposal twice
+// (e.g. changed their mind) still fits comfortably. Each request
+// carries up to MAX_VOTE_ENTRIES entries, so the effective ceiling
+// is ample without inviting abuse.
+function voteLimiter() {
+  return rateLimit({
+    windowMs: 60 * MINUTE,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: voteKey,
+    message: { error: 'too_many_vote_requests' },
+  });
+}
+
 function disabled() {
   return (_req, _res, next) => next();
 }
@@ -61,8 +92,10 @@ function disabled() {
 module.exports = {
   loginLimiter,
   registerLimiter,
+  voteLimiter,
   disabled,
   // Exported for direct unit testing.
   loginKey,
   registerKey,
+  voteKey,
 };

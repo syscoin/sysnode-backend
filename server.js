@@ -17,7 +17,7 @@ const csvParserRoute = require('./routes/csvParser');
 const mnListRoute = require('./routes/mnList');
 const mnSearchRoute = require('./routes/mnSearch');
 
-// New authenticated subsystem (auth + vault).
+// New authenticated subsystem (auth + vault + gov).
 const { openDatabase } = require('./lib/db');
 const { createMailer } = require('./lib/mailer');
 const { selectMailTransport } = require('./lib/mailTransport');
@@ -27,6 +27,8 @@ const {
   finalizeSessionMw,
   mountAuthAndVault,
 } = require('./lib/appFactory');
+const dataStore = require('./data/dataStore');
+const { client, rpcServices } = require('./services/rpcClient');
 
 const app = express();
 
@@ -57,16 +59,30 @@ app.use(cookieParser());
 
 // -----------------------------------------------------------------------------
 // CORS: legacy public data routes keep `origin: *` so existing third-party
-// consumers don't break. Auth and vault use credentialed CORS pinned to the
-// SPA origin (browsers reject `*` with credentials).
+// consumers don't break. Auth, vault, and gov use credentialed CORS pinned
+// to the SPA origin (browsers reject `*` with credentials). /gov is the
+// authenticated voting surface; it carries cookies + the X-CSRF-Token
+// header and MUST go through `authCors` or browsers will block the
+// preflight.
+//
+// CRITICAL: the prefix match MUST be on a path boundary — i.e. "exactly
+// `/gov`" or "starts with `/gov/`". A naive `startsWith('/gov')` also
+// catches the legacy public endpoints `/govlist` and `/govbyhash`
+// (routes/governance.js), which are historically served under
+// `origin: '*'` and must keep working for third-party consumers that
+// are not on the configured CORS_ORIGIN. Same argument applies to
+// `/auth` / `/vault`, though today those prefixes have no legacy
+// collisions; we enforce the boundary everywhere to stay safe as the
+// legacy surface evolves.
 // -----------------------------------------------------------------------------
 const legacyCors = cors({ origin: '*', optionsSuccessStatus: 200 });
 const authCors = cors({
   origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
   credentials: true,
 });
+const { isCredentialedPath } = require('./lib/credentialedPaths');
 app.use((req, res, next) => {
-  if (req.path.startsWith('/auth') || req.path.startsWith('/vault')) {
+  if (isCredentialedPath(req.path)) {
     return authCors(req, res, next);
   }
   return legacyCors(req, res, next);
@@ -91,7 +107,11 @@ const mailer = createMailer({
 });
 const services = finalizeSessionMw(buildServices({ db }));
 
-app.use(['/auth', '/vault'], services.sessionMw.parse);
+// Session parsing must cover every route that reads `req.user`. /gov
+// uses `requireAuth` in its router; without parse running here first
+// `req.user` would always be undefined and every authenticated caller
+// would see a 401.
+app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 
 mountAuthAndVault(app, {
   services,
@@ -101,6 +121,24 @@ mountAuthAndVault(app, {
     process.env.FRONTEND_URL ||
     process.env.CORS_ORIGIN ||
     'http://localhost:3000',
+  // Read the live tracker array fresh on every call rather than
+  // snapshotting it here — the tracker REASSIGNS `masternodesArr`
+  // every 10s (`data.masternodesArr = []`), so a captured reference
+  // would go stale after the first refresh. `dataStore.masternodesArr`
+  // is a property access and therefore always returns the current value.
+  masternodesProvider: () => dataStore.masternodesArr,
+  voteRaw: (collateralHash, collateralIndex, governanceHash, signal, outcome, time, voteSig) =>
+    rpcServices(client.callRpc)
+      .voteRaw(
+        collateralHash,
+        collateralIndex,
+        governanceHash,
+        signal,
+        outcome,
+        time,
+        voteSig
+      )
+      .call(true),
 });
 
 // -----------------------------------------------------------------------------
