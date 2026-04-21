@@ -1,0 +1,27 @@
+-- 002_vote_reminder_log_scope_key
+--
+-- Rename vote_reminder_log.proposal_hash -> scope_key.
+--
+-- Why: the governance reminder dispatcher (lib/reminderDispatcher.js)
+-- now writes one log row per (user, governance_cycle, bucket) instead
+-- of per (user, proposal, bucket). A cycle spans every proposal sharing
+-- a closing window, so a user receives at most one reminder per
+-- (cycle, bucket) regardless of how many proposals are in it. Keeping
+-- the column name tied to "proposal_hash" misdescribes its contents
+-- (today: `cycle:<voting_deadline_unix>`).
+--
+-- Why a new migration file instead of editing 001_init.sql:
+--   lib/db.js tracks applied migrations by filename. Any deployment
+--   that already ran 001_init.sql will not re-run it, so a column
+--   rename that only lives in 001 never reaches existing databases —
+--   startup code that prepares statements against `scope_key` would
+--   then fail with `no such column` on deploy and the service would
+--   refuse to boot. Fresh installs run 001 (old name) then 002
+--   (rename); existing installs skip 001 and apply only 002. Both
+--   paths converge.
+--
+-- Note on SQLite semantics: `ALTER TABLE ... RENAME COLUMN` (SQLite
+-- >= 3.25) automatically rewrites the UNIQUE constraint and any
+-- dependent indexes, so no further DDL is needed.
+
+ALTER TABLE vote_reminder_log RENAME COLUMN proposal_hash TO scope_key;
