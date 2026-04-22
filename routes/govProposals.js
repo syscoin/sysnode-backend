@@ -517,10 +517,33 @@ function createGovProposalsRouter({
     const parentHash = '0';
     const revision = 1;
 
-    const existingByPayload = submissions.findPreparedByDataHexForUser(
-      userId,
-      canon.dataHex
-    );
+    // Codex PR8 round 8 P1: this async route had several persistence
+    // calls outside any try/catch, so a synchronous DB throw from
+    // better-sqlite3 (SQLITE_BUSY / I/O error / corrupt-index, etc.)
+    // became an unhandled promise rejection rather than a controlled
+    // JSON 500. Express 4 does NOT catch async handler rejections —
+    // in production those surface as hung requests and/or process-
+    // level instability under transient faults. Wrap everything
+    // from this point on in a top-level try/catch. The existing
+    // inner try/catch blocks (gObjectCheck soft-fail, rehash,
+    // hash-computation, persist-race) all do early `return
+    // res.status(...)`, so they still short-circuit before reaching
+    // this outer catch — the outer catch only fires for truly
+    // unexpected DB / RPC / compute failures.
+    let existingByPayload;
+    try {
+      existingByPayload = submissions.findPreparedByDataHexForUser(
+        userId,
+        canon.dataHex
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[POST /gov/proposals/prepare] findPreparedByDataHexForUser failed',
+        err
+      );
+      return res.status(500).json({ error: 'internal' });
+    }
 
     // Determine the hashing time. On the idempotent replay path we
     // MUST reuse the frozen `timeUnix` from the existing row — any
@@ -672,7 +695,22 @@ function createGovProposalsRouter({
     if (f && body.draftId !== undefined && body.draftId !== null) {
       const draftId = parseIntId(body.draftId);
       if (draftId) {
-        const d = drafts.getByIdForUser(draftId, userId);
+        // Codex PR8 round 8 P1: `drafts.getByIdForUser` can throw for
+        // the same class of transient SQLite faults as
+        // `findPreparedByDataHexForUser` above — catch here so an
+        // I/O hiccup surfaces as a controlled 500 rather than an
+        // unhandled promise rejection inside the async handler.
+        let d;
+        try {
+          d = drafts.getByIdForUser(draftId, userId);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error(
+            '[POST /gov/proposals/prepare] drafts.getByIdForUser failed',
+            err
+          );
+          return res.status(500).json({ error: 'internal' });
+        }
         if (d) draftIdToConsume = draftId;
       }
     }

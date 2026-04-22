@@ -923,6 +923,46 @@ describe('POST /gov/proposals/prepare', () => {
     expect(res.body.submission.status).toBe('prepared');
   });
 
+  test(
+    'returns 500 JSON (not an unhandled rejection) when the DB throws during prepare lookup (Codex round 8 P1)',
+    async () => {
+      // Regression: `findPreparedByDataHexForUser` and
+      // `drafts.getByIdForUser` used to run outside any try/catch in
+      // this async handler. A synchronous better-sqlite3 throw
+      // (SQLITE_BUSY / I/O / corrupt-index / temp-write-failed) then
+      // became an unhandled promise rejection — Express 4 does not
+      // catch async handler throws, so in prod it surfaces as a
+      // hung request + a process-level warning rather than a clean
+      // JSON 500 the client can retry.
+      ctx = buildApp();
+      const origFind = ctx.submissions.findPreparedByDataHexForUser;
+      ctx.submissions.findPreparedByDataHexForUser = () => {
+        const err = new Error('SQLITE_BUSY: database is locked');
+        err.code = 'SQLITE_BUSY';
+        throw err;
+      };
+      const unhandled = [];
+      const handler = (reason) => unhandled.push(reason);
+      process.on('unhandledRejection', handler);
+      try {
+        const { agent, csrf } = await loggedInAgent(ctx);
+        const res = await agent
+          .post('/gov/proposals/prepare')
+          .set('X-CSRF-Token', csrf)
+          .send(validProposalBody());
+        expect(res.status).toBe(500);
+        expect(res.body).toEqual({ error: 'internal' });
+      } finally {
+        ctx.submissions.findPreparedByDataHexForUser = origFind;
+        process.removeListener('unhandledRejection', handler);
+      }
+      // Let any microtasks settle before we assert — an unhandled
+      // rejection would land on the next tick.
+      await new Promise((r) => setImmediate(r));
+      expect(unhandled).toEqual([]);
+    }
+  );
+
   test('draftId is consumed (deleted) by default on success', async () => {
     ctx = buildApp();
     const { agent, csrf } = await loggedInAgent(ctx);
