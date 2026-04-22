@@ -360,6 +360,57 @@ describe('drafts CRUD', () => {
     expect(res.body.issues[0].code).toBe('amount_too_large');
   });
 
+  // Codex PR8 round 17 P2: raw JSON numbers above
+  // `Number.MAX_SAFE_INTEGER` are rounded by JSON.parse BEFORE the
+  // route handler sees them. Earlier code then `BigInt(n)`-d the
+  // already-rounded double, silently persisting a different
+  // `payment_amount_sats` than the caller sent. Reject non-safe
+  // integers with a dedicated code so clients know to switch to a
+  // digit string for large values.
+  test('create rejects paymentAmountSats as unsafe JSON number (Codex round 17 P2)', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    // Use the JSON text explicitly so the number is parsed in
+    // transit — supertest's .send(object) would let JS stringify
+    // the literal, and we want the over-safe-integer path.
+    const body = `{"paymentAmountSats": 9007199254740993}`;
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .set('Content-Type', 'application/json')
+      .send(body);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('payment_amount_sats');
+    expect(res.body.issues[0].code).toBe('amount_sats_unsafe_number');
+  });
+
+  test('create accepts paymentAmountSats at Number.MAX_SAFE_INTEGER (Codex round 17 P2)', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    // 2^53 - 1 is losslessly representable both as a JS number and
+    // as a BigInt, so the route MUST accept it without forcing the
+    // caller to switch to a string.
+    const body = `{"paymentAmountSats": 9007199254740991}`;
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .set('Content-Type', 'application/json')
+      .send(body);
+    expect(res.status).toBe(201);
+    expect(res.body.draft.paymentAmountSats).toBe('9007199254740991');
+  });
+
+  test('create accepts paymentAmountSats as a large digit string (Codex round 17 P2)', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    // Well past safe-integer but still inside int64 — the correct
+    // way for a client to submit large amounts.
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmountSats: '100000000000000000' }); // 10^17, < 2^63
+    expect(res.status).toBe(201);
+    expect(res.body.draft.paymentAmountSats).toBe('100000000000000000');
+  });
+
   test('list returns only caller drafts, ordered most-recently-updated first', async () => {
     const a = await loggedInAgent(ctx, 'a@example.com');
     const b = await loggedInAgent(ctx, 'b@example.com');
@@ -1257,6 +1308,55 @@ describe('POST /gov/proposals/prepare', () => {
     // B's draft is untouched.
     const stillThere = await b.agent.get(`/gov/proposals/drafts/${draftId}`);
     expect(stillThere.status).toBe(200);
+  });
+
+  // Codex PR8 round 17 P2: /prepare used to `BigInt(f.paymentAmountSats)`
+  // directly, which silently rounded raw JSON numbers above
+  // `Number.MAX_SAFE_INTEGER` at parse time. The submission row's
+  // canonical JSON + proposal_hash would then encode a different
+  // payment amount than the caller typed. Reject unsafe numeric
+  // input up-front so the caller can re-submit as a digit string.
+  test('prepare rejects paymentAmountSats as unsafe JSON number (Codex round 17 P2)', async () => {
+    ctx = buildApp({
+      gObjectCheck: async () => ({ result: { 'Object status': 'OK' } }),
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const body = validProposalBody();
+    // Strip paymentAmount so the sats path is taken.
+    delete body.paymentAmount;
+    // Send the JSON with a raw unsafe-integer literal in transit.
+    const raw =
+      JSON.stringify(body).replace(/}$/, '') +
+      `, "paymentAmountSats": 9007199254740993}`;
+    const res = await agent
+      .post('/gov/proposals/prepare')
+      .set('X-CSRF-Token', csrf)
+      .set('Content-Type', 'application/json')
+      .send(raw);
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('payment_amount_sats');
+    expect(res.body.issues[0].code).toBe('amount_sats_unsafe_number');
+  });
+
+  test('prepare accepts paymentAmountSats as a large digit string (Codex round 17 P2)', async () => {
+    // Digit strings parse losslessly through BigInt — this is the
+    // recommended wire form for large amounts.
+    ctx = buildApp({
+      gObjectCheck: async () => ({ result: { 'Object status': 'OK' } }),
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const body = {
+      ...validProposalBody(),
+      paymentAmount: undefined,
+      paymentAmountSats: '100000000000000000', // 10^17 sats, < 2^63
+    };
+    delete body.paymentAmount;
+    const res = await agent
+      .post('/gov/proposals/prepare')
+      .set('X-CSRF-Token', csrf)
+      .send(body);
+    expect(res.status).toBe(201);
   });
 });
 

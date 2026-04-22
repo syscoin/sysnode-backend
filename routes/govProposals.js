@@ -115,6 +115,82 @@ function readProposalFields(body) {
   };
 }
 
+// Shape + safety validation for `payment_amount_sats` taken from the
+// wire. Returns `{ ok: true, value: BigInt }` on success, or
+// `{ ok: false, code, message }` with a stable machine-key code that
+// callers wrap into their own `validation_failed` envelope.
+//
+// Accepted shapes:
+//   - BigInt: must be >= 0n. Forwarded verbatim.
+//   - string: must match `/^(0|[1-9][0-9]*)$/` (digit-only, no leading
+//     zeros except "0", no decimal/sign/whitespace/exponent). This is
+//     the recommended wire form for large amounts — strings carry
+//     arbitrary precision, unlike JSON numbers.
+//   - number: must be a SAFE integer (`Number.isSafeInteger`) and
+//     >= 0. Codex PR8 round 17 P2: JS JSON.parse silently rounds
+//     integers above `Number.MAX_SAFE_INTEGER (2^53 - 1)` at parse
+//     time. If we accepted `Number.isInteger` alone and then
+//     `BigInt(n)`'d, a caller that sent `9007199254740993` would
+//     see us persist `9007199254740992` (or some other nearby
+//     double-representable value) — a silent mismatch between the
+//     bytes the user signed and what the server canonicalizes /
+//     hashes. Forcing safe-integer input means callers MUST send
+//     large amounts as digit strings, where `BigInt` parses them
+//     without loss. Anything above int64 is still caught by the
+//     MAX_PAYMENT_AMOUNT_SATS gate downstream, but that gate runs
+//     AFTER the lossy number parse, so the safe-integer check has
+//     to happen here — not there.
+function parsePaymentAmountSatsInput(sats) {
+  if (typeof sats === 'bigint') {
+    if (sats < 0n) {
+      return {
+        ok: false,
+        code: 'amount_sats_invalid',
+        message: 'payment_amount_sats must be non-negative.',
+      };
+    }
+    return { ok: true, value: sats };
+  }
+  if (typeof sats === 'number') {
+    if (!Number.isSafeInteger(sats)) {
+      // Covers: non-finite, non-integer, and integers above 2^53-1
+      // that JSON.parse already rounded. Clients wanting amounts at
+      // or above Number.MAX_SAFE_INTEGER must send a digit string.
+      return {
+        ok: false,
+        code: 'amount_sats_unsafe_number',
+        message:
+          'payment_amount_sats as a JSON number must be a safe integer (|value| < 2^53). Use a digit-only string for larger amounts.',
+      };
+    }
+    if (sats < 0) {
+      return {
+        ok: false,
+        code: 'amount_sats_invalid',
+        message: 'payment_amount_sats must be non-negative.',
+      };
+    }
+    return { ok: true, value: BigInt(sats) };
+  }
+  if (typeof sats === 'string') {
+    if (!/^(0|[1-9][0-9]*)$/.test(sats)) {
+      return {
+        ok: false,
+        code: 'amount_sats_invalid',
+        message:
+          'payment_amount_sats must be a non-negative integer (digit-only string, number, or bigint).',
+      };
+    }
+    return { ok: true, value: BigInt(sats) };
+  }
+  return {
+    ok: false,
+    code: 'amount_sats_invalid',
+    message:
+      'payment_amount_sats must be a non-negative integer (digit-only string, number, or bigint).',
+  };
+}
+
 // Client-side payload shape for a draft. Accepts strings/numbers from
 // JSON and normalizes to what proposalDrafts.create/update expect.
 // BigInt payment amounts come in as either a digit-string or a SYS
@@ -140,20 +216,8 @@ function normalizeDraftPatch(body, maxPaymentCount) {
     // actually a request-shape problem. Validate here so we surface
     // the same `400 validation_failed` shape as the `paymentAmount`
     // branch below.
-    const sats = f.paymentAmountSats;
-    let isValid = false;
-    if (typeof sats === 'bigint' && sats >= 0n) {
-      isValid = true;
-    } else if (typeof sats === 'number') {
-      isValid = Number.isInteger(sats) && sats >= 0;
-    } else if (typeof sats === 'string') {
-      // Require digit-only with no leading/trailing whitespace and
-      // no leading zeros longer than 1 char (so "0" is fine but
-      // "007" is not — matches the canonical serialization we
-      // would later emit). An empty string is rejected.
-      isValid = /^(0|[1-9][0-9]*)$/.test(sats);
-    }
-    if (!isValid) {
+    const parsed = parsePaymentAmountSatsInput(f.paymentAmountSats);
+    if (!parsed.ok) {
       const err = new Error('payment_amount_sats invalid');
       err.status = 400;
       err.body = {
@@ -161,15 +225,16 @@ function normalizeDraftPatch(body, maxPaymentCount) {
         issues: [
           {
             field: 'payment_amount_sats',
-            code: 'amount_sats_invalid',
-            message:
-              'payment_amount_sats must be a non-negative integer (digit-only string, number, or bigint).',
+            code: parsed.code,
+            message: parsed.message,
           },
         ],
       };
       throw err;
     }
-    patch.payment_amount_sats = sats;
+    // `parsePaymentAmountSatsInput` normalizes to BigInt so the
+    // int64 gate below has a single type to compare against.
+    patch.payment_amount_sats = parsed.value;
   } else if (f.paymentAmount !== undefined) {
     // Decimal SYS value — convert to sats up front so the draft row
     // matches the submission row's unit.
@@ -487,20 +552,34 @@ function createGovProposalsRouter({
       end_epoch: f.endEpoch,
     };
     if (f.paymentAmountSats !== undefined) {
-      try {
-        rawForCanon.payment_amount_sats = BigInt(f.paymentAmountSats);
-      } catch {
+      // Codex PR8 round 17 P2: earlier this path used a bare
+      // `BigInt(f.paymentAmountSats)` inside a try/catch. That
+      // accepted raw JS numbers above `Number.MAX_SAFE_INTEGER`,
+      // which `JSON.parse` has already rounded *before* we see
+      // them. `BigInt(9007199254740993)` (what the caller typed)
+      // never happens — what we actually hand to `BigInt` is the
+      // already-rounded double, e.g. `9007199254740992`. We then
+      // canonicalize + hash + persist THAT value, so the stored
+      // submission encodes a different payment amount than the
+      // caller sent, silently. Route through the shared
+      // `parsePaymentAmountSatsInput` helper which enforces
+      // `Number.isSafeInteger` for numeric input; clients that
+      // legitimately need larger amounts must send a digit string
+      // (which `BigInt` parses losslessly).
+      const parsed = parsePaymentAmountSatsInput(f.paymentAmountSats);
+      if (!parsed.ok) {
         return res.status(400).json({
           error: 'validation_failed',
           issues: [
             {
-              field: 'payment_amount',
-              code: 'amount_invalid',
-              message: 'payment_amount_sats must be an integer.',
+              field: 'payment_amount_sats',
+              code: parsed.code,
+              message: parsed.message,
             },
           ],
         });
       }
+      rawForCanon.payment_amount_sats = parsed.value;
     } else if (f.paymentAmount !== undefined) {
       rawForCanon.payment_amount = f.paymentAmount;
     }
