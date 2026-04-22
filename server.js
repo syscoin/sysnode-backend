@@ -33,6 +33,7 @@ const { createCurrentVotesCache } = require('./lib/voteReceipts');
 const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
 const { createProposalDispatcher } = require('./lib/proposalDispatcher');
+const { createProposalRpc } = require('./lib/proposalRpc');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -144,49 +145,17 @@ app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 
 // Proposal RPC adapter.
 //
-// The governance-proposals code (dispatcher + prepare pre-flight) speaks
-// a camelCase surface on purpose — see lib/proposalDispatcher.js for
-// the full rationale. @syscoin/syscoin-js exposes snake_case methods
-// (`gObject_submit`, `gObject_check`, `getRawTransaction`) that return
-// a "stub" you `.call()` to actually fire, so we build the adapter
-// here once and inject it into appFactory.
-//
-// Every adapter function returns a Promise that resolves to the parsed
-// RPC result or rejects with the upstream Error. We pass `true` to
-// `.call()` only where a truthy/verbose response is needed.
-const proposalRpc = {
-  async getRawTransaction(txid, verbose) {
-    return rpcServices(client.callRpc)
-      .getRawTransaction(txid, verbose ? 1 : 0)
-      .call();
-  },
-  async gObjectSubmit(parentHash, revision, time, dataHex, feeTxid) {
-    return rpcServices(client.callRpc)
-      .gObject_submit(parentHash, String(revision), String(time), dataHex, feeTxid)
-      .call(true);
-  },
-  async gObjectCheck(dataHex) {
-    // Codex PR8 round 6 P1: Syscoin Core's `gobject_check` takes
-    // exactly ONE positional arg — `hex_data` — and derives
-    // parentHash, revision and nTime itself (see
-    // syscoin/src/rpc/governance.cpp::gobject_check, which calls
-    //   CGovernanceObject govobj(uint256(), 1, GetAdjustedTime(),
-    //                             uint256(), strDataHex)
-    // ). Earlier iterations of this adapter matched the 4-arg
-    // `gobject_submit` signature, which Core rejected with
-    //   RPC_INVALID_PARAMS: too many positional arguments
-    // and the route's "terminal vs transient" classifier then
-    // masqueraded that as 422 core_rejected on valid proposals.
-    //
-    // gObject_check is a read-only validation endpoint (no state
-    // mutation, no fee). We swallow "Not Implemented" style errors
-    // at the route layer (see routes/govProposals.js) so that older
-    // Core builds degrade silently to "skip pre-flight".
-    return rpcServices(client.callRpc)
-      .gObject_check(dataHex)
-      .call();
-  },
-};
+// The governance-proposals code (dispatcher + prepare pre-flight)
+// speaks a camelCase surface on purpose — see
+// lib/proposalDispatcher.js for the full rationale.
+// @syscoin/syscoin-js exposes snake_case methods (`gObject_submit`,
+// `gObject_check`, `getRawTransaction`) that return a "stub" you
+// `.call()` to actually fire. The wrapping lives in
+// `lib/proposalRpc.js` so it can be unit-tested directly; without
+// that extraction a regression in the argument shape sent to
+// syscoin-js / syscoind (e.g. stringified revision/time) would only
+// surface in integration.
+const proposalRpc = createProposalRpc(() => rpcServices(client.callRpc));
 
 mountAuthAndVault(app, {
   services,

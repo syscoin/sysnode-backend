@@ -293,6 +293,73 @@ describe('drafts CRUD', () => {
     expect(res.body.issues[0].field).toBe('payment_amount_sats');
   });
 
+  // Codex PR8 round 16 P2: shape-valid but over-int64 payment_amount_sats
+  // used to pass draft validation (the regex only checks digit shape)
+  // and then overflowed the SQLite INTEGER column at insert/update,
+  // surfacing as a generic 500. With the MAX_PAYMENT_AMOUNT_SATS gate
+  // the route now returns a deterministic 400 with `amount_too_large`
+  // so the client can correct the payload.
+  test('create rejects payment_amount_sats above int64_max as 400 (Codex round 16 P2)', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    // 2^63 exactly — one past the largest signed 64-bit integer,
+    // the canonical overflow case.
+    const over = '9223372036854775808';
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmountSats: over });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('payment_amount_sats');
+    expect(res.body.issues[0].code).toBe('amount_too_large');
+  });
+
+  test('create accepts exactly int64_max payment_amount_sats (Codex round 16 P2)', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    // 2^63 - 1 — the largest value the SQLite INTEGER column can
+    // hold. Business-nonsensical for SYS but must pass draft
+    // validation so we do not reject a representable payload.
+    const max = '9223372036854775807';
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmountSats: max });
+    expect(res.status).toBe(201);
+    expect(res.body.draft.paymentAmountSats).toBe(max);
+  });
+
+  test('patch rejects payment_amount_sats above int64_max as 400 (Codex round 16 P2)', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const created = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ title: 'draft' });
+    const id = created.body.draft.id;
+    const res = await agent
+      .patch(`/gov/proposals/drafts/${id}`)
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmountSats: '9999999999999999999' }); // 10^19, > 2^63
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('payment_amount_sats');
+    expect(res.body.issues[0].code).toBe('amount_too_large');
+  });
+
+  test('create with over-range decimal paymentAmount also rejected as amount_too_large', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    // 10^13 SYS = 10^21 sats — parses fine to BigInt, but the
+    // int64 gate below must still fire so the error code is
+    // deterministic instead of a 500 at the repo layer.
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmount: '10000000000000' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('payment_amount_sats');
+    expect(res.body.issues[0].code).toBe('amount_too_large');
+  });
+
   test('list returns only caller drafts, ordered most-recently-updated first', async () => {
     const a = await loggedInAgent(ctx, 'a@example.com');
     const b = await loggedInAgent(ctx, 'b@example.com');

@@ -193,6 +193,43 @@ function normalizeDraftPatch(body, maxPaymentCount) {
     }
   }
 
+  // Codex PR8 round 16 P2: enforce the SQLite INTEGER (int64) ceiling
+  // on any accepted payment_amount_sats BEFORE the draft hits the
+  // DB layer. The structural validator applies the same gate for
+  // submissions (see proposalValidate.MAX_PAYMENT_AMOUNT_SATS), but
+  // draft validation is intentionally looser — it only checked the
+  // digit-shape regex / BigInt >= 0 and forwarded arbitrarily large
+  // values straight to `proposal_drafts.payment_amount_sats`, where
+  // an int64 overflow surfaced as a generic 500 instead of a
+  // deterministic 400. Normalize all three accepted shapes (BigInt
+  // / Number / digit-string) to BigInt for the comparison, and
+  // persist the normalized BigInt so the drafts repo never has to
+  // re-parse a string. The `paymentAmount` branch above already
+  // emits a BigInt from `parsePaymentAmountToSats`, so it flows
+  // through this gate automatically.
+  if (patch.payment_amount_sats !== undefined) {
+    const asBig =
+      typeof patch.payment_amount_sats === 'bigint'
+        ? patch.payment_amount_sats
+        : BigInt(patch.payment_amount_sats);
+    if (asBig > proposalValidate.MAX_PAYMENT_AMOUNT_SATS) {
+      const err = new Error('payment_amount_sats exceeds maximum');
+      err.status = 400;
+      err.body = {
+        error: 'validation_failed',
+        issues: [
+          {
+            field: 'payment_amount_sats',
+            code: 'amount_too_large',
+            message: 'Payment amount exceeds the maximum supported value.',
+          },
+        ],
+      };
+      throw err;
+    }
+    patch.payment_amount_sats = asBig;
+  }
+
   if (f.paymentCount !== undefined) {
     const n = Math.trunc(Number(f.paymentCount));
     if (!Number.isFinite(n) || n < 1 || n > maxPaymentCount) {
