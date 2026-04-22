@@ -486,66 +486,37 @@ function createGovProposalsRouter({
       canon.dataHex
     );
 
-    let timeUnix;
-    let proposalHash;
-    let opReturnHex;
-    if (existingByPayload) {
-      timeUnix = existingByPayload.timeUnix;
-      proposalHash = existingByPayload.proposalHash;
-      // Rebuild opReturnHex from the frozen fields; the stored hash
-      // is the big-endian display form, so we rehash rather than
-      // byte-reverse to keep the derivation honest (and to catch
-      // any drift between computeProposalHash and the row).
-      try {
-        opReturnHex = computeProposalHash({
-          parentHash,
-          revision,
-          time: timeUnix,
-          dataHex: existingByPayload.dataHex,
-        }).opReturnBytes.toString('hex');
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error(
-          '[POST /gov/proposals/prepare] rehash error',
-          err
-        );
-        return res.status(500).json({ error: 'internal' });
-      }
-      return res.status(200).json({
-        submission: jsonSubmission(existingByPayload),
-        opReturnHex,
-        canonicalJson: canon.json,
-        payloadBytes: canon.byteLength,
-        collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
-        requiredConfirmations: REQUIRED_CONFIRMATIONS,
-        idempotent: true,
-      });
-    }
+    // Determine the hashing time. On the idempotent replay path we
+    // MUST reuse the frozen `timeUnix` from the existing row — any
+    // other value would change the proposal hash we commit to via
+    // OP_RETURN, and the client already has the original envelope.
+    // On the fresh path, use our server clock (`nowSeconds`) rather
+    // than trust client input, so a stale client can't backdate the
+    // submission past Core's expiration check.
+    const timeUnix = existingByPayload
+      ? existingByPayload.timeUnix
+      : nowSeconds;
 
-    timeUnix = nowSeconds;
-    let hash;
-    try {
-      hash = computeProposalHash({
-        parentHash,
-        revision,
-        time: timeUnix,
-        dataHex: canon.dataHex,
-      });
-    } catch (err) {
-      // Should be impossible post-validation; keep as 500 so we see it.
-      // eslint-disable-next-line no-console
-      console.error('[POST /gov/proposals/prepare] hash error', err);
-      return res.status(500).json({ error: 'internal' });
-    }
-    proposalHash = hash.displayHex;
-    opReturnHex = hash.opReturnBytes.toString('hex');
-
-    // RPC pre-flight: give Core the exact dataHex we'll later submit.
-    // If Core complains now, the user can fix it before paying 150
-    // SYS. Transient errors (node unreachable) are soft-treated —
-    // we proceed and trust the dispatcher to surface any issue later
-    // when it calls gObject_submit.
-    if (typeof rpc.gObjectCheck === 'function') {
+    // Preflight Core BEFORE branching on idempotency. Previously the
+    // idempotent short-circuit returned early without re-running the
+    // check, so if the original /prepare created the row during a
+    // transient RPC outage (the `catch` block below soft-allows net
+    // errors), every retry would replay the cached row and never
+    // revalidate once Core recovered. A Core-invalid proposal could
+    // then proceed to collateral payment and fail only in the
+    // dispatcher — after the 150 SYS fee is already burned.
+    // Running the preflight first ensures every /prepare response is
+    // backed by a fresh Core ack (or an explicit soft-fail we logged).
+    // (Codex PR8 round 5 P1.)
+    //
+    // `rpc` is advertised as optional and appFactory.js explicitly
+    // passes `null` when no Core connection is wired (a valid default
+    // deployment). Destructured defaults (`rpc = {}`) only fire for
+    // `undefined`, so an explicit null would flow through and the
+    // bare `typeof rpc.gObjectCheck` dereference would throw
+    // TypeError inside this async handler, surfacing as an unhandled
+    // rejection instead of a clean "skip preflight".
+    if (rpc && typeof rpc.gObjectCheck === 'function') {
       try {
         // The production adapter in server.js has the full Core
         // signature `(parentHash, revision, time, dataHex)`. Earlier
@@ -600,8 +571,58 @@ function createGovProposalsRouter({
       }
     }
 
-    // (Payload-keyed idempotency handled above via
-    // findPreparedByDataHexForUser — Codex PR8 round 2 P1.)
+    // Idempotent replay: Core just re-acked (or we soft-failed), so
+    // the cached envelope is safe to return.
+    let proposalHash;
+    let opReturnHex;
+    if (existingByPayload) {
+      proposalHash = existingByPayload.proposalHash;
+      // Rebuild opReturnHex from the frozen fields; the stored hash
+      // is the big-endian display form, so we rehash rather than
+      // byte-reverse to keep the derivation honest (and to catch
+      // any drift between computeProposalHash and the row).
+      try {
+        opReturnHex = computeProposalHash({
+          parentHash,
+          revision,
+          time: timeUnix,
+          dataHex: existingByPayload.dataHex,
+        }).opReturnBytes.toString('hex');
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[POST /gov/proposals/prepare] rehash error',
+          err
+        );
+        return res.status(500).json({ error: 'internal' });
+      }
+      return res.status(200).json({
+        submission: jsonSubmission(existingByPayload),
+        opReturnHex,
+        canonicalJson: canon.json,
+        payloadBytes: canon.byteLength,
+        collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
+        requiredConfirmations: REQUIRED_CONFIRMATIONS,
+        idempotent: true,
+      });
+    }
+
+    let hash;
+    try {
+      hash = computeProposalHash({
+        parentHash,
+        revision,
+        time: timeUnix,
+        dataHex: canon.dataHex,
+      });
+    } catch (err) {
+      // Should be impossible post-validation; keep as 500 so we see it.
+      // eslint-disable-next-line no-console
+      console.error('[POST /gov/proposals/prepare] hash error', err);
+      return res.status(500).json({ error: 'internal' });
+    }
+    proposalHash = hash.displayHex;
+    opReturnHex = hash.opReturnBytes.toString('hex');
 
     // Draft consumption: default to "yes" if a draftId is supplied
     // and belongs to the user. The frontend explicitly opts out with

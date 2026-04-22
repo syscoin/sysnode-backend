@@ -594,6 +594,79 @@ describe('POST /gov/proposals/prepare', () => {
     }
   );
 
+  test(
+    'idempotent replay re-runs gObjectCheck preflight; Core-reject after a soft-failed first attempt returns 422 (Codex round 5 P1)',
+    async () => {
+      // Scenario: the *first* /prepare call lands during a transient
+      // Core RPC outage (node unreachable). The route soft-allows
+      // network errors, so the prepared row is created and the
+      // client gets a 201 envelope. Later, the client retries the
+      // exact same canonical body, but now Core is reachable and
+      // deterministically rejects the payload (e.g. checksum-invalid
+      // payment address that fullValidate didn't catch because
+      // address parsing is network-param-specific to Core).
+      //
+      // Before the round-5 fix, the idempotent branch returned the
+      // cached envelope without re-preflighting, so the user would
+      // proceed to burn 150 SYS on a proposal Core will reject at
+      // dispatcher-time. With the fix, gObjectCheck runs on EVERY
+      // /prepare, including the idempotent replay, so Core-reject
+      // surfaces as 422 before any collateral is spent.
+      let phase = 'network-down';
+      ctx = buildApp({
+        gObjectCheck: async () => {
+          if (phase === 'network-down') {
+            // Match the soft-fail heuristic: the route only treats
+            // messages matching /validation|invalid|exceeds|...;/ as
+            // terminal. A pure connection-refused is soft.
+            const e = new Error('ECONNREFUSED: Core unreachable');
+            throw e;
+          }
+          if (phase === 'reject') {
+            return {
+              result: {
+                Error: 'checksum invalid for payment_address',
+              },
+            };
+          }
+          return { result: { Object: 'success' } };
+        },
+      });
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const body = validProposalBody();
+
+      const r1 = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(body);
+      expect(r1.status).toBe(201);
+
+      // Flip to deterministic-reject and retry the SAME canonical
+      // body. The idempotency pre-read will find the prepared row.
+      phase = 'reject';
+
+      const r2 = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(body);
+
+      // Critical: retry must NOT return cached 200-idempotent even
+      // though a prepared row exists for this payload; preflight
+      // has to execute and translate Core's reject into 422.
+      expect(r2.status).toBe(422);
+      expect(r2.body.error).toBe('core_rejected');
+
+      // And the prepared row is still in DB (the user can either
+      // DELETE it or edit the proposal to produce a fresh payload).
+      const rows = ctx.submissions.listForUser(
+        ctx.users.findByEmail('user@example.com').id
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].status).toBe('prepared');
+      expect(rows[0].id).toBe(r1.body.submission.id);
+    }
+  );
+
   test('hash is deterministic: same inputs → same proposalHash', async () => {
     ctx = buildApp();
     // Two different users preparing the same proposal text — because
