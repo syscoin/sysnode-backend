@@ -691,38 +691,49 @@ function createGovProposalsRouter({
     // and belongs to the user. The frontend explicitly opts out with
     // { consumeDraft: false } if it ever wants to publish from a
     // draft without deleting it.
-    let draftIdToConsume = null;
-    if (f && body.draftId !== undefined && body.draftId !== null) {
-      const draftId = parseIntId(body.draftId);
-      if (draftId) {
-        // Codex PR8 round 8 P1: `drafts.getByIdForUser` can throw for
-        // the same class of transient SQLite faults as
-        // `findPreparedByDataHexForUser` above — catch here so an
-        // I/O hiccup surfaces as a controlled 500 rather than an
-        // unhandled promise rejection inside the async handler.
-        let d;
-        try {
-          d = drafts.getByIdForUser(draftId, userId);
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error(
-            '[POST /gov/proposals/prepare] drafts.getByIdForUser failed',
-            err
-          );
-          return res.status(500).json({ error: 'internal' });
-        }
-        if (d) draftIdToConsume = draftId;
-      }
-    }
+    //
+    // Codex PR8 round 9 P2: the ownership lookup + insert USED to
+    // straddle the `runAtomic` boundary: we read the draft, then
+    // inserted with that cached id. A concurrent delete/consume of
+    // the same draft (e.g. another tab, or an earlier /prepare on
+    // the same draft that won a race) could therefore invalidate
+    // the FK between the read and the insert, and the insert would
+    // throw a SQLITE_CONSTRAINT foreign-key error that bled through
+    // as a generic 500. That's a normal race we should degrade
+    // gracefully through, not a server fault. Parse the candidate
+    // id here (still pure), but defer the actual ownership lookup
+    // (and the corresponding removal) to *inside* the atomic block
+    // below so both see the same point-in-time view of `drafts`.
     const consumeDraft =
       body.consumeDraft !== undefined ? Boolean(body.consumeDraft) : true;
+    let candidateDraftId = null;
+    if (body.draftId !== undefined && body.draftId !== null) {
+      candidateDraftId = parseIntId(body.draftId) || null;
+    }
 
     let createdRow;
     try {
       createdRow = runAtomic(() => {
+        // Resolve the draft *inside* the transaction so the ownership
+        // check and the insert (and the optional delete) see a
+        // consistent snapshot. better-sqlite3's `db.transaction`
+        // holds a write lock for the duration of this callback, so
+        // no other writer can delete the draft out from under us
+        // between the getByIdForUser and the submissions.create.
+        // If a concurrent delete already happened *before* we
+        // grabbed the lock, the draft is gone — degrade to
+        // draftId:null (no FK violation) rather than 500ing, since
+        // from the user's perspective the wizard form data is
+        // still perfectly publishable; the draft row is just
+        // bookkeeping.
+        let resolvedDraftId = null;
+        if (candidateDraftId) {
+          const d = drafts.getByIdForUser(candidateDraftId, userId);
+          if (d) resolvedDraftId = candidateDraftId;
+        }
         const row = submissions.create({
           userId,
-          draftId: draftIdToConsume,
+          draftId: resolvedDraftId,
           parentHash,
           revision,
           timeUnix,
@@ -737,8 +748,8 @@ function createGovProposalsRouter({
           startEpoch: canon.payload.start_epoch,
           endEpoch: canon.payload.end_epoch,
         });
-        if (draftIdToConsume && consumeDraft) {
-          drafts.remove(draftIdToConsume, userId);
+        if (resolvedDraftId && consumeDraft) {
+          drafts.remove(resolvedDraftId, userId);
         }
         return row;
       });

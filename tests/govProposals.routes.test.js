@@ -1002,6 +1002,54 @@ describe('POST /gov/proposals/prepare', () => {
     expect(stillThere.status).toBe(200);
   });
 
+  test(
+    'concurrent draft delete between pre-read and insert degrades to draftId:null (Codex round 9 P2)',
+    async () => {
+      // Regression: draft ownership USED to be resolved OUTSIDE the
+      // `runAtomic` transaction. A concurrent delete of that draft
+      // (e.g. another tab or an earlier /prepare that raced us) could
+      // therefore invalidate the FK between the cached id and the
+      // actual row, and the subsequent submissions.create would
+      // throw SQLITE_CONSTRAINT (foreign key) — bubbling out as a
+      // generic 500 even though the user's action is a perfectly
+      // normal race we should degrade through.
+      //
+      // Fix: resolve draft ownership inside the same atomic block
+      // that creates the submission. If the draft is gone by the
+      // time we enter the transaction, fall back to draftId:null
+      // instead of 500ing.
+      //
+      // We simulate the race by stubbing `drafts.getByIdForUser` to
+      // return null (as if the row was deleted between the client
+      // sending the request and the transaction starting). With the
+      // fix in place, prepare succeeds with 201 and draftId:null.
+      ctx = buildApp();
+      const { agent, csrf } = await loggedInAgent(ctx);
+      // Create a real draft so the request body's draftId survives
+      // input validation (parseIntId + > 0).
+      const draft = await agent
+        .post('/gov/proposals/drafts')
+        .set('X-CSRF-Token', csrf)
+        .send({ title: 'will-race' });
+      const draftId = draft.body.draft.id;
+
+      // Simulate "concurrent delete landed before /prepare took the
+      // write lock": force the inside-txn lookup to return null.
+      const origGet = ctx.drafts.getByIdForUser;
+      ctx.drafts.getByIdForUser = () => null;
+      try {
+        const res = await agent
+          .post('/gov/proposals/prepare')
+          .set('X-CSRF-Token', csrf)
+          .send({ ...validProposalBody(), draftId });
+        expect(res.status).toBe(201);
+        expect(res.body.submission.draftId).toBeNull();
+      } finally {
+        ctx.drafts.getByIdForUser = origGet;
+      }
+    }
+  );
+
   test('unknown / other-user draftId is ignored (not an error)', async () => {
     ctx = buildApp();
     const a = await loggedInAgent(ctx, 'a@example.com');

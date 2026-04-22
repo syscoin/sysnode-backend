@@ -365,18 +365,37 @@ const proposalDispatcher = createProposalDispatcher({
   },
 });
 
-setTimeout(() => {
-  proposalDispatcher.tick().catch((err) => {
+// Codex PR8 round 9 P2: self-scheduling dispatcher loop.
+//
+// The previous implementation used `setInterval(..., 60s)` which
+// fires on a fixed cadence regardless of how long the last tick is
+// still running. Under slow RPC or a large `awaiting_collateral`
+// backlog, a single tick can easily exceed the interval — two
+// workers then start processing the same rows concurrently, which
+// at best doubles the `getRawTransaction` / `gObjectSubmit` load on
+// the RPC node (and any shared rate limiter) and at worst races on
+// state transitions that the CAS guards in proposalSubmissions.js
+// would otherwise collapse cleanly. Serialize with a
+// self-scheduling `setTimeout` that re-arms only AFTER the previous
+// `tick()` resolves (matching the appFactory.js pattern).
+const PROPOSAL_DISPATCHER_INTERVAL_MS = 60 * 1000;
+const PROPOSAL_DISPATCHER_KICKOFF_MS = 5 * 60 * 1000;
+
+async function proposalDispatcherLoop() {
+  try {
+    await proposalDispatcher.tick();
+  } catch (err) {
+    // Dispatcher swallows per-row errors internally; any throw out
+    // here is an invariant violation worth logging but not fatal.
     // eslint-disable-next-line no-console
-    console.error('[proposal] initial tick failed', err && err.message);
-  });
-  setInterval(() => {
-    proposalDispatcher.tick().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error('[proposal] tick failed', err && err.message);
-    });
-  }, 60 * 1000).unref();
-}, 5 * 60 * 1000).unref();
+    console.error('[proposal] tick failed', err && err.message);
+  }
+  setTimeout(proposalDispatcherLoop, PROPOSAL_DISPATCHER_INTERVAL_MS).unref();
+}
+
+setTimeout(() => {
+  proposalDispatcherLoop();
+}, PROPOSAL_DISPATCHER_KICKOFF_MS).unref();
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
