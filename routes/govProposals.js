@@ -132,8 +132,44 @@ function normalizeDraftPatch(body, maxPaymentCount) {
   }
 
   if (f.paymentAmountSats !== undefined) {
-    // Digit-string or number; proposalDrafts will bigint-coerce.
-    patch.payment_amount_sats = f.paymentAmountSats;
+    // Codex PR8 round 5 P2: previously this path forwarded the raw
+    // client value straight to the repo, which threw on malformed
+    // input (`"12.5"`, `"-1"`, `"abc"`, objects, …). The route
+    // catch-all rendered those throws as generic `500 internal`,
+    // which looks like a server bug to the client for what is
+    // actually a request-shape problem. Validate here so we surface
+    // the same `400 validation_failed` shape as the `paymentAmount`
+    // branch below.
+    const sats = f.paymentAmountSats;
+    let isValid = false;
+    if (typeof sats === 'bigint' && sats >= 0n) {
+      isValid = true;
+    } else if (typeof sats === 'number') {
+      isValid = Number.isInteger(sats) && sats >= 0;
+    } else if (typeof sats === 'string') {
+      // Require digit-only with no leading/trailing whitespace and
+      // no leading zeros longer than 1 char (so "0" is fine but
+      // "007" is not — matches the canonical serialization we
+      // would later emit). An empty string is rejected.
+      isValid = /^(0|[1-9][0-9]*)$/.test(sats);
+    }
+    if (!isValid) {
+      const err = new Error('payment_amount_sats invalid');
+      err.status = 400;
+      err.body = {
+        error: 'validation_failed',
+        issues: [
+          {
+            field: 'payment_amount_sats',
+            code: 'amount_sats_invalid',
+            message:
+              'payment_amount_sats must be a non-negative integer (digit-only string, number, or bigint).',
+          },
+        ],
+      };
+      throw err;
+    }
+    patch.payment_amount_sats = sats;
   } else if (f.paymentAmount !== undefined) {
     // Decimal SYS value — convert to sats up front so the draft row
     // matches the submission row's unit.

@@ -240,6 +240,59 @@ describe('drafts CRUD', () => {
     expect(res.body.issues[0].field).toBe('payment_amount');
   });
 
+  // Codex PR8 round 5 P2: malformed payment_amount_sats used to
+  // surface as a generic 500 because the route forwarded the raw
+  // string down to proposalDrafts.create(), which throws out of the
+  // handler. Route-layer validation now rejects it with the same
+  // 400 shape as other validation failures.
+  test('create rejects malformed payment_amount_sats as 400', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const cases = [
+      'abc', // non-digit
+      '12.5', // decimal (sats are integer)
+      '-1', // negative
+      '007', // leading zeros
+      '', // empty string
+      '1e3', // scientific notation
+    ];
+    for (const sats of cases) {
+      const res = await agent
+        .post('/gov/proposals/drafts')
+        .set('X-CSRF-Token', csrf)
+        .send({ paymentAmountSats: sats });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('validation_failed');
+      expect(res.body.issues[0].field).toBe('payment_amount_sats');
+      expect(res.body.issues[0].code).toBe('amount_sats_invalid');
+    }
+  });
+
+  test('create accepts well-formed payment_amount_sats', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const res = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmountSats: '15000000000' });
+    expect(res.status).toBe(201);
+    expect(res.body.draft.paymentAmountSats).toBe('15000000000');
+  });
+
+  test('patch rejects malformed payment_amount_sats as 400', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const created = await agent
+      .post('/gov/proposals/drafts')
+      .set('X-CSRF-Token', csrf)
+      .send({ title: 'draft' });
+    const id = created.body.draft.id;
+    const res = await agent
+      .patch(`/gov/proposals/drafts/${id}`)
+      .set('X-CSRF-Token', csrf)
+      .send({ paymentAmountSats: '12.5' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('payment_amount_sats');
+  });
+
   test('list returns only caller drafts, ordered most-recently-updated first', async () => {
     const a = await loggedInAgent(ctx, 'a@example.com');
     const b = await loggedInAgent(ctx, 'b@example.com');
