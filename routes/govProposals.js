@@ -1253,20 +1253,26 @@ function createGovProposalsRouter({
         code === 'bad_op_return' ||
         code === 'network_mismatch'
       ) {
+        // `network_mismatch` can come from either xpub-prefix or
+        // change-address HRP validation — the thrower tags the
+        // failing input via `err.field` so we highlight the right
+        // form control downstream. Other codes have a single
+        // unambiguous origin field.
+        let field;
+        if (code === 'bad_xpub') field = 'xpub';
+        else if (code === 'bad_change_address') field = 'changeAddress';
+        else if (code === 'bad_fee_rate') field = 'feeRate';
+        else if (code === 'bad_op_return') field = 'opReturnHex';
+        else if (code === 'network_mismatch') {
+          field = err && (err.field === 'xpub' || err.field === 'changeAddress')
+            ? err.field
+            : 'xpub';
+        }
         return res.status(400).json({
           error: 'validation_failed',
           issues: [
             {
-              field:
-                code === 'bad_xpub'
-                  ? 'xpub'
-                  : code === 'bad_change_address'
-                  ? 'changeAddress'
-                  : code === 'bad_fee_rate'
-                  ? 'feeRate'
-                  : code === 'network_mismatch'
-                  ? 'xpub'
-                  : 'opReturnHex',
+              field,
               code,
               message: (err && err.detail) || err.message || code,
             },

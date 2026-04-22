@@ -172,6 +172,15 @@ const proposalRpc = createProposalRpc(() => rpcServices(client.callRpc));
 // leave `paliPsbtBuilder` null; the gov-proposals router then
 // returns 503 from that route and reports `paliPathEnabled: false`
 // from GET /network, so the FE hides the button cleanly.
+//
+// NOTE: the chain declared here via SYSCOIN_NETWORK is ONLY trusted
+// after it's been cross-checked against the actual RPC node's
+// `getblockchaininfo.chain`. That cross-check lives in
+// `paliChainGuard` below (constructed right after this block); the
+// router refuses /collateral/psbt until the guard reports ready, so
+// an operator misconfiguration (e.g. SYSCOIN_NETWORK=mainnet but
+// SYSCOIN_RPC_* pointing at a testnet node) cannot cause users to
+// burn 150 SYS on the wrong chain.
 const PALI_NETWORK_KEY = (() => {
   const raw = String(process.env.SYSCOIN_NETWORK || '').trim().toLowerCase();
   if (raw === 'mainnet') return 'mainnet';

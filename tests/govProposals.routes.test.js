@@ -2043,11 +2043,12 @@ describe('POST /gov/proposals/submissions/:id/collateral/psbt', () => {
     });
   });
 
-  test('400 network_mismatch maps to xpub validation issue', async () => {
+  test('400 network_mismatch from xpub prefix reports field=xpub', async () => {
     ctx = withBuilder({
       impl: async () => {
         const e = new Error('network_mismatch');
         e.code = 'network_mismatch';
+        e.field = 'xpub';
         e.detail = 'expected zpub... for mainnet';
         throw e;
       },
@@ -2064,6 +2065,52 @@ describe('POST /gov/proposals/submissions/:id/collateral/psbt', () => {
       code: 'network_mismatch',
       message: 'expected zpub... for mainnet',
     });
+  });
+
+  // Codex PR10 round 2 P2: disambiguate which input caused
+  // network_mismatch so the FE highlights the correct form control.
+  test('400 network_mismatch from change-address HRP reports field=changeAddress', async () => {
+    ctx = withBuilder({
+      impl: async () => {
+        const e = new Error('network_mismatch');
+        e.code = 'network_mismatch';
+        e.field = 'changeAddress';
+        e.detail = 'change address is not valid on mainnet';
+        throw e;
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(400);
+    expect(res.body.issues[0]).toEqual({
+      field: 'changeAddress',
+      code: 'network_mismatch',
+      message: 'change address is not valid on mainnet',
+    });
+  });
+
+  // Fallback: legacy callers that throw without setting .field
+  // still get a sensible default of 'xpub' (the most common cause).
+  test('400 network_mismatch with no .field falls back to xpub', async () => {
+    ctx = withBuilder({
+      impl: async () => {
+        const e = new Error('network_mismatch');
+        e.code = 'network_mismatch';
+        e.detail = 'ambiguous';
+        throw e;
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.body.issues[0].field).toBe('xpub');
   });
 
   test('502 on blockbook_unreachable', async () => {
