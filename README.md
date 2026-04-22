@@ -1,0 +1,272 @@
+# sysnode-backend
+
+Express API behind [sysnode.info](https://sysnode.info). Aggregates Syscoin Core RPC + Blockbook + masternode telemetry + a small authenticated subsystem for governance proposal drafts, vote reminders, and "Pay-with-Pali" collateral flows.
+
+The public dashboard is served by [sysnode-info](https://github.com/syscoin/sysnode-info); this repo is the backend half of that stack.
+
+## Runtime surface
+
+Public, unauthenticated routes (cached, read-only):
+
+- `/mnstats`, `/masternodes`, `/mnlist`, `/mnsearch` — masternode data
+- `/governance` — active and historical governance proposals
+- `/csvparser` — CSV-ingest helper used by the dashboard
+
+Authenticated routes (cookie + CSRF, same-site):
+
+- `/auth/*` — registration, verification, login, session, delete account
+- `/vault/*` — encrypted per-user blobs (notification prefs, proposal drafts)
+- `/gov/proposals/*` — governance proposal wizard, submissions, collateral PSBT, vote receipts
+
+## Requirements
+
+- Node.js 20 LTS (engines in `package.json` gate Node ≥ 20, < 24)
+- A reachable `syscoind` on mainnet or testnet, with RPC enabled
+- SMTP server for verification emails and vote reminders (or `MAIL_TRANSPORT=log` for dry-run)
+- SQLite 3 (via `better-sqlite3`, no separate install; native module compiles at `npm install`)
+
+Optional, used only for the Pali PSBT collateral path:
+
+- A Blockbook instance for the same network as the RPC node (`https://blockbook.syscoin.org/` for mainnet, `https://blockbook-dev.syscoin.org/` for testnet)
+
+## Local development
+
+```bash
+git clone https://github.com/syscoin/sysnode-backend.git
+cd sysnode-backend
+npm ci
+cp .env.example .env        # then edit — see .env.example for inline docs
+npm run dev                 # nodemon on :3001
+npm test                    # full jest suite (~830 cases)
+```
+
+## Configuration
+
+All configuration is via environment variables. `.env.example` is the source of truth and carries inline rationale for every field. The short form:
+
+| Variable | Purpose |
+| --- | --- |
+| `PORT`, `BASE_URL` | Where the server listens, and the public URL baked into email links |
+| `CORS_ORIGIN`, `FRONTEND_URL` | SPA origin for credentialed CORS and verification-link base |
+| `TRUST_PROXY` | Reverse-proxy hop count (or CIDR) so `req.ip` is the real client |
+| `SYSNODE_DB_PATH` | Path to the SQLite file (auto-created) |
+| `SYSNODE_AUTH_PEPPER` | 32-byte hex secret; **required in production** |
+| `SMTP_*`, `MAIL_FROM`, `MAIL_TRANSPORT` | Mail delivery; `MAIL_TRANSPORT=log` prints to stdout |
+| `SYSCOIN_RPC_HOST`, `SYSCOIN_RPC_PORT` | RPC endpoint (default `127.0.0.1:8370`) |
+| `SYSCOIN_RPC_COOKIE_PATH` | **Preferred** — absolute path to Core's `.cookie` for same-host deployments |
+| `SYSCOIN_RPC_USER`, `SYSCOIN_RPC_PASS` | Fallback static creds for remote RPC nodes |
+| `SYSCOIN_NETWORK`, `SYSCOIN_BLOCKBOOK_URL` | Enables the Pay-with-Pali collateral PSBT path |
+
+### Cookie vs static RPC auth
+
+The backend supports both authentication modes and picks **cookie over static** when both are configured (with a one-line warning at boot). Cookie auth is zero-secret-management: `syscoind` rewrites the cookie on every restart, and the backend picks up the new token automatically via a 401-driven replay. Use it for any deployment where the backend runs on the same host as `syscoind`.
+
+For remote RPC nodes, either configure `rpcauth=` in `syscoin.conf` and use the static `SYSCOIN_RPC_USER` / `SYSCOIN_RPC_PASS` here, or mount the cookie file via a secure channel.
+
+## Full-stack test deployment (single host)
+
+These steps stand up `sysnode-backend` + [`sysnode-info`](https://github.com/syscoin/sysnode-info) on one Ubuntu box that already runs `syscoind`. HTTP-only; intended for staging and testing, not production. Everything installs into the user's home directory — **no `sudo` required** on most steps (a couple of optional hardening steps do need it; they are clearly marked).
+
+Walked end-to-end against Ubuntu 24.04 LTS + Node 22. Port layout: backend :3001, frontend :3000, Mailpit UI :8025, Mailpit SMTP :1025 (loopback-only).
+
+### 1. Node.js 20 or 22 + basic tooling
+
+Node.js ≥ 20, < 24 (see `engines` in `package.json`). If the box already has a Node in that range, skip the `nvm` block. Ubuntu 24.04 ships a compatible Node in its default repos; many one-click images come with Node 20 or 22 pre-installed.
+
+```bash
+# Only if you don't already have Node 20–23.x
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+source ~/.bashrc
+nvm install 22 && nvm use 22
+
+# Use a user-local npm prefix so global installs don't need sudo
+mkdir -p ~/.npm-global ~/.local/bin
+npm config set prefix ~/.npm-global
+echo 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"' >> ~/.bashrc
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+
+npm install -g pm2 serve
+```
+
+### 2. Mailpit (open-source SMTP catcher + web UI)
+
+[Mailpit](https://github.com/axllent/mailpit) is a single-binary SMTP sink that exposes every delivered message through a local web UI. Perfect for staging: you click verification links out of the inbox instead of running a real mailer. We install it into `~/.local/bin` (no sudo) and supervise it with `pm2` alongside the two Node processes.
+
+```bash
+cd /tmp
+ARCH=$(uname -m); case "$ARCH" in x86_64) MP=linux-amd64;; aarch64) MP=linux-arm64;; esac
+curl -fsSL "https://github.com/axllent/mailpit/releases/latest/download/mailpit-${MP}.tar.gz" -o mailpit.tgz
+tar -xzf mailpit.tgz
+mv mailpit ~/.local/bin/mailpit && chmod +x ~/.local/bin/mailpit
+
+pm2 start "mailpit --smtp 127.0.0.1:1025 --listen 0.0.0.0:8025" --name mailpit
+```
+
+After this, `http://<server-ip>:8025` is the inbox.
+
+### 3. Clone both repos
+
+```bash
+mkdir -p ~/apps && cd ~/apps
+git clone https://github.com/syscoin/sysnode-backend.git
+git clone https://github.com/syscoin/sysnode-info.git
+```
+
+### 4. Configure the backend
+
+```bash
+cd ~/apps/sysnode-backend
+npm ci
+
+# Locate the Core cookie (path depends on the user that runs syscoind)
+ls -l ~/.syscoin/.cookie 2>/dev/null || sudo ls -l /root/.syscoin/.cookie
+
+PEPPER=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+COOKIE_PATH=/home/ubuntu/.syscoin/.cookie   # adjust to match the ls above
+SERVER_IP=$(hostname -I | awk '{print $1}') # or hardcode the public IP
+
+cat > .env <<EOF
+PORT=3001
+BASE_URL=http://${SERVER_IP}:3001
+CORS_ORIGIN=http://${SERVER_IP}:3000
+FRONTEND_URL=http://${SERVER_IP}:3000
+NODE_ENV=development
+TRUST_PROXY=loopback
+SYSNODE_DB_PATH=./data/sysnode.db
+SYSNODE_AUTH_PEPPER=${PEPPER}
+
+# Mailpit — stdout-free, inbox visible at :8025
+SMTP_HOST=127.0.0.1
+SMTP_PORT=1025
+SMTP_USER=
+SMTP_PASS=
+MAIL_FROM=no-reply@test.syscoin.dev
+MAIL_TRANSPORT=smtp
+
+# Syscoin Core RPC (cookie mode, preferred for same-host)
+SYSCOIN_RPC_HOST=127.0.0.1
+SYSCOIN_RPC_PORT=8370
+SYSCOIN_RPC_COOKIE_PATH=${COOKIE_PATH}
+SYSCOIN_RPC_LOG_LEVEL=error
+
+# Pay-with-Pali (mainnet)
+SYSCOIN_NETWORK=mainnet
+SYSCOIN_BLOCKBOOK_URL=https://blockbook.syscoin.org/
+EOF
+
+mkdir -p data
+```
+
+> **The backend does not load `.env` automatically.** It has no `dotenv` dependency. We load the file with Node's native `--env-file=` flag (Node 20.6+), which is why every invocation of `node` for this repo below passes `--env-file=.env`.
+
+> **Cookie file permissions.** If the backend user can't read `~/.syscoin/.cookie` (different uid than `syscoind`), add `rpccookieperms=group` to `~/.syscoin/syscoin.conf` and restart `syscoind`, then add the backend's user to the syscoin group. The backend's boot log prints the exact errno (`ENOENT` / `EACCES`) if it can't read the file.
+
+Quick sanity check — confirms `.env` is loaded and RPC cookie auth works against Core:
+
+```bash
+node --env-file=.env -e '
+  const { client, rpcServices } = require("./services/rpcClient");
+  rpcServices(client.callRpc).getBlockchainInfo().call()
+    .then(r => console.log(r.chain, r.blocks, "ibd=" + r.initialblockdownload))
+    .catch(e => { console.error(e.message); process.exit(1); });
+'
+# expected: "main <height> ibd=false"
+```
+
+### 5. Build and serve the frontend
+
+`REACT_APP_API_BASE` is a Create React App build-time variable — it must be set before `npm run build` or the bundle will keep pointing at the default.
+
+```bash
+cd ~/apps/sysnode-info
+npm ci
+SERVER_IP=$(hostname -I | awk '{print $1}')
+REACT_APP_API_BASE=http://${SERVER_IP}:3001 npm run build
+```
+
+### 6. Start both under pm2
+
+```bash
+cd ~/apps/sysnode-backend
+pm2 start "node --env-file=.env server.js" --name sysnode-backend
+
+cd ~/apps/sysnode-info
+pm2 start "serve -s build -l 3000" --name sysnode-info
+
+pm2 save
+pm2 list
+```
+
+Optional — survive a full reboot. Requires sudo; skip if you don't have it and just run `pm2 resurrect` after any reboot:
+
+```bash
+pm2 startup systemd -u $USER --hp $HOME   # prints one sudo line; paste it
+```
+
+### 7. Firewall (optional)
+
+If `ufw` isn't active on the host, your cloud security-group / network-layer rules are what matter — adjust those instead.
+
+```bash
+sudo ufw status
+# If active:
+sudo ufw allow 3000/tcp   # frontend
+sudo ufw allow 3001/tcp   # backend API
+sudo ufw allow 8025/tcp   # Mailpit UI
+# DO NOT open 1025 (SMTP) — keep it loopback-only
+```
+
+### 8. Smoke-test end to end
+
+```bash
+# Backend reachable + RPC cookie auth working (real stats from Core)
+curl -s http://<server-ip>:3001/mnstats | head -c 200
+
+# Mail pipeline. Open a shell on the server and run:
+cd ~/apps/sysnode-backend
+node --env-file=.env -e '
+  const { createMailer } = require("./lib/mailer");
+  createMailer({ transport: "smtp" }).sendVerification({
+    to: "smoketest@example.com",
+    link: process.env.BASE_URL + "/auth/verify?t=smoketest"
+  }).then(() => console.log("sent"));
+'
+# Then: curl -s http://<server-ip>:8025/api/v1/messages | head -c 400
+# You should see one message with subject "Verify your Syscoin Sysnode account".
+```
+
+Then exercise the UI:
+
+1. Open `http://<server-ip>:3000` — dashboard loads.
+2. Register a user in the UI → open `http://<server-ip>:8025`, click the verification link from the inbox.
+3. Go into the governance proposal wizard — the **Pay with Pali** button should be enabled (assuming your browser has Pali installed and the chain guard verified mainnet).
+
+## Updating the stack
+
+```bash
+pm2 stop sysnode-backend sysnode-info
+
+cd ~/apps/sysnode-backend
+git pull && npm ci
+
+cd ~/apps/sysnode-info
+git pull && npm ci
+REACT_APP_API_BASE=http://<server-ip>:3001 npm run build
+
+pm2 restart sysnode-backend sysnode-info
+```
+
+## Troubleshooting
+
+| Symptom | Likely cause | Check |
+| --- | --- | --- |
+| Backend exits at boot, `failed to read rpc cookie at ... ENOENT` | Wrong `SYSCOIN_RPC_COOKIE_PATH` | `sudo -u <syscoind-user> cat <path>` |
+| Backend exits at boot, `... EACCES` | Backend user can't read the cookie | Use `rpccookieperms=group` + `usermod -aG` |
+| Backend rejects RPC with 401 after a Core restart once, then recovers | Expected — cookie rotated, backend replayed with the new one | No action |
+| Pay with Pali button disabled | `paliChainGuard` reports `pali_path_chain_mismatch` or `pali_path_rpc_down` | `GET /gov/proposals/network` returns a `paliPathReason` |
+| Verification emails never arrive | `MAIL_TRANSPORT=smtp` but Mailpit isn't running | `systemctl status mailpit` |
+| Frontend hits `https://syscoin.dev` instead of the test backend | `REACT_APP_API_BASE` not set at build time | Rebuild with the env var inline |
+
+## License
+
+MIT
