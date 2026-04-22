@@ -38,7 +38,12 @@ const { _resetPepperForTests } = require('../lib/kdf');
 const SAMPLE_AUTH =
   'a4f8b3c1d9e7f2a5b1c6d8e4f7a9b2c5d1e8f4a7b3c9d5e1f6a2b8c4d7e3f5a9';
 
-function buildApp({ gObjectCheck = null, nowRef = null } = {}) {
+function buildApp({
+  gObjectCheck = null,
+  nowRef = null,
+  networkInfo = null,
+  buildCollateralPsbt = null,
+} = {}) {
   _resetPepperForTests();
   process.env.SYSNODE_AUTH_PEPPER = 'd'.repeat(64);
   process.env.NODE_ENV = 'test';
@@ -106,6 +111,8 @@ function buildApp({ gObjectCheck = null, nowRef = null } = {}) {
       rpc: gObjectCheck ? { gObjectCheck } : {},
       runAtomic,
       ...(nowRef ? { now: () => nowRef.value } : {}),
+      ...(networkInfo ? { networkInfo } : {}),
+      ...(buildCollateralPsbt ? { buildCollateralPsbt } : {}),
     })
   );
 
@@ -1618,6 +1625,321 @@ describe('submissions lifecycle', () => {
       .delete(`/gov/proposals/submissions/${prep.submission.id}`)
       .set('X-CSRF-Token', b.csrf);
     expect(del.status).toBe(404);
+  });
+});
+
+// -----------------------------------------------------------------------
+// GET /gov/proposals/network
+// -----------------------------------------------------------------------
+
+describe('GET /gov/proposals/network', () => {
+  test('reports paliPathEnabled=false when nothing is wired', async () => {
+    const ctx = buildApp();
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/proposals/network');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        chain: 'unknown',
+        slip44: null,
+        networkKey: null,
+        paliPathEnabled: false,
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('reports the configured network when both wired', async () => {
+    const ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt: async () => ({
+        psbt: { psbt: 'AA==', assets: '[]' },
+        feeSats: '1',
+      }),
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/proposals/network');
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        chain: 'main',
+        slip44: 57,
+        networkKey: 'mainnet',
+        paliPathEnabled: true,
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('reports paliPathEnabled=false when networkInfo is set but builder is not', async () => {
+    // Defensive branch: a deploy that configures SYSCOIN_NETWORK but
+    // forgets SYSCOIN_BLOCKBOOK_URL. The server still runs; /network
+    // tells the FE the path is disabled so the button stays hidden.
+    const ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/proposals/network');
+      expect(res.body.paliPathEnabled).toBe(false);
+      expect(res.body.networkKey).toBe('mainnet');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('401 without session', async () => {
+    const ctx = buildApp();
+    try {
+      const res = await request(ctx.app).get('/gov/proposals/network');
+      expect(res.status).toBe(401);
+    } finally {
+      ctx.db.close();
+    }
+  });
+});
+
+// -----------------------------------------------------------------------
+// POST /gov/proposals/submissions/:id/collateral/psbt
+// -----------------------------------------------------------------------
+
+describe('POST /gov/proposals/submissions/:id/collateral/psbt', () => {
+  let ctx;
+
+  beforeEach(() => {
+    ctx = null;
+  });
+
+  afterEach(() => {
+    if (ctx) ctx.db.close();
+  });
+
+  async function prepareOne(agent, csrf, overrides = {}) {
+    const res = await agent
+      .post('/gov/proposals/prepare')
+      .set('X-CSRF-Token', csrf)
+      .send(validProposalBody(overrides));
+    if (res.status !== 201) {
+      throw new Error(
+        `prepare failed: ${res.status} ${JSON.stringify(res.body)}`
+      );
+    }
+    return res.body;
+  }
+
+  const SAMPLE_XPUB =
+    'zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs';
+  const SAMPLE_CHANGE = 'sys1qw508d6qejxtdg4y5r3zarvary0c5xw7kygmkq9';
+
+  function withBuilder({ impl } = {}) {
+    return buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt:
+        impl ||
+        (async () => ({
+          psbt: { psbt: 'BASE64PSBT==', assets: '[]' },
+          feeSats: '2000',
+        })),
+    });
+  }
+
+  test('503 pali_path_disabled when builder unwired', async () => {
+    ctx = buildApp();
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('pali_path_disabled');
+  });
+
+  test('401 without session', async () => {
+    ctx = withBuilder();
+    const res = await request(ctx.app)
+      .post('/gov/proposals/submissions/1/collateral/psbt')
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(401);
+  });
+
+  test('403 csrf_missing', async () => {
+    ctx = withBuilder();
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('csrf_missing');
+  });
+
+  test('404 for non-existent submission id', async () => {
+    ctx = withBuilder();
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const res = await agent
+      .post('/gov/proposals/submissions/999999/collateral/psbt')
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(404);
+  });
+
+  test('404 when the submission belongs to another user', async () => {
+    ctx = withBuilder();
+    const a = await loggedInAgent(ctx, 'a@example.com');
+    const b = await loggedInAgent(ctx, 'b@example.com');
+    const prep = await prepareOne(a.agent, a.csrf);
+    const res = await b.agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', b.csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(404);
+  });
+
+  test('409 when submission is already awaiting_collateral', async () => {
+    ctx = withBuilder();
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const txid =
+      'a'.repeat(8) + 'b'.repeat(8) + 'c'.repeat(8) + 'd'.repeat(8) + 'e'.repeat(32);
+    // Move the row past `prepared` via the existing manual path.
+    await agent
+      .post(
+        `/gov/proposals/submissions/${prep.submission.id}/attach-collateral`
+      )
+      .set('X-CSRF-Token', csrf)
+      .send({ collateralTxid: txid });
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe('status_not_prepared');
+  });
+
+  test('400 when xpub missing', async () => {
+    ctx = withBuilder();
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('validation_failed');
+    expect(res.body.issues[0].field).toBe('xpub');
+  });
+
+  test('400 when changeAddress missing', async () => {
+    ctx = withBuilder();
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB });
+    expect(res.status).toBe(400);
+    expect(res.body.issues[0].field).toBe('changeAddress');
+  });
+
+  test('happy path returns PSBT envelope + echoed opReturnHex', async () => {
+    let captured;
+    ctx = withBuilder({
+      impl: async (args) => {
+        captured = args;
+        return {
+          psbt: { psbt: 'BASE64PSBT==', assets: '[]' },
+          feeSats: '2000',
+        };
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE, feeRate: 15 });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      psbt: { psbt: 'BASE64PSBT==', assets: '[]' },
+      feeSats: '2000',
+      opReturnHex: prep.opReturnHex,
+      collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
+      networkKey: 'mainnet',
+    });
+    // Builder received the exact args we forwarded, plus the server-
+    // recomputed opReturnHex.
+    expect(captured.xpub).toBe(SAMPLE_XPUB);
+    expect(captured.changeAddress).toBe(SAMPLE_CHANGE);
+    expect(captured.feeRate).toBe(15);
+    expect(captured.opReturnHex).toBe(prep.opReturnHex);
+  });
+
+  test('422 insufficient_funds is not a 500', async () => {
+    ctx = withBuilder({
+      impl: async () => {
+        const e = new Error('insufficient_funds');
+        e.code = 'insufficient_funds';
+        e.shortfallSats = '123';
+        throw e;
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({
+      error: 'insufficient_funds',
+      shortfallSats: '123',
+    });
+  });
+
+  test('400 network_mismatch maps to xpub validation issue', async () => {
+    ctx = withBuilder({
+      impl: async () => {
+        const e = new Error('network_mismatch');
+        e.code = 'network_mismatch';
+        e.detail = 'expected zpub... for mainnet';
+        throw e;
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(400);
+    expect(res.body.issues[0]).toEqual({
+      field: 'xpub',
+      code: 'network_mismatch',
+      message: 'expected zpub... for mainnet',
+    });
+  });
+
+  test('502 on blockbook_unreachable', async () => {
+    ctx = withBuilder({
+      impl: async () => {
+        const e = new Error('blockbook_unreachable');
+        e.code = 'blockbook_unreachable';
+        e.detail = 'ENOTFOUND';
+        throw e;
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(502);
+    expect(res.body.error).toBe('upstream_unreachable');
+    expect(res.body.detail).toBe('ENOTFOUND');
   });
 });
 

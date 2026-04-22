@@ -34,6 +34,10 @@ const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
 const { createProposalDispatcher } = require('./lib/proposalDispatcher');
 const { createProposalRpc } = require('./lib/proposalRpc');
+const {
+  buildCollateralPsbt,
+  createDefaultSyscoinClient,
+} = require('./lib/proposalPsbt');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -157,6 +161,69 @@ app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 // surface in integration.
 const proposalRpc = createProposalRpc(() => rpcServices(client.callRpc));
 
+// "Pay with Pali" wiring.
+//
+// Both `SYSCOIN_NETWORK` and `SYSCOIN_BLOCKBOOK_URL` must be set for
+// the /collateral/psbt route to function. We pre-wire the syscoinjs
+// client at boot so every request reuses one SyscoinJSLib instance
+// (it's stateless across requests — it only holds a Blockbook URL
+// and a bitcoinjs network object). When either env var is missing we
+// leave `paliPsbtBuilder` null; the gov-proposals router then
+// returns 503 from that route and reports `paliPathEnabled: false`
+// from GET /network, so the FE hides the button cleanly.
+const PALI_NETWORK_KEY = (() => {
+  const raw = String(process.env.SYSCOIN_NETWORK || '').trim().toLowerCase();
+  if (raw === 'mainnet') return 'mainnet';
+  if (raw === 'testnet') return 'testnet';
+  return null;
+})();
+const PALI_BLOCKBOOK_URL =
+  typeof process.env.SYSCOIN_BLOCKBOOK_URL === 'string'
+    ? process.env.SYSCOIN_BLOCKBOOK_URL.trim()
+    : '';
+
+let paliSyscoinClient = null;
+let paliPsbtBuilder = null;
+let paliNetworkInfo = null;
+if (PALI_NETWORK_KEY && PALI_BLOCKBOOK_URL) {
+  try {
+    paliSyscoinClient = createDefaultSyscoinClient({
+      blockbookURL: PALI_BLOCKBOOK_URL,
+      networkKey: PALI_NETWORK_KEY,
+    });
+    paliPsbtBuilder = paliSyscoinClient
+      ? (args) =>
+          buildCollateralPsbt({ ...args, syscoinClient: paliSyscoinClient })
+      : null;
+    paliNetworkInfo = {
+      // `chain` mirrors the string Core returns from getblockchaininfo
+      // so /network readers can compare against a value they've seen
+      // elsewhere. slip44 is the BIP-44 coin type (57 for mainnet SYS,
+      // 1 for any testnet per BIP-44), which Pali's chainId response
+      // can be cross-checked against.
+      chain: PALI_NETWORK_KEY === 'mainnet' ? 'main' : 'test',
+      slip44: PALI_NETWORK_KEY === 'mainnet' ? 57 : 1,
+      networkKey: PALI_NETWORK_KEY,
+    };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[pali] failed to wire Pali PSBT builder; path stays disabled',
+      err && err.message
+    );
+    paliSyscoinClient = null;
+    paliPsbtBuilder = null;
+    paliNetworkInfo = null;
+  }
+} else if (PALI_NETWORK_KEY || PALI_BLOCKBOOK_URL) {
+  // Half-configured: loud warning so the operator notices on boot.
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[pali] SYSCOIN_NETWORK and SYSCOIN_BLOCKBOOK_URL must both be set;' +
+      ' Pali collateral path disabled until both are present.'
+  );
+}
+
 mountAuthAndVault(app, {
   services,
   mailer,
@@ -184,6 +251,8 @@ mountAuthAndVault(app, {
   invalidateCurrentVotes: (proposalHash) =>
     currentVotesCache.invalidate(proposalHash),
   proposalRpc,
+  governanceNetworkInfo: paliNetworkInfo,
+  buildCollateralPsbt: paliPsbtBuilder,
 });
 
 // -----------------------------------------------------------------------------
