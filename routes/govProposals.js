@@ -878,7 +878,30 @@ function createGovProposalsRouter({
         .status(409)
         .json({ error: 'conflict', reason: 'status_not_deletable' });
     }
-    submissions.remove(id, userId);
+    // Codex PR8 round 7 P2: `submissions.remove` only deletes rows
+    // still in `prepared` or `failed` (see the partial DELETE in
+    // proposalSubmissions.js). A concurrent transition between our
+    // pre-read above and this line — e.g. a sibling request flips
+    // the row to `awaiting_collateral` via attach-collateral — is
+    // perfectly possible in a multi-worker deployment, and leaves
+    // `changes === 0`. Silently returning 204 in that case is a
+    // false-success: the submission is still alive and may run to
+    // completion on-chain even though the API told the client it
+    // was deleted. Check the row count and translate a miss into a
+    // 409 so the client can re-read the state and react.
+    const removed = submissions.remove(id, userId);
+    if (Number(removed) === 0) {
+      // Re-read to produce the most actionable reason. If the row
+      // is gone, another tab/device already deleted it — 404 is
+      // correct. If it still exists, its status moved out of the
+      // deletable set — 409 with `status_not_deletable` mirrors the
+      // pre-read branch above.
+      const again = submissions.getByIdForUser(id, userId);
+      if (!again) return res.status(404).json({ error: 'not_found' });
+      return res
+        .status(409)
+        .json({ error: 'conflict', reason: 'status_not_deletable' });
+    }
     return res.status(204).end();
   });
 

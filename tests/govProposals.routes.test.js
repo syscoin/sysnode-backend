@@ -1142,6 +1142,95 @@ describe('submissions lifecycle', () => {
     expect(del.body.reason).toBe('status_not_deletable');
   });
 
+  test(
+    'delete returns 409 when a concurrent transition racesthe row out of the deletable set (Codex round 7 P2)',
+    async () => {
+      // Scenario: the DELETE handler pre-reads the row, sees
+      // `prepared`, passes the status gate, then calls
+      // submissions.remove(). In a multi-worker deployment, a
+      // sibling request (attach-collateral from another tab, or a
+      // dispatcher pickup) can flip the status to
+      // `awaiting_collateral` between that pre-read and the DELETE
+      // statement. The repo's partial DELETE is guarded
+      // (`status IN ('prepared','failed')`) so it returns 0 changes
+      // — but the handler used to blindly return 204 anyway, which
+      // tells the client the submission is gone while it is in fact
+      // still alive and can run to completion on-chain.
+      //
+      // Fix (R7 P2): route checks `changes` and, when zero, re-reads
+      // to pick the right failure code — 409 status_not_deletable
+      // (raced to a non-deletable state) or 404 (raced to
+      // `deleted`, which today can only happen from another tab).
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const prep = await prepareOne(agent, csrf);
+      const id = prep.submission.id;
+
+      // Monkey-patch the submissions repo so `remove()` returns 0
+      // and the partial DELETE actually didn't fire (we simulate a
+      // concurrent transition to awaiting_collateral by flipping
+      // the row directly via attachCollateral just before remove).
+      const origRemove = ctx.submissions.remove;
+      ctx.submissions.remove = (rowId, userId) => {
+        // Simulate the concurrent transition — this is what
+        // another worker would have done between the pre-read and
+        // our DELETE.
+        ctx.submissions.attachCollateral(rowId, userId, 'a'.repeat(64));
+        return origRemove(rowId, userId);
+      };
+
+      try {
+        const del = await agent
+          .delete(`/gov/proposals/submissions/${id}`)
+          .set('X-CSRF-Token', csrf);
+        expect(del.status).toBe(409);
+        expect(del.body.reason).toBe('status_not_deletable');
+      } finally {
+        ctx.submissions.remove = origRemove;
+      }
+
+      // Row still exists, in its raced-to status.
+      const stillThere = await agent.get(
+        `/gov/proposals/submissions/${id}`
+      );
+      expect(stillThere.status).toBe(200);
+      expect(stillThere.body.submission.status).toBe('awaiting_collateral');
+    }
+  );
+
+  test(
+    'delete returns 404 when the row was deleted concurrently (Codex round 7 P2)',
+    async () => {
+      // Same class of race as the previous test, but the concurrent
+      // worker deletes the row outright (another tab DELETE'd it).
+      // The repo's pre-read hit it, but by the time we call remove
+      // the row is gone — 0 changes and re-read returns null. The
+      // handler must surface that as 404 so the UI doesn't pretend
+      // it just deleted something it didn't.
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const prep = await prepareOne(agent, csrf);
+      const id = prep.submission.id;
+
+      const origRemove = ctx.submissions.remove;
+      ctx.submissions.remove = (rowId, userId) => {
+        // Concurrent deletion by another tab
+        origRemove(rowId, userId);
+        // Report 0 changes for *our* call, as if a raced sibling
+        // already consumed the row.
+        return 0;
+      };
+
+      try {
+        const del = await agent
+          .delete(`/gov/proposals/submissions/${id}`)
+          .set('X-CSRF-Token', csrf);
+        expect(del.status).toBe(404);
+        expect(del.body.error).toBe('not_found');
+      } finally {
+        ctx.submissions.remove = origRemove;
+      }
+    }
+  );
+
   test('delete 404 when row belongs to another user', async () => {
     const a = await loggedInAgent(ctx, 'a@example.com');
     const b = await loggedInAgent(ctx, 'b@example.com');
