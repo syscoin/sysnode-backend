@@ -824,10 +824,30 @@ function createGovProposalsRouter({
           err.code === 'SQLITE_CONSTRAINT')) ||
         /UNIQUE constraint failed/i.test(msg);
       if (constraintHit) {
-        const winner = submissions.findPreparedByDataHexForUser(
-          userId,
-          canon.dataHex
-        );
+        // better-sqlite3 is synchronous and can throw (SQLITE_BUSY,
+        // I/O, corrupt index, temp-write-failed) from this read.
+        // Without a local try/catch the throw escapes into the
+        // async Express 4 handler as an unhandled rejection —
+        // Express 4 does not catch async handler errors, so in
+        // prod that becomes a process-level UnhandledPromise-
+        // Rejection warning and a client-visible hang/default
+        // 500 HTML page instead of our structured JSON 500.
+        // Swallow here and surface the same `internal` code the
+        // rest of this handler uses for DB failures.
+        let winner;
+        try {
+          winner = submissions.findPreparedByDataHexForUser(
+            userId,
+            canon.dataHex
+          );
+        } catch (lookupErr) {
+          // eslint-disable-next-line no-console
+          console.error(
+            '[POST /gov/proposals/prepare] winner lookup after unique-race failed',
+            lookupErr
+          );
+          return res.status(500).json({ error: 'internal' });
+        }
         if (winner) {
           let winnerOpReturnHex;
           try {

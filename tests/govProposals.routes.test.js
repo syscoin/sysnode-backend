@@ -650,6 +650,59 @@ describe('POST /gov/proposals/prepare', () => {
   );
 
   test(
+    'prepare race fallback: DB throw on winner re-read returns JSON 500, not unhandled rejection (Codex round 12 P2)',
+    async () => {
+      // Regression: the unique-constraint recovery path re-reads
+      // the winning row via findPreparedByDataHexForUser. That call
+      // is synchronous better-sqlite3 and can throw (SQLITE_BUSY,
+      // I/O, corrupt index) — without a local try/catch the throw
+      // escaped as an unhandled rejection in the async Express 4
+      // handler, reintroducing exactly the async-error gap the
+      // surrounding code was designed to avoid. Fix: wrap the
+      // re-read in try/catch and return the structured
+      // `{ error: 'internal' }` JSON 500 the rest of the handler
+      // already uses for DB failures.
+      ctx = buildApp();
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const body = validProposalBody();
+
+      // Prime a prepared row so the UNIQUE index will reject the
+      // second insert and push us into the recovery branch.
+      const r1 = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(body);
+      expect(r1.status).toBe(201);
+
+      // Make the pre-read miss (drives the second /prepare into
+      // the INSERT → UNIQUE-race branch) AND make the winner
+      // re-read throw a synthetic SQLITE_BUSY.
+      const realFind = ctx.submissions.findPreparedByDataHexForUser;
+      let calls = 0;
+      ctx.submissions.findPreparedByDataHexForUser = () => {
+        calls += 1;
+        if (calls === 1) return null; // pre-read miss
+        // The recovery-path re-read — this is the call round-12
+        // P2 protects. Throw synchronously as better-sqlite3
+        // would under SQLITE_BUSY.
+        const e = new Error('database is locked');
+        e.code = 'SQLITE_BUSY';
+        throw e;
+      };
+
+      const r2 = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(body);
+
+      ctx.submissions.findPreparedByDataHexForUser = realFind;
+
+      expect(r2.status).toBe(500);
+      expect(r2.body).toEqual({ error: 'internal' });
+    }
+  );
+
+  test(
     'idempotent replay re-runs gObjectCheck preflight; Core-reject after a soft-failed first attempt returns 422 (Codex round 5 P1)',
     async () => {
       // Scenario: the *first* /prepare call lands during a transient
