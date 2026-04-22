@@ -1,6 +1,21 @@
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const { normalizeEmail } = require('../lib/email');
+const securityLog = require('../lib/securityLog');
+
+// Emit a structured security event every time a limiter trips so
+// operators can grep `rate_limit.tripped` to correlate bursts with
+// IPs / users. `bucket` identifies WHICH limiter fired (login,
+// register, verify-email, vote) without depending on the freeform
+// req path. We intentionally do NOT log the full key (it contains
+// email for login bucket) — the reqContext already captures
+// ip/userId which is the forensic minimum.
+function trippedHandler(bucket) {
+  return (req, res, _next, options) => {
+    securityLog.warn('rate_limit.tripped', { req, bucket });
+    res.status(options.statusCode).json(options.message);
+  };
+}
 
 // Per-route limiters for authentication endpoints.
 // In-memory store is fine for single-process; switch to a shared store (Redis
@@ -32,6 +47,21 @@ function registerKey(req) {
   return `register|${ipBucket(req)}`;
 }
 
+// /auth/verify-email is unauthenticated and consumes a 64-hex one-shot
+// token against a pending_registrations row. Brute-forcing the token
+// space is computationally infeasible (2^256) AND every attempt burns
+// a `runAtomic` + two repo reads, so the real risk here is DoS from a
+// flood of invalid-token requests, not credential attack. We bucket
+// by the /56-masked IP (same as register) and set a generous cap:
+// legitimate users click the link once; even slow SMTP + retry looks
+// like a few requests per hour from any single network. A hundred
+// per 15 minutes still trips WAY before a floor of "flood the
+// transaction log" abuse becomes a problem. Separate key prefix so
+// a register flood does NOT eat into a legit user's verify budget.
+function verifyEmailKey(req) {
+  return `verify-email|${ipBucket(req)}`;
+}
+
 // Per-user bucket for /gov/vote. IP alone is wrong here: a shared-IP
 // office can legitimately vote from many accounts in one hour, and a
 // user on a mobile IPv6 prefix can churn through addresses faster
@@ -55,6 +85,7 @@ function loginLimiter() {
     legacyHeaders: false,
     keyGenerator: loginKey,
     message: { error: 'too_many_attempts' },
+    handler: trippedHandler('login'),
   });
 }
 
@@ -66,6 +97,24 @@ function registerLimiter() {
     legacyHeaders: false,
     keyGenerator: registerKey,
     message: { error: 'too_many_registrations' },
+    handler: trippedHandler('register'),
+  });
+}
+
+// 100 attempts / 15 min / IP. See `verifyEmailKey` above for the
+// rationale: this is a DoS bound, not a credential-attack bound.
+// Using the same message code as the /login limiter so the SPA can
+// surface a generic "too many attempts" without leaking which
+// endpoint tripped.
+function verifyEmailLimiter() {
+  return rateLimit({
+    windowMs: 15 * MINUTE,
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: verifyEmailKey,
+    message: { error: 'too_many_attempts' },
+    handler: trippedHandler('verify-email'),
   });
 }
 
@@ -82,6 +131,7 @@ function voteLimiter() {
     legacyHeaders: false,
     keyGenerator: voteKey,
     message: { error: 'too_many_vote_requests' },
+    handler: trippedHandler('vote'),
   });
 }
 
@@ -92,10 +142,12 @@ function disabled() {
 module.exports = {
   loginLimiter,
   registerLimiter,
+  verifyEmailLimiter,
   voteLimiter,
   disabled,
   // Exported for direct unit testing.
   loginKey,
   registerKey,
+  verifyEmailKey,
   voteKey,
 };

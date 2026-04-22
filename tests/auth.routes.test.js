@@ -1224,6 +1224,49 @@ describe('auth routes', () => {
   });
 });
 
+describe('/auth/verify-email DoS bound (rate limiter)', () => {
+  // F1 mini-audit: brute-forcing a 256-bit one-shot token is infeasible,
+  // but an unauthenticated flood of invalid-token POSTs still consumes a
+  // runAtomic + two repo reads per request. We cap at
+  // verifyEmailLimiter defaults (100/15min/IP). This test asserts the
+  // cap is actually wired — bypassing it would leave the route open to
+  // trivial DoS.
+  //
+  // Note the default max is 100, so we need to fire 101 requests to
+  // observe the 429. We parallelise with Promise.all because sequential
+  // supertest round-trips over 101 calls is multi-second; concurrent
+  // issues share the same in-memory limiter bucket and one of them
+  // will be the trip wire. We also build a dedicated app with
+  // `disableRateLimit: false` because the shared helper disables
+  // limiters by default.
+  let ctx;
+  beforeEach(() => {
+    ctx = buildTestApp({ disableRateLimit: false });
+  });
+  afterEach(() => {
+    ctx.db.close();
+  });
+
+  test('returns 429 too_many_attempts once the per-IP cap is exceeded', async () => {
+    const fakeToken = 'f'.repeat(64); // shape-valid but never issued
+    const total = 105;
+    const results = await Promise.all(
+      Array.from({ length: total }, () =>
+        request(ctx.app).post('/auth/verify-email').send({ token: fakeToken })
+      )
+    );
+    const statuses = results.map((r) => r.status);
+    const rateLimited = statuses.filter((s) => s === 429);
+    // The limiter allows at most 100 through in a 15-min window, so at
+    // least (total - 100) must be 429. We don't assert exactly 5
+    // because any concurrent-ordering slop in supertest can count
+    // requests in flight against the bucket.
+    expect(rateLimited.length).toBeGreaterThanOrEqual(total - 100);
+    const tripped = results.find((r) => r.status === 429);
+    expect(tripped.body).toEqual({ error: 'too_many_attempts' });
+  }, 15_000);
+});
+
 describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
   // Pure-input contract tests. /auth/change-password uses BOTH
   // vaults.get (to enforce vault_rewrap_required inside the atomic
@@ -1249,7 +1292,7 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
       },
       sessionMw: { requireAuth: mw, parse: mw, setSessionCookie: noop, clearSessionCookie: noop },
       csrfMw: { require: mw, parse: mw, issueCookie: noop, clearCookie: noop },
-      limiters: { login: mw, register: mw, vote: mw },
+      limiters: { login: mw, register: mw, verifyEmail: mw, vote: mw },
       baseUrl: 'http://api.test',
       frontendUrl: 'http://app.test',
       scheduler: (fn) => fn(),

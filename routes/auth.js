@@ -1,6 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
 const { normalizeEmail, isValidEmailSyntax } = require('../lib/email');
+const securityLog = require('../lib/securityLog');
 
 // Shape of client-provided data. authHash is the 32-byte HKDF output in hex
 // produced by the client from PBKDF2-SHA512(password, email, 600k). The server
@@ -225,8 +226,7 @@ function createAuthRouter({
       if (err.code === 'invalid_email') {
         return badRequest(res, 'invalid_email');
       }
-      // eslint-disable-next-line no-console
-      console.error('[auth/register] pending-issue failed', err);
+      securityLog.error('auth.register_pending_issue_failed', { req, error: err });
       return res.status(500).json({ error: 'internal' });
     }
 
@@ -261,7 +261,7 @@ function createAuthRouter({
   // email (another pending for the same email verified first), we surface
   // 409 and purge remaining pendings so attacker-spawned tokens die.
   // -------------------------------------------------------------------------
-  router.post('/verify-email', asyncHandler(async (req, res) => {
+  router.post('/verify-email', limiters.verifyEmail, asyncHandler(async (req, res) => {
     const parsed = VerifySchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_token');
 
@@ -348,8 +348,10 @@ function createAuthRouter({
         return res.json({ status: 'verified' });
       default:
         // Should be unreachable; defensive 500.
-        // eslint-disable-next-line no-console
-        console.error('[auth/verify-email] unknown outcome', outcome);
+        securityLog.error('auth.verify_email_unknown_outcome', {
+          req,
+          outcomeKind: outcome && outcome.kind,
+        });
         return res.status(500).json({ error: 'internal' });
     }
   }));
@@ -369,8 +371,7 @@ function createAuthRouter({
       // fire loudly instead of masquerading as a bad password. (Codex
       // round-7 P1.)
       if (err && err.code === 'kdf_config') {
-        // eslint-disable-next-line no-console
-        console.error('[auth/login] kdf config error', err.message);
+        securityLog.error('auth.login_kdf_config', { req, error: err });
         return res.status(503).json({ error: 'server_misconfigured' });
       }
       // Any other failure in verifyAuth (transient DB, etc.) is not a
@@ -379,9 +380,25 @@ function createAuthRouter({
       throw err;
     }
     if (!user) {
+      // F5: failed-login events feed brute-force / credential-stuffing
+      // detection. We include the normalized email because operators
+      // need it to correlate attempts across IPs; the 401 response
+      // remains identical regardless of whether the email exists so
+      // there is no new enumeration channel. authHash is NEVER
+      // logged (securityLog auto-redacts known-sensitive keys).
+      securityLog.warn('auth.login_failed', {
+        req,
+        email: parsed.data.email,
+        reason: 'invalid_credentials',
+      });
       return res.status(401).json({ error: 'invalid_credentials' });
     }
     if (!user.emailVerified) {
+      securityLog.warn('auth.login_failed', {
+        req,
+        email: parsed.data.email,
+        reason: 'email_not_verified',
+      });
       return res.status(403).json({ error: 'email_not_verified' });
     }
     // sessions.issue / setSessionCookie / issueCookie may also throw on
@@ -429,8 +446,7 @@ function createAuthRouter({
     } catch (err) {
       // Log-and-continue — response is still 200 because from the
       // client's point of view logout succeeded (cookies are gone).
-      // eslint-disable-next-line no-console
-      console.error('[auth/logout] sessions.revoke failed', err && err.message);
+      securityLog.error('auth.logout_revoke_failed', { req, error: err });
     } finally {
       sessionMw.clearSessionCookie(res);
       csrfMw.clearCookie(res);
@@ -535,8 +551,7 @@ function createAuthRouter({
         );
       } catch (err) {
         if (err && err.code === 'kdf_config') {
-          // eslint-disable-next-line no-console
-          console.error('[auth/change-password] kdf config error', err.message);
+          securityLog.error('auth.change_password_kdf_config', { req, error: err });
           return res.status(503).json({ error: 'server_misconfigured' });
         }
         // Non-config failures bubble through asyncHandler → error mw.
@@ -544,6 +559,10 @@ function createAuthRouter({
         throw err;
       }
       if (!confirmed) {
+        // Authenticated endpoint: sustained 401s on /change-password
+        // for the same userId may signal an attacker who has hijacked
+        // a session cookie but does not know the password.
+        securityLog.warn('auth.change_password_invalid_old_password', { req });
         return res.status(401).json({ error: 'invalid_credentials' });
       }
 
@@ -559,10 +578,7 @@ function createAuthRouter({
         parsed.data.vault &&
         !(vaults && typeof vaults.put === 'function')
       ) {
-        // eslint-disable-next-line no-console
-        console.error(
-          '[auth/change-password] vault repo unavailable but client sent vault body'
-        );
+        securityLog.error('auth.change_password_vault_repo_unavailable', { req });
         return res.status(503).json({ error: 'server_misconfigured' });
       }
 
@@ -742,16 +758,13 @@ function createAuthRouter({
         confirmed = users.verifyAuth(req.user.email, parsed.data.oldAuthHash);
       } catch (err) {
         if (err && err.code === 'kdf_config') {
-          // eslint-disable-next-line no-console
-          console.error(
-            '[auth/delete-account] kdf config error',
-            err.message
-          );
+          securityLog.error('auth.delete_account_kdf_config', { req, error: err });
           return res.status(503).json({ error: 'server_misconfigured' });
         }
         throw err;
       }
       if (!confirmed) {
+        securityLog.warn('auth.delete_account_invalid_password', { req });
         return res.status(401).json({ error: 'invalid_credentials' });
       }
 

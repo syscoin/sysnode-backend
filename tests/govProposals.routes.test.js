@@ -86,6 +86,7 @@ function buildApp({ gObjectCheck = null, nowRef = null } = {}) {
       limiters: {
         login: rateLimiters.disabled(),
         register: rateLimiters.disabled(),
+        verifyEmail: rateLimiters.disabled(),
         vote: rateLimiters.disabled(),
       },
       baseUrl: 'http://api.test.local',
@@ -560,6 +561,7 @@ describe('drafts CRUD', () => {
         limiters: {
           login: rateLimiters.disabled(),
           register: rateLimiters.disabled(),
+          verifyEmail: rateLimiters.disabled(),
           vote: rateLimiters.disabled(),
         },
         baseUrl: 'http://api.test.local',
