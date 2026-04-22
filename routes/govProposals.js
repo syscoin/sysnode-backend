@@ -406,6 +406,37 @@ function createGovProposalsRouter({
   now = () => Date.now(),
   maxDraftsPerUser = DEFAULT_MAX_DRAFTS_PER_USER,
   maxPaymentCount = DEFAULT_MAX_PAYMENT_COUNT,
+  // Optional: info about the chain this backend is pinned to. Used by
+  // GET /network and as the authoritative `networkKey` for PSBT builds.
+  // When null, we treat the chain as unknown and skip network probes.
+  // Shape: { chain: 'main'|'test'|'regtest', slip44: number,
+  //          networkKey: 'mainnet'|'testnet' }.
+  networkInfo = null,
+  // Optional: collateral-PSBT builder. Injected by appFactory when
+  // SYSCOIN_BLOCKBOOK_URL is set. A typed function:
+  //   async ({ opReturnHex, xpub, changeAddress, feeRate }) ->
+  //     { psbt, feeSats }
+  // When null, POST /submissions/:id/collateral/psbt returns 503 and
+  // GET /network reports paliPathEnabled=false so the FE can keep
+  // the "Pay with Pali" button hidden.
+  buildCollateralPsbt = null,
+  // Optional: chain-verification guard that cross-checks the
+  // operator-declared network (SYSCOIN_NETWORK) against the actual
+  // chain behind the RPC node. Until the guard reports `isReady()`
+  // we refuse the Pali path — otherwise a misconfigured deploy
+  // could let users burn 150 SYS on chain A while the dispatcher
+  // watches chain B. Interface:
+  //   { isReady(): boolean, reason(): string|null }
+  // `reason()` returns one of:
+  //   'pali_not_configured'       — no SYSCOIN_NETWORK declared
+  //   'pali_path_rpc_down'        — RPC unreachable; retrying
+  //   'pali_path_chain_mismatch'  — env vs RPC chain disagree
+  //                                 (terminal; operator must restart)
+  //   null                        — verified (isReady() === true)
+  // When this prop is null, the router falls back to the bare
+  // buildCollateralPsbt truthiness check (used by tests and any
+  // single-network dev boot where the cross-check is overkill).
+  paliChainGuard = null,
 } = {}) {
   if (!drafts || typeof drafts.create !== 'function') {
     throw new Error('createGovProposalsRouter: drafts repo is required');
@@ -1031,6 +1062,249 @@ function createGovProposalsRouter({
     const row = submissions.getByIdForUser(id, userId);
     if (!row) return res.status(404).json({ error: 'not_found' });
     return res.json({ submission: jsonSubmission(row) });
+  });
+
+  // -----------------------------------------------------------------
+  // GET /gov/proposals/network
+  //
+  // Surfaces the chain this backend is pinned to so the frontend can
+  // gate the "Pay with Pali" button on a chain match (and pick the
+  // right copy — "Switch Pali to Syscoin mainnet", etc.). Purely
+  // informational; never mutates state. Requires auth because it
+  // rides the same router chain as the rest of /gov/proposals, which
+  // is fine — callers that need it are authenticated by construction
+  // (you have to be logged in to be in the proposal wizard).
+  //
+  // Output: 200 {
+  //   chain: 'main' | 'test' | 'regtest' | 'unknown',
+  //   slip44: 57 | 1 | null,
+  //   networkKey: 'mainnet' | 'testnet' | null,
+  //   paliPathEnabled: boolean        // true iff the PSBT builder is
+  //                                     wired (= SYSCOIN_BLOCKBOOK_URL
+  //                                     is set AND networkInfo is
+  //                                     known)
+  // }
+  // -----------------------------------------------------------------
+  router.get('/network', (req, res) => {
+    const info = networkInfo || {};
+    const builderWired =
+      typeof buildCollateralPsbt === 'function' &&
+      (info.networkKey === 'mainnet' || info.networkKey === 'testnet');
+    // If a guard is injected, it has the final say. No guard ==
+    // legacy/dev path: trust the builder wiring alone.
+    const guardReady = paliChainGuard
+      ? typeof paliChainGuard.isReady === 'function' &&
+        paliChainGuard.isReady()
+      : true;
+    const paliPathEnabled = builderWired && guardReady;
+    const reason =
+      !paliPathEnabled && paliChainGuard &&
+      typeof paliChainGuard.reason === 'function'
+        ? paliChainGuard.reason()
+        : null;
+    return res.json({
+      chain: info.chain || 'unknown',
+      slip44: Number.isInteger(info.slip44) ? info.slip44 : null,
+      networkKey: info.networkKey || null,
+      paliPathEnabled,
+      // Surfaced so the FE can pick the right hint ("verifying RPC
+      // chain…" vs "operator misconfigured, contact admin"). Absent
+      // when the path is enabled.
+      ...(reason ? { paliPathReason: reason } : {}),
+    });
+  });
+
+  // -----------------------------------------------------------------
+  // POST /gov/proposals/submissions/:id/collateral/psbt
+  //
+  // Build an UNSIGNED collateral PSBT for Pali to sign. Only callable
+  // while the submission is still in `prepared` state; once the user
+  // has attached a txid, the dispatcher owns the row and rebuilding
+  // a PSBT would produce a second collateral tx that Core would
+  // reject as a duplicate. Guards here mirror /attach-collateral so
+  // the two paths can't race.
+  //
+  // Input:
+  //   {
+  //     xpub: string,           // Syscoin zpub (mainnet) or vpub (testnet)
+  //     changeAddress: string,  // valid address on the same network
+  //     feeRate?: number        // sat/vByte, default 10, clamped 1..1000
+  //   }
+  //
+  // Output:
+  //   200 { psbt: { psbt: '<base64>', assets: '[]' },
+  //         feeSats: '<integer>',
+  //         opReturnHex,              // echo for FE sanity-check
+  //         collateralFeeSats: '15000000000',
+  //         networkKey: 'mainnet' | 'testnet' }
+  //
+  // Errors:
+  //   401 unauthorized              (sessionMw)
+  //   403 csrf_missing / csrf_invalid
+  //   404 not_found                 (unknown / other user's submission)
+  //   409 conflict: status_not_prepared
+  //   400 validation_failed         (bad_xpub, bad_change_address, bad_fee_rate,
+  //                                  network_mismatch, bad_op_return)
+  //   422 unprocessable             (insufficient_funds)
+  //   503 pali_path_disabled        (no SYSCOIN_BLOCKBOOK_URL configured)
+  //   502 upstream_unreachable      (Blockbook unreachable)
+  //
+  // The `insufficient_funds` -> 422 split (rather than 400) reflects
+  // that the request shape was fine; the user's wallet just didn't
+  // have 150+ SYS. The FE distinguishes on the status code so its
+  // error copy can be specific.
+  // -----------------------------------------------------------------
+  router.post('/submissions/:id/collateral/psbt', async (req, res) => {
+    if (typeof buildCollateralPsbt !== 'function') {
+      return res
+        .status(503)
+        .json({ error: 'pali_path_disabled' });
+    }
+    // Guard check BEFORE any state reads. When the guard is injected
+    // and not ready, we refuse regardless of builder wiring — the
+    // builder could succeed against the wrong chain and burn funds
+    // that the dispatcher will never find.
+    if (
+      paliChainGuard &&
+      typeof paliChainGuard.isReady === 'function' &&
+      !paliChainGuard.isReady()
+    ) {
+      const reason =
+        typeof paliChainGuard.reason === 'function'
+          ? paliChainGuard.reason() || 'pali_path_disabled'
+          : 'pali_path_disabled';
+      return res.status(503).json({ error: reason });
+    }
+
+    const userId = req.user.id;
+    const id = parseIntId(req.params.id);
+    if (!id) return res.status(404).json({ error: 'not_found' });
+
+    const row = submissions.getByIdForUser(id, userId);
+    if (!row) return res.status(404).json({ error: 'not_found' });
+    if (row.status !== 'prepared') {
+      return res
+        .status(409)
+        .json({ error: 'conflict', reason: 'status_not_prepared' });
+    }
+
+    const body = req.body || {};
+    const xpub = typeof body.xpub === 'string' ? body.xpub.trim() : '';
+    const changeAddress =
+      typeof body.changeAddress === 'string' ? body.changeAddress.trim() : '';
+    const feeRate = body.feeRate;
+
+    if (!xpub) {
+      return res.status(400).json({
+        error: 'validation_failed',
+        issues: [
+          { field: 'xpub', code: 'required', message: 'xpub is required.' },
+        ],
+      });
+    }
+    if (!changeAddress) {
+      return res.status(400).json({
+        error: 'validation_failed',
+        issues: [
+          {
+            field: 'changeAddress',
+            code: 'required',
+            message: 'changeAddress is required.',
+          },
+        ],
+      });
+    }
+
+    // Recompute opReturnHex from the stored row so we're building
+    // against the exact bytes Core will check. Mirrors the idempotent
+    // replay at the top of /prepare (line ~819) rather than trusting
+    // any FE-supplied hash.
+    let opReturnHex;
+    try {
+      opReturnHex = computeProposalHash({
+        parentHash: row.parentHash,
+        revision: row.revision,
+        time: row.timeUnix,
+        dataHex: row.dataHex,
+      }).opReturnBytes.toString('hex');
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[POST /gov/proposals/submissions/:id/collateral/psbt] rehash',
+        err
+      );
+      return res.status(500).json({ error: 'internal' });
+    }
+
+    let built;
+    try {
+      built = await buildCollateralPsbt({
+        opReturnHex,
+        xpub,
+        changeAddress,
+        feeRate,
+      });
+    } catch (err) {
+      const code = err && err.code;
+      if (
+        code === 'bad_xpub' ||
+        code === 'bad_change_address' ||
+        code === 'bad_fee_rate' ||
+        code === 'bad_op_return' ||
+        code === 'network_mismatch'
+      ) {
+        // `network_mismatch` can come from either xpub-prefix or
+        // change-address HRP validation — the thrower tags the
+        // failing input via `err.field` so we highlight the right
+        // form control downstream. Other codes have a single
+        // unambiguous origin field.
+        let field;
+        if (code === 'bad_xpub') field = 'xpub';
+        else if (code === 'bad_change_address') field = 'changeAddress';
+        else if (code === 'bad_fee_rate') field = 'feeRate';
+        else if (code === 'bad_op_return') field = 'opReturnHex';
+        else if (code === 'network_mismatch') {
+          field = err && (err.field === 'xpub' || err.field === 'changeAddress')
+            ? err.field
+            : 'xpub';
+        }
+        return res.status(400).json({
+          error: 'validation_failed',
+          issues: [
+            {
+              field,
+              code,
+              message: (err && err.detail) || err.message || code,
+            },
+          ],
+        });
+      }
+      if (code === 'insufficient_funds') {
+        return res.status(422).json({
+          error: 'insufficient_funds',
+          shortfallSats: err.shortfallSats || null,
+        });
+      }
+      if (code === 'blockbook_unreachable') {
+        return res
+          .status(502)
+          .json({ error: 'upstream_unreachable', detail: err.detail });
+      }
+      // eslint-disable-next-line no-console
+      console.error(
+        '[POST /gov/proposals/submissions/:id/collateral/psbt] build',
+        err
+      );
+      return res.status(500).json({ error: 'internal' });
+    }
+
+    return res.status(200).json({
+      psbt: built.psbt,
+      feeSats: built.feeSats,
+      opReturnHex,
+      collateralFeeSats: COLLATERAL_FEE_SATS.toString(),
+      networkKey: (networkInfo && networkInfo.networkKey) || null,
+    });
   });
 
   // POST /gov/proposals/submissions/:id/attach-collateral

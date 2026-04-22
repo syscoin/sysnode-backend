@@ -34,6 +34,11 @@ const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
 const { createProposalDispatcher } = require('./lib/proposalDispatcher');
 const { createProposalRpc } = require('./lib/proposalRpc');
+const {
+  buildCollateralPsbt,
+  createDefaultSyscoinClient,
+} = require('./lib/proposalPsbt');
+const { createPaliChainGuard } = require('./lib/paliChainGuard');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -157,6 +162,113 @@ app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 // surface in integration.
 const proposalRpc = createProposalRpc(() => rpcServices(client.callRpc));
 
+// "Pay with Pali" wiring.
+//
+// Both `SYSCOIN_NETWORK` and `SYSCOIN_BLOCKBOOK_URL` must be set for
+// the /collateral/psbt route to function. We pre-wire the syscoinjs
+// client at boot so every request reuses one SyscoinJSLib instance
+// (it's stateless across requests — it only holds a Blockbook URL
+// and a bitcoinjs network object). When either env var is missing we
+// leave `paliPsbtBuilder` null; the gov-proposals router then
+// returns 503 from that route and reports `paliPathEnabled: false`
+// from GET /network, so the FE hides the button cleanly.
+//
+// NOTE: the chain declared here via SYSCOIN_NETWORK is ONLY trusted
+// after it's been cross-checked against the actual RPC node's
+// `getblockchaininfo.chain`. That cross-check lives in
+// `paliChainGuard` below (constructed right after this block); the
+// router refuses /collateral/psbt until the guard reports ready, so
+// an operator misconfiguration (e.g. SYSCOIN_NETWORK=mainnet but
+// SYSCOIN_RPC_* pointing at a testnet node) cannot cause users to
+// burn 150 SYS on the wrong chain.
+const PALI_NETWORK_KEY = (() => {
+  const raw = String(process.env.SYSCOIN_NETWORK || '').trim().toLowerCase();
+  if (raw === 'mainnet') return 'mainnet';
+  if (raw === 'testnet') return 'testnet';
+  return null;
+})();
+const PALI_BLOCKBOOK_URL =
+  typeof process.env.SYSCOIN_BLOCKBOOK_URL === 'string'
+    ? process.env.SYSCOIN_BLOCKBOOK_URL.trim()
+    : '';
+
+let paliSyscoinClient = null;
+let paliPsbtBuilder = null;
+let paliNetworkInfo = null;
+if (PALI_NETWORK_KEY && PALI_BLOCKBOOK_URL) {
+  try {
+    paliSyscoinClient = createDefaultSyscoinClient({
+      blockbookURL: PALI_BLOCKBOOK_URL,
+      networkKey: PALI_NETWORK_KEY,
+    });
+    paliPsbtBuilder = paliSyscoinClient
+      ? (args) =>
+          buildCollateralPsbt({ ...args, syscoinClient: paliSyscoinClient })
+      : null;
+    paliNetworkInfo = {
+      // `chain` mirrors the string Core returns from getblockchaininfo
+      // so /network readers can compare against a value they've seen
+      // elsewhere. slip44 is the BIP-44 coin type (57 for mainnet SYS,
+      // 1 for any testnet per BIP-44), which Pali's chainId response
+      // can be cross-checked against.
+      chain: PALI_NETWORK_KEY === 'mainnet' ? 'main' : 'test',
+      slip44: PALI_NETWORK_KEY === 'mainnet' ? 57 : 1,
+      networkKey: PALI_NETWORK_KEY,
+    };
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '[pali] failed to wire Pali PSBT builder; path stays disabled',
+      err && err.message
+    );
+    paliSyscoinClient = null;
+    paliPsbtBuilder = null;
+    paliNetworkInfo = null;
+  }
+} else if (PALI_NETWORK_KEY || PALI_BLOCKBOOK_URL) {
+  // Half-configured: loud warning so the operator notices on boot.
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[pali] SYSCOIN_NETWORK and SYSCOIN_BLOCKBOOK_URL must both be set;' +
+      ' Pali collateral path disabled until both are present.'
+  );
+}
+
+// Chain-verification guard (Codex PR10 P1).
+//
+// Even with both env vars set correctly, the RPC node behind them
+// could be on a different chain (common mistake: repointed
+// SYSCOIN_RPC_HOST without flipping SYSCOIN_NETWORK). If we trust
+// the env blindly, the PSBT builder would happily burn 150 SYS on
+// the env-declared chain while the dispatcher watches the RPC
+// chain — funds gone, submission eternally stuck in
+// `awaiting_collateral` until timeout. The guard probes
+// getblockchaininfo.chain once the RPC is reachable and disables
+// the Pali path on mismatch. We still publish /network with
+// paliPathEnabled=false + paliPathReason so the FE can explain why
+// the button is grey.
+const paliChainGuard = paliNetworkInfo
+  ? createPaliChainGuard({
+      declaredChain: paliNetworkInfo.chain,
+      fetchActualChain: async () => {
+        const info = await rpcServices(client.callRpc)
+          .getBlockchainInfo()
+          .call();
+        return info && info.chain;
+      },
+      log: (level, event, meta) => {
+        // eslint-disable-next-line no-console
+        console[level === 'error' ? 'error' : 'log'](
+          `[pali-guard] ${level} ${event}`,
+          meta || ''
+        );
+      },
+    })
+  : null;
+if (paliChainGuard) {
+  paliChainGuard.start();
+}
+
 mountAuthAndVault(app, {
   services,
   mailer,
@@ -184,6 +296,9 @@ mountAuthAndVault(app, {
   invalidateCurrentVotes: (proposalHash) =>
     currentVotesCache.invalidate(proposalHash),
   proposalRpc,
+  governanceNetworkInfo: paliNetworkInfo,
+  buildCollateralPsbt: paliPsbtBuilder,
+  paliChainGuard,
 });
 
 // -----------------------------------------------------------------------------
