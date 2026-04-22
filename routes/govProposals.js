@@ -420,6 +420,23 @@ function createGovProposalsRouter({
   // GET /network reports paliPathEnabled=false so the FE can keep
   // the "Pay with Pali" button hidden.
   buildCollateralPsbt = null,
+  // Optional: chain-verification guard that cross-checks the
+  // operator-declared network (SYSCOIN_NETWORK) against the actual
+  // chain behind the RPC node. Until the guard reports `isReady()`
+  // we refuse the Pali path — otherwise a misconfigured deploy
+  // could let users burn 150 SYS on chain A while the dispatcher
+  // watches chain B. Interface:
+  //   { isReady(): boolean, reason(): string|null }
+  // `reason()` returns one of:
+  //   'pali_not_configured'       — no SYSCOIN_NETWORK declared
+  //   'pali_path_rpc_down'        — RPC unreachable; retrying
+  //   'pali_path_chain_mismatch'  — env vs RPC chain disagree
+  //                                 (terminal; operator must restart)
+  //   null                        — verified (isReady() === true)
+  // When this prop is null, the router falls back to the bare
+  // buildCollateralPsbt truthiness check (used by tests and any
+  // single-network dev boot where the cross-check is overkill).
+  paliChainGuard = null,
 } = {}) {
   if (!drafts || typeof drafts.create !== 'function') {
     throw new Error('createGovProposalsRouter: drafts repo is required');
@@ -1070,14 +1087,30 @@ function createGovProposalsRouter({
   // -----------------------------------------------------------------
   router.get('/network', (req, res) => {
     const info = networkInfo || {};
-    const paliPathEnabled =
+    const builderWired =
       typeof buildCollateralPsbt === 'function' &&
       (info.networkKey === 'mainnet' || info.networkKey === 'testnet');
+    // If a guard is injected, it has the final say. No guard ==
+    // legacy/dev path: trust the builder wiring alone.
+    const guardReady = paliChainGuard
+      ? typeof paliChainGuard.isReady === 'function' &&
+        paliChainGuard.isReady()
+      : true;
+    const paliPathEnabled = builderWired && guardReady;
+    const reason =
+      !paliPathEnabled && paliChainGuard &&
+      typeof paliChainGuard.reason === 'function'
+        ? paliChainGuard.reason()
+        : null;
     return res.json({
       chain: info.chain || 'unknown',
       slip44: Number.isInteger(info.slip44) ? info.slip44 : null,
       networkKey: info.networkKey || null,
       paliPathEnabled,
+      // Surfaced so the FE can pick the right hint ("verifying RPC
+      // chain…" vs "operator misconfigured, contact admin"). Absent
+      // when the path is enabled.
+      ...(reason ? { paliPathReason: reason } : {}),
     });
   });
 
@@ -1126,6 +1159,21 @@ function createGovProposalsRouter({
       return res
         .status(503)
         .json({ error: 'pali_path_disabled' });
+    }
+    // Guard check BEFORE any state reads. When the guard is injected
+    // and not ready, we refuse regardless of builder wiring — the
+    // builder could succeed against the wrong chain and burn funds
+    // that the dispatcher will never find.
+    if (
+      paliChainGuard &&
+      typeof paliChainGuard.isReady === 'function' &&
+      !paliChainGuard.isReady()
+    ) {
+      const reason =
+        typeof paliChainGuard.reason === 'function'
+          ? paliChainGuard.reason() || 'pali_path_disabled'
+          : 'pali_path_disabled';
+      return res.status(503).json({ error: reason });
     }
 
     const userId = req.user.id;

@@ -38,6 +38,7 @@ const {
   buildCollateralPsbt,
   createDefaultSyscoinClient,
 } = require('./lib/proposalPsbt');
+const { createPaliChainGuard } = require('./lib/paliChainGuard');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -224,6 +225,41 @@ if (PALI_NETWORK_KEY && PALI_BLOCKBOOK_URL) {
   );
 }
 
+// Chain-verification guard (Codex PR10 P1).
+//
+// Even with both env vars set correctly, the RPC node behind them
+// could be on a different chain (common mistake: repointed
+// SYSCOIN_RPC_HOST without flipping SYSCOIN_NETWORK). If we trust
+// the env blindly, the PSBT builder would happily burn 150 SYS on
+// the env-declared chain while the dispatcher watches the RPC
+// chain — funds gone, submission eternally stuck in
+// `awaiting_collateral` until timeout. The guard probes
+// getblockchaininfo.chain once the RPC is reachable and disables
+// the Pali path on mismatch. We still publish /network with
+// paliPathEnabled=false + paliPathReason so the FE can explain why
+// the button is grey.
+const paliChainGuard = paliNetworkInfo
+  ? createPaliChainGuard({
+      declaredChain: paliNetworkInfo.chain,
+      fetchActualChain: async () => {
+        const info = await rpcServices(client.callRpc)
+          .getBlockchainInfo()
+          .call();
+        return info && info.chain;
+      },
+      log: (level, event, meta) => {
+        // eslint-disable-next-line no-console
+        console[level === 'error' ? 'error' : 'log'](
+          `[pali-guard] ${level} ${event}`,
+          meta || ''
+        );
+      },
+    })
+  : null;
+if (paliChainGuard) {
+  paliChainGuard.start();
+}
+
 mountAuthAndVault(app, {
   services,
   mailer,
@@ -253,6 +289,7 @@ mountAuthAndVault(app, {
   proposalRpc,
   governanceNetworkInfo: paliNetworkInfo,
   buildCollateralPsbt: paliPsbtBuilder,
+  paliChainGuard,
 });
 
 // -----------------------------------------------------------------------------

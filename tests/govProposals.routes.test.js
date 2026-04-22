@@ -43,6 +43,7 @@ function buildApp({
   nowRef = null,
   networkInfo = null,
   buildCollateralPsbt = null,
+  paliChainGuard = null,
 } = {}) {
   _resetPepperForTests();
   process.env.SYSNODE_AUTH_PEPPER = 'd'.repeat(64);
@@ -113,6 +114,7 @@ function buildApp({
       ...(nowRef ? { now: () => nowRef.value } : {}),
       ...(networkInfo ? { networkInfo } : {}),
       ...(buildCollateralPsbt ? { buildCollateralPsbt } : {}),
+      ...(paliChainGuard ? { paliChainGuard } : {}),
     })
   );
 
@@ -1699,6 +1701,80 @@ describe('GET /gov/proposals/network', () => {
       ctx.db.close();
     }
   });
+
+  // -----------------------------------------------------------------
+  // paliChainGuard: even when builder+networkInfo are wired, an
+  // unready guard must flip paliPathEnabled=false and surface a
+  // reason code so the FE can show the right hint.
+  // -----------------------------------------------------------------
+  test('guard not ready => paliPathEnabled=false with paliPathReason', async () => {
+    const ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt: async () => ({
+        psbt: { psbt: 'AA==', assets: '[]' },
+        feeSats: '1',
+      }),
+      paliChainGuard: {
+        isReady: () => false,
+        reason: () => 'pali_path_rpc_down',
+      },
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/proposals/network');
+      expect(res.status).toBe(200);
+      expect(res.body.paliPathEnabled).toBe(false);
+      expect(res.body.paliPathReason).toBe('pali_path_rpc_down');
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('guard mismatch flips paliPathEnabled=false with explicit reason', async () => {
+    const ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt: async () => ({
+        psbt: { psbt: 'AA==', assets: '[]' },
+        feeSats: '1',
+      }),
+      paliChainGuard: {
+        isReady: () => false,
+        reason: () => 'pali_path_chain_mismatch',
+      },
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/proposals/network');
+      expect(res.body).toMatchObject({
+        paliPathEnabled: false,
+        paliPathReason: 'pali_path_chain_mismatch',
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('guard ready => paliPathEnabled=true and no reason surfaced', async () => {
+    const ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt: async () => ({
+        psbt: { psbt: 'AA==', assets: '[]' },
+        feeSats: '1',
+      }),
+      paliChainGuard: {
+        isReady: () => true,
+        reason: () => null,
+      },
+    });
+    try {
+      const { agent } = await loggedInAgent(ctx);
+      const res = await agent.get('/gov/proposals/network');
+      expect(res.body.paliPathEnabled).toBe(true);
+      expect(res.body.paliPathReason).toBeUndefined();
+    } finally {
+      ctx.db.close();
+    }
+  });
 });
 
 // -----------------------------------------------------------------------
@@ -1755,6 +1831,74 @@ describe('POST /gov/proposals/submissions/:id/collateral/psbt', () => {
       .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
     expect(res.status).toBe(503);
     expect(res.body.error).toBe('pali_path_disabled');
+  });
+
+  // Codex PR10: even with builder wired, an unready guard must
+  // refuse with its reason code. Prevents burning 150 SYS on the
+  // wrong chain while the dispatcher watches the other.
+  test('503 from guard when builder wired but guard not ready (mismatch)', async () => {
+    const buildCollateralPsbt = jest.fn();
+    ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt,
+      paliChainGuard: {
+        isReady: () => false,
+        reason: () => 'pali_path_chain_mismatch',
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('pali_path_chain_mismatch');
+    // Critically: we must refuse BEFORE even attempting to build
+    // against a potentially-wrong chain.
+    expect(buildCollateralPsbt).not.toHaveBeenCalled();
+  });
+
+  test('503 from guard when rpc still down', async () => {
+    ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt: async () => ({
+        psbt: { psbt: 'AA==', assets: '[]' },
+        feeSats: '1',
+      }),
+      paliChainGuard: {
+        isReady: () => false,
+        reason: () => 'pali_path_rpc_down',
+      },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('pali_path_rpc_down');
+  });
+
+  test('guard.isReady() === true passes through to the builder', async () => {
+    const buildCollateralPsbt = jest.fn().mockResolvedValue({
+      psbt: { psbt: 'BASE64PSBT==', assets: '[]' },
+      feeSats: '2000',
+    });
+    ctx = buildApp({
+      networkInfo: { chain: 'main', slip44: 57, networkKey: 'mainnet' },
+      buildCollateralPsbt,
+      paliChainGuard: { isReady: () => true, reason: () => null },
+    });
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(`/gov/proposals/submissions/${prep.submission.id}/collateral/psbt`)
+      .set('X-CSRF-Token', csrf)
+      .send({ xpub: SAMPLE_XPUB, changeAddress: SAMPLE_CHANGE });
+    expect(res.status).toBe(200);
+    expect(buildCollateralPsbt).toHaveBeenCalledTimes(1);
   });
 
   test('401 without session', async () => {
