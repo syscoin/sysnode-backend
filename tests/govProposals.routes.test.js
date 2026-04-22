@@ -923,6 +923,75 @@ describe('POST /gov/proposals/prepare', () => {
     expect(res.body.submission.status).toBe('prepared');
   });
 
+  // Codex PR8 round 11 P1: narrow gObjectCheck terminal-error
+  // matcher. The previous heuristic included a bare /invalid/
+  // regex, which matched JSON-RPC transport/parser errors that
+  // routinely contain the word "invalid" — for example the
+  // messages below from fetch/jsonrpc client layers. Those are
+  // transient outages, NOT Core validation rejects, and must
+  // soft-allow through to a 201 prepare (let the idempotent
+  // replay or a subsequent retry handle it) instead of being
+  // misreported as a permanent 422 core_rejected.
+  test.each([
+    ['Invalid URL'],
+    ['invalid response from server'],
+    ['invalid JSON-RPC response: expected object'],
+    ['invalid utf-8 sequence in headers'],
+    ['request failed: invalid status line'],
+  ])(
+    'transport error containing "invalid" is soft-allowed not terminal (%s) (Codex round 11 P1)',
+    async (transportMsg) => {
+      ctx = buildApp({
+        gObjectCheck: async () => {
+          throw new Error(transportMsg);
+        },
+      });
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(validProposalBody());
+      expect(res.status).toBe(201);
+      expect(res.body.submission.status).toBe('prepared');
+    }
+  );
+
+  // Complementary regression: the matcher still has to fire for
+  // actual Core governance-validation phrases. If it does not,
+  // bad payloads silently get filed as `prepared` and the user
+  // only learns the object is garbage once the dispatcher
+  // eventually submits and Core rejects it — a much worse UX
+  // because collateral may already be burned by then.
+  test.each([
+    ['name exceeds 40 characters', 'name_too_long'],
+    ['proposal data exceeds 512 bytes', 'payload_too_large'],
+    ['payment_address is invalid', 'address_invalid'],
+    ['Invalid data hex', null],
+    ['Governance object is not valid - start_epoch', 'epoch_order'],
+    ['Object submission rejected: hash mismatch', null],
+  ])(
+    'genuine Core reject phrase "%s" still returns 422 (Codex round 11 P1)',
+    async (coreMsg, expectedIssueCode) => {
+      ctx = buildApp({
+        gObjectCheck: async () => {
+          throw new Error(coreMsg);
+        },
+      });
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(validProposalBody());
+      expect(res.status).toBe(422);
+      expect(res.body.error).toBe('core_rejected');
+      if (expectedIssueCode) {
+        expect(
+          res.body.issues.some((i) => i.code === expectedIssueCode)
+        ).toBe(true);
+      }
+    }
+  );
+
   test(
     'returns 500 JSON (not an unhandled rejection) when the DB throws during prepare lookup (Codex round 8 P1)',
     async () => {

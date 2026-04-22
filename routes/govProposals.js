@@ -616,12 +616,66 @@ function createGovProposalsRouter({
           return res.status(422).json({ error: 'core_rejected', issues });
         }
       } catch (err) {
+        // Codex PR8 round 11 P1: the previous heuristic included a
+        // bare /invalid/ token, which matched transport / parser
+        // errors JSON-RPC clients commonly wrap with the word
+        // "invalid" ("Invalid URL", "invalid response from server",
+        // "invalid JSON-RPC response", "invalid utf-8 sequence in
+        // headers", etc.). Those are temporary outages, not Core
+        // rejections — classifying them as 422 core_rejected
+        // blocks legitimate /prepare calls until the node/network
+        // recovers.
+        //
+        // Terminal = phrases Syscoin Core explicitly emits from
+        // CGovernanceObject::IsValidLocally() and gobject_check's
+        // reject branches. Everything else (including anything
+        // containing a bare "invalid" / "error" / "failed") is
+        // treated as transient and soft-allowed, because JSON-RPC
+        // clients routinely wrap transport and parser failures
+        // with those tokens ("Invalid URL", "invalid response
+        // from server", "invalid JSON-RPC response"). Note: we
+        // deliberately do NOT use `parseCoreRejectMessage` for
+        // classification — its final arm raises a catch-all
+        // `core_rejected` issue for ANY non-empty string, which
+        // would false-positive every transport error as a Core
+        // rejection.
         const msg = String((err && err.message) || err);
-        // Heuristic: treat obvious validation errors as 422 terminal;
-        // anything else (network/timeout) we soft-allow.
-        if (
-          /validation|invalid|exceeds|rejected|collateral|size/i.test(msg)
-        ) {
+        const terminalCorePhrases = [
+          // CGovernanceObject::IsValidLocally phrases (same set
+          // `parseCoreRejectMessage` maps to structured codes):
+          /name exceeds/i,
+          /name\s+(?:is\s+)?empty/i,
+          /name contains invalid/i,
+          /start_epoch/i,
+          /end_epoch/i,
+          /payment_amount is negative/i,
+          /payment_amount\b.*not found/i,
+          /payment_address is invalid/i,
+          /payment_address\b.*not found/i,
+          /payment_address can't have whitespaces/i,
+          /script addresses are not supported/i,
+          /url.*whitespaces/i,
+          /url too short/i,
+          /url invalid/i,
+          /url\b.*not found/i,
+          /data exceeds/i,
+          /type is not 1/i,
+          /type field not found/i,
+          /governance object (?:is )?expired/i,
+          /proposal (?:is )?expired/i,
+          // gobject_check wrapper rejects:
+          /Governance object is not valid/i,
+          /Object submission rejected/i,
+          /Invalid parent hash/i,
+          /Invalid (?:object )?signature/i,
+          /Invalid object type/i,
+          /Invalid proposal/i,
+          /Invalid data hex/i,
+          /hash mismatch/i,
+          /collateral (?:missing|invalid|rejected)/i,
+        ];
+        const isTerminal = terminalCorePhrases.some((re) => re.test(msg));
+        if (isTerminal) {
           const issues = proposalValidate.parseCoreRejectMessage(msg);
           return res.status(422).json({ error: 'core_rejected', issues });
         }
@@ -630,7 +684,8 @@ function createGovProposalsRouter({
           '[POST /gov/proposals/prepare] gObjectCheck soft-fail',
           msg
         );
-        // fall through
+        // fall through — transient; let the idempotent replay
+        // branch or subsequent insert handle it.
       }
     }
 
