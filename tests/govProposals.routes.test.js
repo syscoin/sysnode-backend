@@ -1628,6 +1628,183 @@ describe('submissions lifecycle', () => {
       .set('X-CSRF-Token', b.csrf);
     expect(del.status).toBe(404);
   });
+
+  // -------------------------------------------------------------
+  // POST /submissions/:id/clone-to-draft
+  //
+  // "Start over with these details" flow for a failed submission.
+  // The endpoint is transactional: in a single SQLite txn it
+  // creates a fresh draft seeded from the failed submission and
+  // deletes the failed row. The contract we exercise here:
+  //
+  //   - happy path: failed → 201 { draft }, submission is gone,
+  //                 draft carries every structural field.
+  //   - status gate: non-failed source rows return 409
+  //                  status_not_failed.
+  //   - ownership : another user gets 404, never 409/401.
+  //   - cap       : draft-limit returns 409 draft_limit so the
+  //                 route can't be used as a back-door past POST
+  //                 /drafts' limiter.
+  // -------------------------------------------------------------
+
+  test('clone-to-draft: failed → 201 draft seeded, submission removed', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const body = validProposalBody({
+      name: 'clone-me',
+      url: 'https://forum.syscoin.org/t/clone-me',
+      paymentAmount: '1234',
+      paymentCount: 2,
+    });
+    const prep = await agent
+      .post('/gov/proposals/prepare')
+      .set('X-CSRF-Token', csrf)
+      .send(body);
+    expect(prep.status).toBe(201);
+    const submissionId = prep.body.submission.id;
+
+    // Transition to failed via the repo (mirrors what the
+    // dispatcher does when Core rejects submit or the collateral
+    // times out). The route's status gate only cares that the
+    // row reached 'failed'; the specific fail_reason is not
+    // interesting for this test.
+    ctx.submissions.markFailed(submissionId, {
+      reason: 'submit_rejected',
+      detail: 'test-induced',
+    });
+
+    const res = await agent
+      .post(`/gov/proposals/submissions/${submissionId}/clone-to-draft`)
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(res.status).toBe(201);
+    expect(res.body.draft).toBeTruthy();
+    const d = res.body.draft;
+    expect(d.name).toBe('clone-me');
+    expect(d.url).toBe('https://forum.syscoin.org/t/clone-me');
+    expect(d.paymentAddress).toBe(body.paymentAddress);
+    // paymentAmount '1234' SYS → 123_400_000_000 sats (12 digits,
+    // serialised as decimal string so BigInt precision survives).
+    expect(d.paymentAmountSats).toBe('123400000000');
+    expect(d.paymentCount).toBe(2);
+    expect(d.startEpoch).toBe(body.startEpoch);
+    expect(d.endEpoch).toBe(body.endEpoch);
+    // Description isn't on the submission so the clone starts
+    // blank; users can reintroduce any body copy in the new draft.
+    expect(d.description).toBe('');
+
+    // Source submission is gone.
+    const after = await agent.get(
+      `/gov/proposals/submissions/${submissionId}`
+    );
+    expect(after.status).toBe(404);
+
+    // The new draft shows up in the drafts list.
+    const list = await agent.get('/gov/proposals/drafts');
+    expect(list.status).toBe(200);
+    expect(list.body.drafts.some((r) => r.id === d.id)).toBe(true);
+  });
+
+  test('clone-to-draft: prepared source → 409 status_not_failed', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    const res = await agent
+      .post(
+        `/gov/proposals/submissions/${prep.submission.id}/clone-to-draft`
+      )
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe('status_not_failed');
+    // Source submission unchanged.
+    const get = await agent.get(
+      `/gov/proposals/submissions/${prep.submission.id}`
+    );
+    expect(get.status).toBe(200);
+    expect(get.body.submission.status).toBe('prepared');
+  });
+
+  test('clone-to-draft: other user → 404', async () => {
+    const a = await loggedInAgent(ctx, 'a@example.com');
+    const b = await loggedInAgent(ctx, 'b@example.com');
+    const prep = await prepareOne(a.agent, a.csrf);
+    ctx.submissions.markFailed(prep.submission.id, {
+      reason: 'submit_rejected',
+      detail: 'x',
+    });
+    const res = await b.agent
+      .post(
+        `/gov/proposals/submissions/${prep.submission.id}/clone-to-draft`
+      )
+      .set('X-CSRF-Token', b.csrf)
+      .send({});
+    expect(res.status).toBe(404);
+    // A's submission row is still present (clone was rejected).
+    const stillThere = await a.agent.get(
+      `/gov/proposals/submissions/${prep.submission.id}`
+    );
+    expect(stillThere.status).toBe(200);
+    expect(stillThere.body.submission.status).toBe('failed');
+  });
+
+  test('clone-to-draft: bogus id → 404', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const res = await agent
+      .post('/gov/proposals/submissions/999999/clone-to-draft')
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(res.status).toBe(404);
+  });
+
+  test('clone-to-draft: enforces per-user draft limit (409 draft_limit)', async () => {
+    // Dedicated app with a tight cap so we can fill it without
+    // creating 50 rows.
+    const smallCtx = buildApp();
+    try {
+      // Swap in a router scoped to a small draft cap by constructing
+      // a fresh express app over the same repos. Rather than touch
+      // buildApp(), we stuff the cap by pre-filling the user's
+      // drafts up to the default cap (50) — but that's slow, so
+      // instead we patch `drafts.countForUser` for this test only.
+      // This matches the pattern used elsewhere in the file for
+      // surgically exercising rare branches without a second app.
+      const { agent, csrf } = await loggedInAgent(
+        smallCtx,
+        'cap@example.com'
+      );
+      const prep = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(validProposalBody());
+      expect(prep.status).toBe(201);
+      smallCtx.submissions.markFailed(prep.body.submission.id, {
+        reason: 'submit_rejected',
+        detail: 'x',
+      });
+      const origCount = smallCtx.drafts.countForUser;
+      smallCtx.drafts.countForUser = () => 50; // default cap
+      try {
+        const res = await agent
+          .post(
+            `/gov/proposals/submissions/${prep.body.submission.id}/clone-to-draft`
+          )
+          .set('X-CSRF-Token', csrf)
+          .send({});
+        expect(res.status).toBe(409);
+        expect(res.body.reason).toBe('draft_limit');
+        // Source submission untouched — the transaction rolled
+        // back cleanly when we threw the cap conflict.
+        const after = await agent.get(
+          `/gov/proposals/submissions/${prep.body.submission.id}`
+        );
+        expect(after.status).toBe(200);
+        expect(after.body.submission.status).toBe('failed');
+      } finally {
+        smallCtx.drafts.countForUser = origCount;
+      }
+    } finally {
+      smallCtx.db.close();
+    }
+  });
 });
 
 // -----------------------------------------------------------------------
