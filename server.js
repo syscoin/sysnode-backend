@@ -32,6 +32,8 @@ const { client, rpcServices } = require('./services/rpcClient');
 const { createCurrentVotesCache } = require('./lib/voteReceipts');
 const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
+const { createProposalDispatcher } = require('./lib/proposalDispatcher');
+const { createProposalRpc } = require('./lib/proposalRpc');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -141,6 +143,20 @@ const services = finalizeSessionMw(buildServices({ db }));
 // would see a 401.
 app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
 
+// Proposal RPC adapter.
+//
+// The governance-proposals code (dispatcher + prepare pre-flight)
+// speaks a camelCase surface on purpose — see
+// lib/proposalDispatcher.js for the full rationale.
+// @syscoin/syscoin-js exposes snake_case methods (`gObject_submit`,
+// `gObject_check`, `getRawTransaction`) that return a "stub" you
+// `.call()` to actually fire. The wrapping lives in
+// `lib/proposalRpc.js` so it can be unit-tested directly; without
+// that extraction a regression in the argument shape sent to
+// syscoin-js / syscoind (e.g. stringified revision/time) would only
+// surface in integration.
+const proposalRpc = createProposalRpc(() => rpcServices(client.callRpc));
+
 mountAuthAndVault(app, {
   services,
   mailer,
@@ -167,6 +183,7 @@ mountAuthAndVault(app, {
   getCurrentVotes: (proposalHash) => currentVotesCache.get(proposalHash),
   invalidateCurrentVotes: (proposalHash) =>
     currentVotesCache.invalidate(proposalHash),
+  proposalRpc,
 });
 
 // -----------------------------------------------------------------------------
@@ -270,6 +287,84 @@ setTimeout(() => {
     });
   }, 60 * 60 * 1000).unref();
 }, 5 * 60 * 1000).unref();
+
+// -----------------------------------------------------------------------------
+// Proposal dispatcher (PR 8).
+//
+// Walks `awaiting_collateral` submissions: bumps confirmation counts
+// from getRawTransaction, fires gObject_submit once >= 6 confs, and
+// transitions rows to `submitted` or `failed`. The mailer hooks
+// resolve the submission's user and send the corresponding template.
+//
+// Same cadence philosophy as the reminder dispatcher: first tick a
+// few minutes after boot (lets the RPC warm up) and then once a
+// minute — fast enough that the 6-conf threshold is observed within
+// about a block of real confirmation, slow enough to be polite to
+// the RPC node (N rows → N getRawTransaction calls per tick). The
+// timer is .unref()'d so it never keeps the process alive on its own.
+// -----------------------------------------------------------------------------
+const proposalDispatcher = createProposalDispatcher({
+  submissions: services.proposalSubmissions,
+  rpc: proposalRpc,
+  onSubmitted: async ({ submission }) => {
+    const user = services.users.findById(submission.userId);
+    if (!user || !user.email) return;
+    await mailer.sendProposalSubmitted({
+      to: user.email,
+      proposalName: submission.name,
+      governanceHash: submission.governanceHash,
+      collateralTxid: submission.collateralTxid,
+      submissionId: submission.id,
+    });
+  },
+  onFailed: async ({ submission }) => {
+    const user = services.users.findById(submission.userId);
+    if (!user || !user.email) return;
+    await mailer.sendProposalFailed({
+      to: user.email,
+      proposalName: submission.name,
+      failReason: submission.failReason,
+      failDetail: submission.failDetail,
+      submissionId: submission.id,
+    });
+  },
+  log: (level, event, meta) => {
+    // eslint-disable-next-line no-console
+    console.log(`[proposal] ${level} ${event}`, meta || '');
+  },
+});
+
+// Codex PR8 round 9 P2: self-scheduling dispatcher loop.
+//
+// The previous implementation used `setInterval(..., 60s)` which
+// fires on a fixed cadence regardless of how long the last tick is
+// still running. Under slow RPC or a large `awaiting_collateral`
+// backlog, a single tick can easily exceed the interval — two
+// workers then start processing the same rows concurrently, which
+// at best doubles the `getRawTransaction` / `gObjectSubmit` load on
+// the RPC node (and any shared rate limiter) and at worst races on
+// state transitions that the CAS guards in proposalSubmissions.js
+// would otherwise collapse cleanly. Serialize with a
+// self-scheduling `setTimeout` that re-arms only AFTER the previous
+// `tick()` resolves (matching the appFactory.js pattern).
+const PROPOSAL_DISPATCHER_INTERVAL_MS = 60 * 1000;
+const PROPOSAL_DISPATCHER_KICKOFF_MS = 5 * 60 * 1000;
+
+async function proposalDispatcherLoop() {
+  try {
+    await proposalDispatcher.tick();
+  } catch (err) {
+    // Dispatcher swallows per-row errors internally; any throw out
+    // here is an invariant violation worth logging but not fatal.
+    // eslint-disable-next-line no-console
+    console.error('[proposal] tick failed', err && err.message);
+  }
+  setTimeout(proposalDispatcherLoop, PROPOSAL_DISPATCHER_INTERVAL_MS).unref();
+}
+
+setTimeout(() => {
+  proposalDispatcherLoop();
+}, PROPOSAL_DISPATCHER_KICKOFF_MS).unref();
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
