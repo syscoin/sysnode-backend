@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const securityLog = require('../lib/securityLog');
 
 // Double-submit CSRF.
 //
@@ -58,9 +59,18 @@ function createCsrfMiddleware({ secureCookies }) {
       const cookieToken = req.cookies && req.cookies[CSRF_COOKIE];
       const headerToken = req.get('X-CSRF-Token');
       if (!cookieToken || !headerToken) {
+        // F5: structured security event — operators can grep for
+        // csrf.* to spot abuse patterns. `reason` distinguishes the
+        // "client forgot the header" benign case from a same-site
+        // attack without logging the tokens themselves.
+        securityLog.warn('csrf.missing', {
+          req,
+          reason: !cookieToken ? 'no_cookie' : 'no_header',
+        });
         return res.status(403).json({ error: 'csrf_missing' });
       }
       if (!timingEqual(cookieToken, headerToken)) {
+        securityLog.warn('csrf.mismatch', { req });
         return res.status(403).json({ error: 'csrf_mismatch' });
       }
       next();

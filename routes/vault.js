@@ -1,5 +1,6 @@
 const express = require('express');
 const { z } = require('zod');
+const securityLog = require('../lib/securityLog');
 
 // Vault HTTP interface.
 //
@@ -53,8 +54,7 @@ function createVaultRouter({ vaults, sessionMw, csrfMw }) {
       if (err.code === 'invalid_blob') {
         return res.status(400).json({ error: 'invalid_blob' });
       }
-      // eslint-disable-next-line no-console
-      console.error('[vault PUT]', err);
+      securityLog.error('vault.put_failed', { req, error: err });
       return res.status(500).json({ error: 'internal' });
     }
   });
