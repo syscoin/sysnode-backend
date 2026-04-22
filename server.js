@@ -165,13 +165,25 @@ const proposalRpc = {
       .gObject_submit(parentHash, String(revision), String(time), dataHex, feeTxid)
       .call(true);
   },
-  async gObjectCheck(parentHash, revision, time, dataHex) {
+  async gObjectCheck(dataHex) {
+    // Codex PR8 round 6 P1: Syscoin Core's `gobject_check` takes
+    // exactly ONE positional arg — `hex_data` — and derives
+    // parentHash, revision and nTime itself (see
+    // syscoin/src/rpc/governance.cpp::gobject_check, which calls
+    //   CGovernanceObject govobj(uint256(), 1, GetAdjustedTime(),
+    //                             uint256(), strDataHex)
+    // ). Earlier iterations of this adapter matched the 4-arg
+    // `gobject_submit` signature, which Core rejected with
+    //   RPC_INVALID_PARAMS: too many positional arguments
+    // and the route's "terminal vs transient" classifier then
+    // masqueraded that as 422 core_rejected on valid proposals.
+    //
     // gObject_check is a read-only validation endpoint (no state
     // mutation, no fee). We swallow "Not Implemented" style errors
     // at the route layer (see routes/govProposals.js) so that older
     // Core builds degrade silently to "skip pre-flight".
     return rpcServices(client.callRpc)
-      .gObject_check(parentHash, String(revision), String(time), dataHex)
+      .gObject_check(dataHex)
       .call();
   },
 };

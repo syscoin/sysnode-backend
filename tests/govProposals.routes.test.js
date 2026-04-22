@@ -498,9 +498,12 @@ describe('POST /gov/proposals/prepare', () => {
   test('happy path: creates submission, returns hash/canonical/fee', async () => {
     const calls = [];
     ctx = buildApp({
-      gObjectCheck: async (parentHash, revision, time, dataHex) => {
-        calls.push({ parentHash, revision, time, dataHex });
-        return { result: { Object: 'success' } };
+      // Codex PR8 round 6 P1: Core's gobject_check takes ONE
+      // positional arg (hex_data) and returns { "Object status": "OK" }
+      // on accept. Mock the contract the real adapter exposes today.
+      gObjectCheck: async (dataHex) => {
+        calls.push({ dataHex });
+        return { result: { 'Object status': 'OK' } };
       },
     });
     const { agent, csrf } = await loggedInAgent(ctx);
@@ -538,13 +541,12 @@ describe('POST /gov/proposals/prepare', () => {
     );
     expect(res.body.requiredConfirmations).toBe(REQUIRED_CONFIRMATIONS);
     expect(calls).toHaveLength(1);
-    // Codex PR8 round 1 P1: pre-flight must pass the full Core
-    // argument tuple (parent_hash, revision, time, data_hex) — any
-    // other shape silently shifts args under the production adapter.
+    // Codex PR8 round 6 P1: preflight must call Core's gobject_check
+    // with its single positional arg — `hex_data`. Earlier we passed
+    // the 4-tuple that gobject_submit uses, which Core rejects with
+    // RPC_INVALID_PARAMS and our "terminal" classifier misread as
+    // 422 core_rejected. Assert the wire contract directly.
     expect(calls[0]).toEqual({
-      parentHash: '0',
-      revision: 1,
-      time: res.body.submission.timeUnix,
       dataHex: res.body.submission.dataHex,
     });
   });
@@ -682,7 +684,7 @@ describe('POST /gov/proposals/prepare', () => {
               },
             };
           }
-          return { result: { Object: 'success' } };
+          return { result: { 'Object status': 'OK' } };
         },
       });
       const { agent, csrf } = await loggedInAgent(ctx);
@@ -812,8 +814,11 @@ describe('POST /gov/proposals/prepare', () => {
 
   test('core_rejected when gObjectCheck returns non-success', async () => {
     ctx = buildApp({
+      // Codex PR8 round 6 P1: a non-"Object status: OK" response
+      // (including a plain `Error` message) is a rejection. Parse
+      // the message for codes and surface 422.
       gObjectCheck: async () => ({
-        result: { Object: 'failure', Error: 'name exceeds 40 characters' },
+        result: { Error: 'name exceeds 40 characters' },
       }),
     });
     const { agent, csrf } = await loggedInAgent(ctx);
@@ -844,6 +849,61 @@ describe('POST /gov/proposals/prepare', () => {
       res.body.issues.find((i) => i.code === 'payload_too_large')
     ).toBeTruthy();
   });
+
+  test(
+    'accepts Core\'s canonical success shape { "Object status": "OK" } (Codex round 6 P1)',
+    async () => {
+      // Regression: previously we checked `result.Object === 'success'`,
+      // which is NOT the response Core produces. Core returns
+      //   { "Object status": "OK" }
+      // (see syscoin/src/rpc/governance.cpp line 111:
+      //    objResult.pushKV("Object status", "OK");
+      // ). With the old check every valid preflight fell through the
+      // reject branch and /prepare surfaced as 422 core_rejected. We
+      // accept mixed casing on the OK string for forward-compat but
+      // require the exact key.
+      ctx = buildApp({
+        gObjectCheck: async () => ({ result: { 'Object status': 'OK' } }),
+      });
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const r = await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(validProposalBody());
+      expect(r.status).toBe(201);
+      expect(r.body.submission.status).toBe('prepared');
+    }
+  );
+
+  test(
+    'gObjectCheck is called with hex_data only (Codex round 6 P1)',
+    async () => {
+      // Regression: a previous iteration of the adapter mirrored the
+      // 4-tuple `gobject_submit` signature and sent
+      // (parent_hash, revision, time, data_hex) to `gobject_check`.
+      // Core only takes `hex_data`, so it rejected with
+      // RPC_INVALID_PARAMS (too many positional arguments) and the
+      // route's terminal-error classifier then misread that as
+      // 422 core_rejected on valid proposals. Assert the adapter
+      // boundary sees exactly one argument.
+      const argCalls = [];
+      ctx = buildApp({
+        gObjectCheck: async (...args) => {
+          argCalls.push(args);
+          return { result: { 'Object status': 'OK' } };
+        },
+      });
+      const { agent, csrf } = await loggedInAgent(ctx);
+      await agent
+        .post('/gov/proposals/prepare')
+        .set('X-CSRF-Token', csrf)
+        .send(validProposalBody());
+      expect(argCalls).toHaveLength(1);
+      expect(argCalls[0]).toHaveLength(1);
+      expect(typeof argCalls[0][0]).toBe('string');
+      expect(/^[0-9a-f]+$/.test(argCalls[0][0])).toBe(true);
+    }
+  );
 
   test('transient RPC failure is soft-allowed (still 201)', async () => {
     ctx = buildApp({

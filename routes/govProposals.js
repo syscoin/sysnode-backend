@@ -554,32 +554,36 @@ function createGovProposalsRouter({
     // rejection instead of a clean "skip preflight".
     if (rpc && typeof rpc.gObjectCheck === 'function') {
       try {
-        // The production adapter in server.js has the full Core
-        // signature `(parentHash, revision, time, dataHex)`. Earlier
-        // iterations of this route passed only `dataHex`, which
-        // silently shifted args so `dataHex` became `parentHash` and
-        // the real payload was `undefined` — invalid-params errors
-        // then matched the /invalid/ classifier below and masqueraded
-        // as 422 core_rejected on perfectly valid proposals. Always
-        // forward the full canonical argument tuple we just hashed.
-        // (Codex PR8 round 1 P1.)
-        const resp = await rpc.gObjectCheck(
-          parentHash,
-          revision,
-          timeUnix,
-          canon.dataHex
-        );
+        // Codex PR8 round 6 P1: Syscoin Core's `gobject_check` takes
+        // exactly ONE positional arg — `hex_data` — see
+        // syscoin/src/rpc/governance.cpp::gobject_check. Core
+        // derives parentHash/revision/nTime internally just to
+        // construct the validator; they do NOT participate in the
+        // submission hash, so they are irrelevant to preflight. An
+        // earlier iteration forwarded the full 4-tuple to match
+        // `gobject_submit`; Core rejects that with
+        //   RPC_INVALID_PARAMS: too many positional arguments
+        // which our "terminal" heuristic below then misclassifies
+        // as 422 core_rejected on perfectly valid proposals. Pass
+        // just the canonical dataHex.
+        const resp = await rpc.gObjectCheck(canon.dataHex);
         const result =
           resp && typeof resp === 'object' && 'result' in resp
             ? resp.result
             : resp;
-        const okFlag = result && (result.Object || result.object);
-        // Core 4.x returns { "Object": "success" } on accept. Anything
-        // else is treated as a rejection; parse the message for codes.
-        if (
-          okFlag &&
-          String(okFlag).toLowerCase() === 'success'
-        ) {
+        // Codex PR8 round 6 P1: Syscoin Core's `gobject_check`
+        // returns `{ "Object status": "OK" }` on accept (literal
+        // key with a space; see governance.cpp line 111:
+        //   objResult.pushKV("Object status", "OK");
+        // ). It does NOT use `{ "Object": "success" }` — that was
+        // our previous (wrong) assumption, inherited from legacy
+        // Dash docs. Without this fix, every successful preflight
+        // fell through to the "reject" branch and surfaced as
+        // 422 core_rejected. Be lenient on the "OK" casing but
+        // strict on the key.
+        const statusStr =
+          result && (result['Object status'] || result['object status']);
+        if (statusStr && String(statusStr).toUpperCase() === 'OK') {
           // accepted
         } else {
           const msg =
