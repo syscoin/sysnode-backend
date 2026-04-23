@@ -431,6 +431,74 @@ describe('createMnCountLogger', () => {
     expect(logger.getDiagnostics().stopped).toBe(true);
   });
 
+  // Codex PR16 P2 round 2: repo.getLatestDate() used to sit
+  // outside runAndReschedule()'s try/catch. A transient SQLite
+  // read failure there would reject the returned promise, the
+  // setTimeout callback didn't attach a .catch, and the scheduler
+  // silently died — daily /mnCount updates would halt until
+  // process restart. This test wires a repo whose getLatestDate()
+  // throws once on the first tick, then recovers, and asserts the
+  // logger stays alive and rearms.
+  test('scheduler survives a synchronous throw in repo.getLatestDate()', async () => {
+    const clockLocal = { nowMs: msAt('2024-03-15T06:00:00Z') };
+    const schedLocal = makeManualScheduler(clockLocal);
+    const dbLocal = openDatabase(':memory:');
+    const realRepo = createMasternodeCountRepo(dbLocal);
+
+    let throwOnce = true;
+    const brittleRepo = {
+      ...realRepo,
+      getLatestDate: () => {
+        if (throwOnce) {
+          throwOnce = false;
+          throw new Error('synthetic sqlite read transient');
+        }
+        return realRepo.getLatestDate();
+      },
+    };
+
+    const logsLocal = [];
+    const fetchTotalLocal = jest.fn(async () => 4242);
+    const loggerLocal = createMnCountLogger({
+      repo: brittleRepo,
+      fetchTotal: fetchTotalLocal,
+      now: () => clockLocal.nowMs,
+      log: (level, event, meta) => logsLocal.push({ level, event, meta }),
+      setTimeoutImpl: schedLocal.setTimeoutImpl,
+      clearTimeoutImpl: schedLocal.clearTimeoutImpl,
+    });
+
+    try {
+      loggerLocal.start();
+      for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+
+      // First pass hit the throw. The logger MUST have logged the
+      // failure and scheduled a retry inside today's UTC window,
+      // not gone silent.
+      expect(
+        logsLocal.some((l) => l.event === 'mncount_tick_failed')
+      ).toBe(true);
+      const firstPending = schedLocal.pending();
+      expect(firstPending).toHaveLength(1);
+      expect(firstPending[0].delay).toBeGreaterThan(0);
+      expect(firstPending[0].delay).toBeLessThan(
+        msUntilNextMidnightUtc(clockLocal.nowMs) + 1
+      );
+
+      // Second pass: getLatestDate() now returns null (empty repo),
+      // the sample path writes today's row, and the logger arms for
+      // next midnight — proof the scheduler is still alive.
+      await schedLocal.fireNext();
+      expect(realRepo.getAll()).toEqual([
+        { date: '2024-03-15', users: 4242 },
+      ]);
+      expect(schedLocal.pending()).toHaveLength(1);
+    } finally {
+      loggerLocal.stop();
+      dbLocal.close();
+    }
+  });
+
   test('MAX_RETRY_MS cap keeps the backoff sane on chronic failure', async () => {
     // Verify the exposed constants so they cannot regress silently.
     expect(BASE_RETRY_MS).toBe(60 * 1000);
