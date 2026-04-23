@@ -110,6 +110,29 @@ function createMnCountLogger({
     return { date, total, inserted: result.inserted };
   }
 
+  // Post-error reschedule helper used by every catch path below.
+  // Keeps the schedule() argument logic (backoff, midnight clamp,
+  // fallback when msUntilNextMidnightUtc itself rejects) in one
+  // place so a rescue path on the outer try/catch cannot drift out
+  // of sync with the main one.
+  function scheduleBackoffRetry() {
+    if (stopped) return;
+    currentRetryMs = Math.min(currentRetryMs * 2, MAX_RETRY_MS);
+    let untilMidnight;
+    try {
+      untilMidnight = msUntilNextMidnightUtc(now());
+    } catch (innerErr) {
+      // msUntilNextMidnightUtc wraps Math + Date only; a throw here
+      // would be an invariant violation, but we handle it rather
+      // than letting the scheduler die.
+      log('error', 'mncount_schedule_invariant', {
+        err: innerErr && innerErr.message,
+      });
+      untilMidnight = MAX_RETRY_MS;
+    }
+    schedule(Math.min(currentRetryMs, untilMidnight));
+  }
+
   function schedule(ms) {
     if (stopped) return;
     if (timer) {
@@ -118,9 +141,24 @@ function createMnCountLogger({
     }
     timer = setTimeoutImpl(() => {
       timer = null;
-      // Fire-and-forget: runAndReschedule owns its own rescheduling
-      // and error handling.
-      runAndReschedule();
+      // Belt-and-braces: runAndReschedule is documented never to
+      // reject, but if it ever did (e.g. a future refactor drops
+      // the outer try/catch below) an unhandled rejection here
+      // would silently kill the logger until the next process
+      // restart. Attach a last-resort catch that logs and arms a
+      // short retry so the scheduler self-heals (Codex PR16 P2
+      // round 2).
+      runAndReschedule().catch((err) => {
+        lastError = err && err.message;
+        log('error', 'mncount_scheduler_invariant', {
+          err: err && err.message,
+        });
+        try {
+          scheduleBackoffRetry();
+        } catch {
+          /* final fallback: give up silently rather than crash */
+        }
+      });
     }, ms);
     if (timer && typeof timer.unref === 'function') timer.unref();
   }
@@ -128,34 +166,37 @@ function createMnCountLogger({
   async function runAndReschedule() {
     if (stopped) return;
 
-    // Fast-path: if today's row is already there (boot after a
-    // successful earlier tick, or a spurious re-fire on the same
-    // UTC day) skip the RPC entirely and arm for next midnight.
-    // The INSERT OR IGNORE in the repo would collapse a duplicate
-    // write anyway, but avoiding the RPC call keeps Core's load
-    // bounded and stops a same-day re-sample from shadowing the
-    // 00:00 snapshot with an afternoon value at the log layer.
-    const today = utcDateString(now());
-    if (repo.getLatestDate() === today) {
-      if (stopped) return;
-      schedule(msUntilNextMidnightUtc(now()));
-      return;
-    }
-
+    // Single outer try covers BOTH the pre-flight repo read and
+    // the sample path. The pre-flight `repo.getLatestDate()` call
+    // used to sit outside the try/catch; a transient SQLite read
+    // failure there would reject the returned promise and — since
+    // the scheduler callback doesn't await this function — silently
+    // kill the logger's ability to reschedule future writes
+    // (Codex PR16 P2 round 2). Treating any failure here as a
+    // tick failure (log + backoff + clamp to this UTC day) keeps
+    // the scheduler alive.
     try {
+      // Fast-path: if today's row is already there (boot after a
+      // successful earlier tick, or a spurious re-fire on the same
+      // UTC day) skip the RPC entirely and arm for next midnight.
+      // The INSERT OR IGNORE in the repo would collapse a duplicate
+      // write anyway, but avoiding the RPC call keeps Core's load
+      // bounded and stops a same-day re-sample from shadowing the
+      // 00:00 snapshot with an afternoon value at the log layer.
+      const today = utcDateString(now());
+      if (repo.getLatestDate() === today) {
+        if (stopped) return;
+        schedule(msUntilNextMidnightUtc(now()));
+        return;
+      }
+
       await sampleAndWrite('tick');
       if (stopped) return;
       schedule(msUntilNextMidnightUtc(now()));
     } catch (err) {
       lastError = err && err.message;
       log('error', 'mncount_tick_failed', { err: err && err.message });
-      currentRetryMs = Math.min(currentRetryMs * 2, MAX_RETRY_MS);
-      // Never overshoot the next day's midnight: we want at least
-      // one scheduled attempt BEFORE the next UTC-day boundary so a
-      // single bad sample cannot lose its day entirely.
-      const untilMidnight = msUntilNextMidnightUtc(now());
-      if (stopped) return;
-      schedule(Math.min(currentRetryMs, untilMidnight));
+      scheduleBackoffRetry();
     }
   }
 
