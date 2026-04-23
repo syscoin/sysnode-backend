@@ -13,7 +13,7 @@ require('./services/masternodeTracker');
 const mnStatsRoute = require('./routes/mnStats');
 const masternodesRoute = require('./routes/masternodes');
 const governanceRoute = require('./routes/governance');
-const csvParserRoute = require('./routes/csvParser');
+const { createMnCountRouter } = require('./routes/mnCount');
 const mnListRoute = require('./routes/mnList');
 const mnSearchRoute = require('./routes/mnSearch');
 
@@ -39,6 +39,11 @@ const {
   createDefaultSyscoinClient,
 } = require('./lib/proposalPsbt');
 const { createPaliChainGuard } = require('./lib/paliChainGuard');
+const {
+  createMasternodeCountRepo,
+} = require('./lib/masternodeCountRepo');
+const { seedMasternodeCount } = require('./lib/mnCountSeed');
+const { createMnCountLogger } = require('./services/mnCountLogger');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -119,6 +124,42 @@ app.use((req, res, next) => {
 // -----------------------------------------------------------------------------
 const dbPath = process.env.SYSNODE_DB_PATH || './data/sysnode.db';
 const db = openDatabase(dbPath);
+
+// Historical masternode-count store (feeds the /mnCount endpoint +
+// the homepage TrendChart). We construct the repo up front because
+// three independent callers need it: the one-time seeder, the daily
+// logger that appends new rows, and the /mnCount HTTP route.
+//
+// seedMasternodeCount is idempotent: it loads the committed CSV
+// (db/seeds/masternode-count.csv) only when the table is empty, so
+// normal restarts and second-boot upgrades both no-op correctly.
+const mnCountRepo = createMasternodeCountRepo(db);
+seedMasternodeCount({
+  db,
+  repo: mnCountRepo,
+  log: (level, event, meta) => {
+    // eslint-disable-next-line no-console
+    console.log(`[mncount-seed] ${level} ${event}`, meta || '');
+  },
+});
+
+// Daily masternode-count logger. Catches up on boot if today's row
+// is missing, then re-arms for each subsequent midnight UTC. The
+// timer is .unref()'d inside the service so the event loop is free
+// to exit on SIGINT even if a tick is scheduled.
+const mnCountLogger = createMnCountLogger({
+  repo: mnCountRepo,
+  fetchTotal: async () => {
+    const r = await rpcServices(client.callRpc).masternode_count().call();
+    const total = r && r.total;
+    return Number.isInteger(total) ? total : Number(total);
+  },
+  log: (level, event, meta) => {
+    // eslint-disable-next-line no-console
+    console.log(`[mncount] ${level} ${event}`, meta || '');
+  },
+});
+mnCountLogger.start();
 
 // Boot-time config sanity checks. These throw synchronously so a
 // misconfigured deploy crashes on startup rather than silently turning
@@ -308,7 +349,15 @@ mountAuthAndVault(app, {
 app.use(mnStatsRoute);
 app.use(masternodesRoute);
 app.use(governanceRoute);
-app.use(csvParserRoute);
+app.use(
+  createMnCountRouter({
+    repo: mnCountRepo,
+    log: (level, event, meta) => {
+      // eslint-disable-next-line no-console
+      console.log(`[mncount-route] ${level} ${event}`, meta || '');
+    },
+  })
+);
 app.use(mnListRoute);
 app.use(mnSearchRoute);
 

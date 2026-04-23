@@ -331,3 +331,35 @@ CREATE UNIQUE INDEX idx_proposal_submissions_user_payload_prepared
 CREATE UNIQUE INDEX idx_proposal_submissions_governance_hash
   ON proposal_submissions(governance_hash)
   WHERE governance_hash IS NOT NULL;
+
+-- masternode_count_daily: historical time series of total masternode
+-- count, one row per UTC calendar day, feeding the node-count trend
+-- chart on /mnCount (TrendChart.js). Previously this data lived in
+-- an out-of-repo CSV at /root/sysnode/data.csv that was maintained
+-- by an unsupervised standalone script (mnCount.js) using hardcoded
+-- RPC credentials; the reader (routes/csvParser.js) opened the file
+-- directly, which broke on any host where the daemon hadn't been set
+-- up with root permissions (staging, fresh deploys, self-hosted
+-- mirrors). Moving the store into SQLite eliminates a whole class of
+-- deployment bugs (wrong cwd, missing file, EACCES, crontab-not-
+-- installed) and makes the writer part of the normal pm2-managed
+-- backend lifecycle.
+--
+-- Shape:
+--   date        'YYYY-MM-DD' (UTC). PRIMARY KEY so INSERT OR IGNORE
+--               is the idempotent write — a restart-storm cannot
+--               produce duplicate rows for the same day.
+--   total       snapshot of masternode_count.total at sample time.
+--   recorded_at epoch ms when we actually sampled (for audit; the
+--               chart uses `date`, not this value).
+--
+-- Seeding: the 2018-05-15 → 2026-04-22 historical series from the
+-- legacy CSV is loaded once on first boot by lib/mnCountSeed.js from
+-- db/seeds/masternode-count.csv (idempotent — runs only when the
+-- table is empty). The writer (services/mnCountLogger.js) takes
+-- over from there, appending one row per UTC midnight.
+CREATE TABLE masternode_count_daily (
+  date        TEXT    PRIMARY KEY NOT NULL,
+  total       INTEGER NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
