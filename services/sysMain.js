@@ -25,21 +25,40 @@ const data = require("../data/dataStore");
 //     "block height not found" for projections too far in the future). A
 //     per-sb failure falls back to "To be determined" and does not abort the
 //     whole tick — matching the prior fire-and-forget .catch semantics.
+//   • Watchdog-driven rescheduling. The previous setInterval kept firing
+//     every 20s even when a tick was stuck mid-call. Switching naively to
+//     "await tick(); then schedule next" reintroduces a failure mode where
+//     a hung CoinGecko or RPC socket (no upstream timeout is configured on
+//     the RPC client) freezes the loop forever, so /mnstats stays stale
+//     indefinitely. We instead schedule the next tick from whichever fires
+//     first: tick completion OR a TICK_WATCHDOG_MS timer. A tick generation
+//     counter guards against a stalled tick later resolving and overwriting
+//     a committed payload from a subsequent tick.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BASE_TICK_MS = 20_000;
 const MAX_BACKOFF_MS = 5 * 60_000; // 5 min ceiling
+const TICK_WATCHDOG_MS = 60_000;   // 60s hard cap per tick before forced reschedule
+const COINGECKO_TIMEOUT_MS = 10_000;
 const SUPERBLOCK_INTERVAL = 17520; // mainnet nSuperblockCycle (kept identical to previous logic)
 const GENESIS_HASH = "00000c255f9999002258ddd4d4c86a4b758a5e2ec07e7d69b3e8e7f3fbd44b92";
 
 let currentTickMs = BASE_TICK_MS;
-let lastGoodAt = 0; // ms epoch of the last successful commit (observability / tests)
+let lastGoodAt = 0;         // ms epoch of the last successful commit (observability / tests)
 let tickTimer = null;
 let stopped = false;
+let tickGen = 0;            // monotonically increasing per tick()
+let lastCommittedGen = 0;   // gen of the newest tick that successfully committed
+let lastCompletedGen = 0;   // gen of the newest tick whose result has been published
+                             // (committed OR rejected OR watchdog-abandoned). Used to
+                             // no-op late-arriving results from superseded ticks so a
+                             // stalled tick can't roll back backoff or overwrite data.
+let watchdogFires = 0;      // observability / tests
 
 async function fetchMarketData() {
   const gecko = await axios.get(
-    "https://api.coingecko.com/api/v3/coins/syscoin?tickers=true&market_data=true"
+    "https://api.coingecko.com/api/v3/coins/syscoin?tickers=true&market_data=true",
+    { timeout: COINGECKO_TIMEOUT_MS }
   );
   const m = gecko.data.market_data;
   return {
@@ -151,7 +170,11 @@ async function fetchMasternodeCount() {
   };
 }
 
-async function tick() {
+async function tick(externalGen) {
+  // If the scheduler allocated the generation for us (so the watchdog can
+  // name the same tick we're running), use that; otherwise allocate our
+  // own — this supports direct `tick()` invocation from unit tests.
+  const gen = externalGen !== undefined ? externalGen : ++tickGen;
   try {
     const next = {};
 
@@ -185,15 +208,34 @@ async function tick() {
 
     Object.assign(next, await fetchMasternodeCount());
 
+    // Stale-commit guard. If a newer tick (or the watchdog on our behalf)
+    // has already published a result, our payload is by definition stale:
+    // it may mix values read before the supersession with values read
+    // after, and committing it would also roll back the newer tick's
+    // backoff reset. No-op instead.
+    if (gen <= lastCompletedGen) {
+      return { ok: false, stale: true, gen };
+    }
+
     // Atomic commit: only touch dataStore once the whole payload resolved.
     Object.assign(data, next);
+    lastCommittedGen = gen;
+    lastCompletedGen = gen;
     lastGoodAt = Date.now();
     currentTickMs = BASE_TICK_MS;
-    return { ok: true };
+    return { ok: true, gen };
   } catch (err) {
     console.error("[sysMain]", err.message);
+    // Same guard as the success path: if we've been superseded (newer
+    // commit landed, newer rejection landed, or watchdog already
+    // accounted for us), don't double-apply backoff or overwrite a
+    // newer signal.
+    if (gen <= lastCompletedGen) {
+      return { ok: false, stale: true, err, gen };
+    }
+    lastCompletedGen = gen;
     currentTickMs = Math.min(currentTickMs * 2, MAX_BACKOFF_MS);
-    return { ok: false, err };
+    return { ok: false, err, gen };
   }
 }
 
@@ -206,8 +248,46 @@ function scheduleNext() {
 }
 
 async function runAndReschedule() {
-  await tick();
-  scheduleNext();
+  if (stopped) return;
+
+  // Allocate the tick's generation here so the watchdog and the tick
+  // body refer to the same in-flight tick. If the watchdog fires first
+  // we mark this gen as "completed" (abandoned) so its eventual late
+  // resolution will see itself as stale and no-op cleanly.
+  const gen = ++tickGen;
+
+  // The next tick is scheduled by whichever of these fires first:
+  //  - tick() resolving / rejecting normally (via the finally block)
+  //  - TICK_WATCHDOG_MS elapsing (via the watchdog timer)
+  // rescheduleOnce() ensures we never double-schedule, even if the stuck
+  // tick eventually resolves after the watchdog already fired.
+  let rescheduled = false;
+  function rescheduleOnce() {
+    if (rescheduled || stopped) return;
+    rescheduled = true;
+    scheduleNext();
+  }
+
+  const watchdog = setTimeout(() => {
+    // Only act if this tick hasn't already published a result itself.
+    if (gen > lastCompletedGen) {
+      watchdogFires++;
+      lastCompletedGen = gen;
+      currentTickMs = Math.min(currentTickMs * 2, MAX_BACKOFF_MS);
+      console.error(
+        `[sysMain] tick watchdog fired after ${TICK_WATCHDOG_MS}ms — rescheduling without awaiting the stuck tick`
+      );
+    }
+    rescheduleOnce();
+  }, TICK_WATCHDOG_MS);
+  if (watchdog && typeof watchdog.unref === "function") watchdog.unref();
+
+  // Swallow rejections from the tick so they can't escape as unhandled
+  // promise rejections — tick() already logs + adjusts backoff internally.
+  tick(gen).catch(() => {}).finally(() => {
+    clearTimeout(watchdog);
+    rescheduleOnce();
+  });
 }
 
 function start() {
@@ -226,7 +306,14 @@ function stop() {
 }
 
 function getDiagnostics() {
-  return { currentTickMs, lastGoodAt };
+  return {
+    currentTickMs,
+    lastGoodAt,
+    tickGen,
+    lastCommittedGen,
+    lastCompletedGen,
+    watchdogFires,
+  };
 }
 
 // Test-only: reset module-scope state so a test suite can exercise cold-start
@@ -236,6 +323,10 @@ function getDiagnostics() {
 function __resetForTests() {
   currentTickMs = BASE_TICK_MS;
   lastGoodAt = 0;
+  tickGen = 0;
+  lastCommittedGen = 0;
+  lastCompletedGen = 0;
+  watchdogFires = 0;
   stopped = false;
   if (tickTimer) {
     clearTimeout(tickTimer);
@@ -261,4 +352,5 @@ module.exports = {
   // exported for tests / operators wanting to read configured pacing
   BASE_TICK_MS,
   MAX_BACKOFF_MS,
+  TICK_WATCHDOG_MS,
 };

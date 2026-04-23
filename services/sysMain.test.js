@@ -271,6 +271,136 @@ describe('sysMain periodic aggregator', () => {
     }
   });
 
+  test('CoinGecko call is issued with a timeout option (no indefinite hangs on the HTTP layer)', async () => {
+    primeHappyRpc();
+    await sysMain.tick();
+    expect(axios.get).toHaveBeenCalledWith(
+      expect.stringContaining('api.coingecko.com'),
+      expect.objectContaining({ timeout: expect.any(Number) })
+    );
+    const opts = axios.get.mock.calls[0][1];
+    expect(opts.timeout).toBeGreaterThan(0);
+  });
+
+  test('a stalled tick that eventually resolves is discarded if a newer tick has already committed (stale-gen guard)', async () => {
+    // First: seed a committed snapshot with a distinct sb1 value so we can
+    // detect any late-arriving overwrite.
+    primeHappyRpc();
+    rpc.getGovernanceInfo.mockResolvedValueOnce({
+      lastsuperblock: 2_036_160,
+      nextsuperblock: 2_053_680,
+      proposalfee: 50,
+    });
+    await sysMain.tick();
+    const committedSb1 = data.sb1;
+    const committedGen = sysMain.getDiagnostics().lastCommittedGen;
+    expect(committedGen).toBeGreaterThan(0);
+
+    // Now simulate a stalled tick. We start the stall BEFORE the newer
+    // commit lands — mimicking the watchdog scenario where gen N is still
+    // in flight when gen N+1 starts and commits ahead of it.
+    let releaseStall;
+    const stallPromise = new Promise((resolve) => {
+      releaseStall = resolve;
+    });
+    rpc.masternode_count.mockReturnValueOnce(stallPromise);
+
+    const stalledTick = sysMain.tick(); // gen = committedGen + 1 (N)
+    // Let the stalled tick progress past the non-stalled awaits.
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    // Meanwhile: a subsequent, normal tick (gen = committedGen + 2) runs
+    // to completion and commits fresh values.
+    rpc.getGovernanceInfo.mockResolvedValueOnce({
+      lastsuperblock: 2_036_160,
+      nextsuperblock: 2_071_200,
+      proposalfee: 99,
+    });
+    const freshTick = await sysMain.tick();
+    expect(freshTick.ok).toBe(true);
+    expect(data.proposalFee).toBe(99);
+    expect(data.sb1).not.toBe(committedSb1); // nextsuperblock rotated
+
+    const newCommittedSb1 = data.sb1;
+    const newCommittedProposalFee = data.proposalFee;
+
+    // Now release the stalled tick. It should observe gen <= lastCommittedGen
+    // and return without touching dataStore.
+    releaseStall({ total: 9999, enabled: 9999 });
+    const stalledResult = await stalledTick;
+    expect(stalledResult.ok).toBe(false);
+    expect(stalledResult.stale).toBe(true);
+
+    // Fresh commit is preserved — no late-arriving rollback.
+    expect(data.sb1).toBe(newCommittedSb1);
+    expect(data.proposalFee).toBe(newCommittedProposalFee);
+    expect(data.mnTotal).not.toBe(9999);
+  });
+
+  test('a late-rejecting stalled tick does NOT undo backoff nor touch dataStore', async () => {
+    // Commit a good snapshot first.
+    primeHappyRpc();
+    await sysMain.tick();
+    const goodSb1 = data.sb1;
+
+    // Stall, then supersede with another tick that FAILS so backoff advances.
+    let rejectStall;
+    rpc.masternode_count.mockReturnValueOnce(
+      new Promise((_, reject) => {
+        rejectStall = reject;
+      })
+    );
+    const stalledTick = sysMain.tick();
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+
+    axios.get.mockRejectedValueOnce(new Error('Request failed with status code 429'));
+    const freshFail = await sysMain.tick();
+    expect(freshFail.ok).toBe(false);
+    const backoffAfterFreshFail = sysMain.getDiagnostics().currentTickMs;
+    expect(backoffAfterFreshFail).toBeGreaterThan(sysMain.BASE_TICK_MS);
+
+    // Now let the stalled tick reject late.
+    rejectStall(new Error('masternode_count timed out'));
+    const stalledResult = await stalledTick;
+    expect(stalledResult.ok).toBe(false);
+
+    // dataStore unchanged relative to the most recent good commit.
+    expect(data.sb1).toBe(goodSb1);
+    // Backoff not double-applied by the late rejection.
+    expect(sysMain.getDiagnostics().currentTickMs).toBe(backoffAfterFreshFail);
+  });
+
+  test('watchdog reschedules the next tick even if the current one never resolves', async () => {
+    jest.useFakeTimers();
+    try {
+      primeHappyRpc();
+      // Make masternode_count never resolve — simulating a stuck RPC socket.
+      rpc.masternode_count.mockReturnValueOnce(new Promise(() => {}));
+
+      sysMain.start();
+      // Let the first kick-off microtasks drain.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(sysMain.getDiagnostics().watchdogFires).toBe(0);
+
+      // Advance fake time past the watchdog.
+      jest.advanceTimersByTime(sysMain.TICK_WATCHDOG_MS + 100);
+      await Promise.resolve();
+
+      expect(sysMain.getDiagnostics().watchdogFires).toBe(1);
+      // Backoff must have advanced since this tick never committed.
+      expect(sysMain.getDiagnostics().currentTickMs).toBeGreaterThan(sysMain.BASE_TICK_MS);
+      // And a next tick must have been scheduled.
+      expect(jest.getTimerCount()).toBeGreaterThan(0);
+    } finally {
+      sysMain.stop();
+      jest.useRealTimers();
+    }
+  });
+
   test('consecutive failures apply exponential backoff up to MAX_BACKOFF_MS', async () => {
     axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
     // Run many ticks and confirm the delay never exceeds MAX_BACKOFF_MS and
