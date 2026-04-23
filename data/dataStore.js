@@ -27,6 +27,7 @@ module.exports = {
     proposalFee: 0,
     budget: 0,
     superBlockNextDate: 0,
+    superBlockNextEpochSec: 0,
     votingDeadlineDate: 0,
     sb1: 0,
     sb2: 0,

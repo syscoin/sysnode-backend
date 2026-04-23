@@ -95,6 +95,11 @@ function calculations() {
       proposal_fee: data.proposalFee,
       budget: data.budget,
       superblock_date: data.superBlockNextDate,
+      // Numeric next-superblock epoch (UNIX seconds). Callers that
+      // need a machine-readable anchor (governance wizard window
+      // derivation, etc.) should use this instead of parsing the
+      // human-formatted `superblock_date` string.
+      superblock_next_epoch_sec: data.superBlockNextEpochSec || 0,
       voting_deadline: data.votingDeadlineDate,
       sb1: "SB" + data.sb1 / sbTotal + " - " + data.sb1,
       sb2: "SB" + data.sb2 / sbTotal + " - " + data.sb2,

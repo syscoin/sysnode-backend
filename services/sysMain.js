@@ -70,6 +70,12 @@ setInterval(async function sysMain() {
     const diffBlock = data.nextSuperBlock - data.currentBlock;
     const sbDate = Date.now() + diffBlock * data.avgBlockTime;
     data.superBlockNextDate = moment(sbDate).format("MMMM Do YYYY, h:mm:ss a");
+    // Raw next-superblock epoch (UNIX seconds) for API consumers that
+    // need a numeric anchor instead of the human-formatted string
+    // (e.g. the /governance/new wizard's computeProposalWindow).
+    // Kept alongside the formatted date so the two stay in sync
+    // whenever sbDate is recomputed.
+    data.superBlockNextEpochSec = Math.floor(sbDate / 1000);
 
     const voteDeadlineBlock = data.nextSuperBlock - 1728;
     const voteDeadlineDate = Date.now() + (voteDeadlineBlock - data.currentBlock) * data.avgBlockTime;
