@@ -393,14 +393,27 @@ const reminderDispatcher = createReminderDispatcher({
     }
     return out;
   },
-  // Next-superblock anchor: read from the in-memory dataStore that
-  // sysMain refreshes every 20s. A missing / stale value surfaces
-  // as `skipped: 'next_superblock_unavailable'` in the tick result
-  // and the dispatcher retries on the next interval — this is
-  // correct behavior on a cold boot (sysMain hasn't completed its
-  // first pass yet) or when RPC is briefly unreachable.
-  getNextSuperblockEpochSec: async () =>
-    Number(dataStore.superBlockNextEpochSec) || 0,
+  // Next-superblock snapshot: { height, epochSec } read atomically
+  // from the in-memory dataStore (sysMain refreshes every 20s).
+  //
+  //   - `height` is Core's nextSuperBlock block number. It is
+  //     STABLE — it only changes when the SB actually executes and
+  //     jumps by exactly nSuperblockCycle (17520 mainnet). The
+  //     dispatcher uses it for scopeKey so reminderLog.has()
+  //     deduplicates correctly across the 72h reminder window.
+  //   - `epochSec` is sysMain's `Date.now() + diffBlock * avgBlockTime`
+  //     estimate of when the SB will occur. It DRIFTS every 20s
+  //     and is used for time-remaining calculations only (bucket
+  //     thresholds are in hours so minute-scale drift is fine).
+  //
+  // Missing / stale / zero values surface as
+  // `skipped: 'next_superblock_unavailable'` and the dispatcher
+  // retries on the next hourly tick — correct behavior on cold
+  // boot (sysMain hasn't completed its first pass) or RPC hiccups.
+  getNextSuperblock: async () => ({
+    height: Number(dataStore.nextSuperBlock) | 0,
+    epochSec: Number(dataStore.superBlockNextEpochSec) || 0,
+  }),
   log: (level, event, meta) => {
     // eslint-disable-next-line no-console
     console.log(`[reminder] ${level} ${event}`, meta || '');
