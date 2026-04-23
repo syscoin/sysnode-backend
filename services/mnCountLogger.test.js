@@ -179,18 +179,25 @@ describe('createMnCountLogger', () => {
     expect(logs.some((l) => l.event === 'mncount_catchup_failed')).toBe(true);
   });
 
-  test('repeated writes for the same UTC date are idempotent (PK on date)', async () => {
-    setup({ rpcSequence: [2200, 2201], startAtIso: '2024-03-15T12:00:00Z' });
+  test('repeated writes for the same UTC date are idempotent (skip + PK on date)', async () => {
+    setup({ rpcSequence: [2200], startAtIso: '2024-03-15T12:00:00Z' });
     await logger.catchUpIfNeeded();
-    // Simulate an erroneous second write attempt from the same UTC day
-    // (e.g. if the schedule fired twice due to a long event-loop stall).
-    // The repo must drop the second write entirely — NOT overwrite the
-    // first row's total with a newer sample.
+
+    // First layer of protection: once today's row is recorded,
+    // runAndReschedule MUST skip the RPC entirely rather than
+    // refetch and overwrite. That keeps the 00:00 snapshot
+    // authoritative and stops a long event-loop stall / spurious
+    // re-fire from shadowing it with an afternoon value.
     clock.nowMs = msAt('2024-03-15T18:00:00Z');
     await logger.runAndReschedule();
-    const rows = repo.getAll();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toEqual({ date: '2024-03-15', users: 2200 });
+    expect(fetchTotal).toHaveBeenCalledTimes(1);
+    expect(repo.getAll()).toEqual([{ date: '2024-03-15', users: 2200 }]);
+
+    // Second layer of protection: even if the skip logic were ever
+    // bypassed, the PK on `date` via INSERT OR IGNORE collapses the
+    // duplicate write without overwriting the first row's total.
+    repo.upsertByDate('2024-03-15', 9999, msAt('2024-03-15T18:00:00Z'));
+    expect(repo.getAll()).toEqual([{ date: '2024-03-15', users: 2200 }]);
   });
 
   test('start() catches up, then schedules the next tick at midnight+skew', async () => {
@@ -224,6 +231,70 @@ describe('createMnCountLogger', () => {
     for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
     expect(fetchTotal).not.toHaveBeenCalled();
     expect(scheduler.pending()).toHaveLength(1);
+  });
+
+  test('start() with RPC down retries inside the same UTC day (Codex PR16 P2)', async () => {
+    // Boot at 06:00 UTC — 18 hours of headroom until next midnight.
+    // First RPC call fails (e.g. syscoind still warming up after a
+    // joint pm2 restart); the logger MUST schedule a retry that
+    // fires BEFORE midnight rather than silently deferring today's
+    // sample and losing the row entirely. Previously start()
+    // always armed for next midnight regardless of catch-up
+    // outcome, which is exactly the bug Codex flagged.
+    setup({
+      rpcSequence: [new Error('rpc down at boot'), 2500],
+      startAtIso: '2024-03-15T06:00:00Z',
+    });
+    logger.start();
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+
+    // The scheduled retry must be strictly inside today's UTC
+    // window, never the 18h-away next-midnight delay.
+    const pending = scheduler.pending();
+    expect(pending).toHaveLength(1);
+    const eighteenHoursFiveSec = 18 * 3600 * 1000 + POST_MIDNIGHT_SKEW_MS;
+    expect(pending[0].delay).toBeLessThan(eighteenHoursFiveSec);
+    expect(pending[0].delay).toBeGreaterThan(0);
+    expect(repo.isEmpty()).toBe(true);
+    expect(logs.some((l) => l.event === 'mncount_tick_failed')).toBe(true);
+
+    // Fire the retry: RPC has recovered, today's row is captured,
+    // and the logger arms for next midnight (not another retry).
+    await scheduler.fireNext();
+    expect(repo.getAll()).toEqual([{ date: '2024-03-15', users: 2500 }]);
+    const afterSuccess = scheduler.pendingDelays();
+    expect(afterSuccess).toHaveLength(1);
+    // Post-success from roughly 06:02Z, next midnight is ~18h out.
+    expect(afterSuccess[0]).toBeGreaterThan(17 * 3600 * 1000);
+  });
+
+  test('start() keeps backing off on repeated RPC failure, still inside today', async () => {
+    // Three sequential failures early in a UTC day must all
+    // schedule retries inside the same day rather than skipping
+    // ahead to the next midnight. Exponential growth is capped
+    // by the until-midnight clamp.
+    setup({
+      rpcSequence: [
+        new Error('boot RPC fail 1'),
+        new Error('retry RPC fail 2'),
+        new Error('retry RPC fail 3'),
+      ],
+      startAtIso: '2024-03-15T06:00:00Z',
+    });
+    logger.start();
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+
+    const untilMidnightFromBoot = 18 * 3600 * 1000 + POST_MIDNIGHT_SKEW_MS;
+    expect(scheduler.pendingDelays()[0]).toBeLessThan(untilMidnightFromBoot);
+
+    await scheduler.fireNext(); // 2nd failure
+    expect(scheduler.pendingDelays()[0]).toBeLessThan(untilMidnightFromBoot);
+
+    await scheduler.fireNext(); // 3rd failure
+    expect(scheduler.pendingDelays()[0]).toBeLessThanOrEqual(
+      msUntilNextMidnightUtc(clock.nowMs)
+    );
+    expect(repo.isEmpty()).toBe(true);
   });
 
   test('scheduled tick writes the new day and re-arms for the following midnight', async () => {

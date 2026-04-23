@@ -127,6 +127,21 @@ function createMnCountLogger({
 
   async function runAndReschedule() {
     if (stopped) return;
+
+    // Fast-path: if today's row is already there (boot after a
+    // successful earlier tick, or a spurious re-fire on the same
+    // UTC day) skip the RPC entirely and arm for next midnight.
+    // The INSERT OR IGNORE in the repo would collapse a duplicate
+    // write anyway, but avoiding the RPC call keeps Core's load
+    // bounded and stops a same-day re-sample from shadowing the
+    // 00:00 snapshot with an afternoon value at the log layer.
+    const today = utcDateString(now());
+    if (repo.getLatestDate() === today) {
+      if (stopped) return;
+      schedule(msUntilNextMidnightUtc(now()));
+      return;
+    }
+
     try {
       await sampleAndWrite('tick');
       if (stopped) return;
@@ -144,6 +159,11 @@ function createMnCountLogger({
     }
   }
 
+  // Exposed for tests / one-shot callers that just want the
+  // "sample today if missing" decision without starting the
+  // scheduler loop. The production boot path funnels through
+  // runAndReschedule() instead so a boot-time failure is retried
+  // with backoff before midnight (Codex PR16 P2).
   async function catchUpIfNeeded() {
     const today = utcDateString(now());
     const latest = repo.getLatestDate();
@@ -164,16 +184,19 @@ function createMnCountLogger({
     if (started) return;
     started = true;
     stopped = false;
-    // Fire catch-up, then schedule the next midnight tick regardless
-    // of catch-up outcome. We MUST check `stopped` inside the
-    // .finally() — a stop() between start() and catch-up resolution
-    // must not leave a stray timer behind.
-    catchUpIfNeeded()
-      .catch(() => {})
-      .finally(() => {
-        if (stopped) return;
-        schedule(msUntilNextMidnightUtc(now()));
-      });
+    // Route the boot path through runAndReschedule() so all three
+    // outcomes are handled uniformly by the scheduler:
+    //   * today already recorded     → arm for next midnight.
+    //   * sample succeeds now        → write, arm for next midnight.
+    //   * sample fails now           → backoff retry, clamped to
+    //                                  stay inside this UTC day.
+    // The previous arrangement always armed for next midnight after
+    // catch-up, so a transient RPC blip at boot would lose today
+    // permanently instead of retrying (Codex PR16 P2).
+    runAndReschedule().catch((err) => {
+      lastError = err && err.message;
+      log('error', 'mncount_start_failed', { err: err && err.message });
+    });
   }
 
   function stop() {
