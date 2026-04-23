@@ -71,6 +71,7 @@ const express = require('express');
 
 const proposalValidate = require('../lib/proposalValidate');
 const { computeProposalHash } = require('../lib/proposalHash');
+const { RATE_LIMIT_CORE_ERROR } = require('../lib/proposalDispatcher');
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
@@ -1449,6 +1450,20 @@ function createGovProposalsRouter({
   //                                  (source row isn't failed — we
   //                                   never clone a live submission
   //                                   the user is still paying off)
+  //   409 conflict: rate_limited_failure
+  //                                  (source row failed because Core
+  //                                   rejected the submit with its
+  //                                   per-cycle object-creation rate
+  //                                   limit — the object hash is
+  //                                   burned for this cycle and a
+  //                                   fresh 150-SYS burn against the
+  //                                   same limit won't help. We
+  //                                   refuse the clone here as
+  //                                   defense-in-depth behind the
+  //                                   frontend's matching suppression
+  //                                   so a direct API caller can't
+  //                                   loop themselves into repeated
+  //                                   collateral burns.)
   //   409 conflict: draft_limit      (user already at maxDraftsPerUser)
   //   500 internal                   (unexpected)
   // -----------------------------------------------------------------
@@ -1479,6 +1494,37 @@ function createGovProposalsRouter({
           e.__http = {
             status: 409,
             body: { error: 'conflict', reason: 'status_not_failed' },
+          };
+          throw e;
+        }
+
+        // Core's per-cycle governance-object rate limit is burned
+        // against the object hash for the current superblock window.
+        // Cloning into a new draft would walk the user into another
+        // 150-SYS collateral burn against the same limit — the new
+        // submission would also fail with the same reject, and the
+        // new burn is non-recoverable. The frontend suppresses the
+        // "Edit details and start over" button when it classifies
+        // failDetail as `rate_limited`, so the expected call-site
+        // never reaches us; this guard is defense-in-depth for
+        // direct API callers and for any classifier drift.
+        //
+        // We classify via the same RATE_LIMIT_CORE_ERROR regex the
+        // dispatcher uses to decide terminal-vs-transient so the two
+        // paths can never disagree on what "rate-limited failure"
+        // means. Scoped to failReason='submit_rejected' because
+        // that's the reason the dispatcher stamps when Core itself
+        // rejects the submit; other reasons (collateral_not_found,
+        // duplicate_governance_hash, etc.) are legitimately editable.
+        if (
+          sub.failReason === 'submit_rejected' &&
+          typeof sub.failDetail === 'string' &&
+          RATE_LIMIT_CORE_ERROR.test(sub.failDetail)
+        ) {
+          const e = new Error('rate_limited_failure');
+          e.__http = {
+            status: 409,
+            body: { error: 'conflict', reason: 'rate_limited_failure' },
           };
           throw e;
         }

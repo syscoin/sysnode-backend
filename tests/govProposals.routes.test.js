@@ -1704,6 +1704,70 @@ describe('submissions lifecycle', () => {
     expect(list.body.drafts.some((r) => r.id === d.id)).toBe(true);
   });
 
+  test('clone-to-draft: rate-limited failure → 409 rate_limited_failure, source untouched', async () => {
+    // Regression: the dispatcher persists Core\'s per-cycle object-
+    // creation rate-limit reject as failReason=\'submit_rejected\' with
+    // the verbatim error phrase in failDetail. Cloning into a new
+    // draft would push the user into another 150 SYS burn against
+    // the same limit, which is unrecoverable for this cycle. The
+    // endpoint must refuse the clone and leave the failed row in
+    // place so the user retains context. The frontend already
+    // suppresses the "Edit details and start over" button for this
+    // class, so this guard is defense-in-depth against direct API
+    // callers and classifier drift.
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    ctx.submissions.markFailed(prep.submission.id, {
+      reason: 'submit_rejected',
+      detail:
+        'gobject(submit): Object creation rate limit exceeded (wait for the next superblock cycle)',
+    });
+    const res = await agent
+      .post(
+        `/gov/proposals/submissions/${prep.submission.id}/clone-to-draft`
+      )
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(res.status).toBe(409);
+    expect(res.body.reason).toBe('rate_limited_failure');
+    // Source submission is still present and still `failed` — the
+    // transaction rolled back cleanly without leaking a ghost
+    // draft.
+    const stillThere = await agent.get(
+      `/gov/proposals/submissions/${prep.submission.id}`
+    );
+    expect(stillThere.status).toBe(200);
+    expect(stillThere.body.submission.status).toBe('failed');
+    // And no new draft was created.
+    const list = await agent.get('/gov/proposals/drafts');
+    expect(list.status).toBe(200);
+    expect(list.body.drafts).toEqual([]);
+  });
+
+  test('clone-to-draft: non-rate-limited submit_rejected (e.g. invalid parent) still clones', async () => {
+    // Complement to the rate-limit guard above: other flavours of
+    // submit_rejected (invalid parent hash, duplicate hash, etc.)
+    // are legitimately editable — the user can fix the content or
+    // wait for the ancestor to clear and re-submit with a fresh
+    // collateral burn. Make sure the guard is scoped to the
+    // rate-limit pattern only, not everything tagged
+    // submit_rejected.
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const prep = await prepareOne(agent, csrf);
+    ctx.submissions.markFailed(prep.submission.id, {
+      reason: 'submit_rejected',
+      detail: 'gobject(submit): Invalid parent hash (0000...)',
+    });
+    const res = await agent
+      .post(
+        `/gov/proposals/submissions/${prep.submission.id}/clone-to-draft`
+      )
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(res.status).toBe(201);
+    expect(res.body.draft).toBeTruthy();
+  });
+
   test('clone-to-draft: prepared source → 409 status_not_failed', async () => {
     const { agent, csrf } = await loggedInAgent(ctx);
     const prep = await prepareOne(agent, csrf);
