@@ -71,6 +71,7 @@ const express = require('express');
 
 const proposalValidate = require('../lib/proposalValidate');
 const { computeProposalHash } = require('../lib/proposalHash');
+const { RATE_LIMIT_CORE_ERROR } = require('../lib/proposalDispatcher');
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
@@ -1417,6 +1418,178 @@ function createGovProposalsRouter({
         .json({ error: 'conflict', reason: 'status_not_deletable' });
     }
     return res.status(204).end();
+  });
+
+  // -----------------------------------------------------------------
+  // POST /gov/proposals/submissions/:id/clone-to-draft
+  //
+  // "Start over with these details" action for a FAILED submission.
+  //
+  // Why this exists: once a submission row reaches `failed` there is
+  // no in-place recovery — the on-chain 150 SYS collateral burn is
+  // bound to that row's `proposal_hash` by consensus, and any of the
+  // terminal failure modes (Core rejected at submit, collateral
+  // never found, governance hash clash) require a fresh submission
+  // with a fresh collateral burn. Asking the user to retype every
+  // field is a UX cliff; instead we let them open the wizard
+  // pre-filled with their own inputs and edit whatever needed to
+  // change.
+  //
+  // Atomicity: creating the draft AND deleting the failed submission
+  // must be one commit. If the draft landed but the delete lost to
+  // a race (or crashed the process), the user's dashboard would
+  // show BOTH the old failed row AND a new draft carrying the same
+  // fields — confusing at best, and tempting them to prepare twice
+  // concurrently. `runAtomic` gives us a single SQLite transaction.
+  //
+  // Input:  none (body ignored).
+  // Output: 201 { draft }
+  // Errors:
+  //   404 not_found                  (unknown / other user's row)
+  //   409 conflict: status_not_failed
+  //                                  (source row isn't failed — we
+  //                                   never clone a live submission
+  //                                   the user is still paying off)
+  //   409 conflict: rate_limited_failure
+  //                                  (source row failed because Core
+  //                                   rejected the submit with its
+  //                                   per-cycle object-creation rate
+  //                                   limit — the object hash is
+  //                                   burned for this cycle and a
+  //                                   fresh 150-SYS burn against the
+  //                                   same limit won't help. We
+  //                                   refuse the clone here as
+  //                                   defense-in-depth behind the
+  //                                   frontend's matching suppression
+  //                                   so a direct API caller can't
+  //                                   loop themselves into repeated
+  //                                   collateral burns.)
+  //   409 conflict: draft_limit      (user already at maxDraftsPerUser)
+  //   500 internal                   (unexpected)
+  // -----------------------------------------------------------------
+  router.post('/submissions/:id/clone-to-draft', (req, res) => {
+    const userId = req.user.id;
+    const id = parseIntId(req.params.id);
+    if (!id) return res.status(404).json({ error: 'not_found' });
+
+    try {
+      // Capture both the draft we created and any conflict we need
+      // to report. Throwing inside `runAtomic` rolls back the txn;
+      // we convert the thrown sentinel into the appropriate HTTP
+      // response AFTER the transaction boundary so callers never
+      // see a partially-committed state.
+      const result = runAtomic(() => {
+        const sub = submissions.getByIdForUser(id, userId);
+        if (!sub) {
+          const e = new Error('not_found');
+          e.__http = { status: 404, body: { error: 'not_found' } };
+          throw e;
+        }
+        if (sub.status !== 'failed') {
+          // Only failed rows are clonable. Prepared / awaiting_collateral
+          // submissions still have an in-flight recovery path
+          // (attach a txid, wait for confs). Submitted rows are
+          // terminal-success and cloning would just spam the wizard.
+          const e = new Error('status_not_failed');
+          e.__http = {
+            status: 409,
+            body: { error: 'conflict', reason: 'status_not_failed' },
+          };
+          throw e;
+        }
+
+        // Core's per-cycle governance-object rate limit is burned
+        // against the object hash for the current superblock window.
+        // Cloning into a new draft would walk the user into another
+        // 150-SYS collateral burn against the same limit — the new
+        // submission would also fail with the same reject, and the
+        // new burn is non-recoverable. The frontend suppresses the
+        // "Edit details and start over" button when it classifies
+        // failDetail as `rate_limited`, so the expected call-site
+        // never reaches us; this guard is defense-in-depth for
+        // direct API callers and for any classifier drift.
+        //
+        // We classify via the same RATE_LIMIT_CORE_ERROR regex the
+        // dispatcher uses to decide terminal-vs-transient so the two
+        // paths can never disagree on what "rate-limited failure"
+        // means. Scoped to failReason='submit_rejected' because
+        // that's the reason the dispatcher stamps when Core itself
+        // rejects the submit; other reasons (collateral_not_found,
+        // duplicate_governance_hash, etc.) are legitimately editable.
+        if (
+          sub.failReason === 'submit_rejected' &&
+          typeof sub.failDetail === 'string' &&
+          RATE_LIMIT_CORE_ERROR.test(sub.failDetail)
+        ) {
+          const e = new Error('rate_limited_failure');
+          e.__http = {
+            status: 409,
+            body: { error: 'conflict', reason: 'rate_limited_failure' },
+          };
+          throw e;
+        }
+
+        // Respect the per-user draft cap so this path can't be used
+        // as a back-door to bypass the limit enforced on POST /drafts.
+        const count = drafts.countForUser(userId);
+        if (count >= maxDraftsPerUser) {
+          const e = new Error('draft_limit');
+          e.__http = {
+            status: 409,
+            body: { error: 'conflict', reason: 'draft_limit' },
+          };
+          throw e;
+        }
+
+        // Map submission camelCase fields → drafts repo snake_case
+        // patch. `description` isn't stored on the submission so we
+        // create a blank description (users can fill one in on the
+        // new draft if they want). `paymentAmountSats` arrives here
+        // as a BigInt from the submissions mapRow, which the drafts
+        // repo accepts via its toBigIntSats helper.
+        const draftRow = drafts.create(userId, {
+          title: sub.title || '',
+          name: sub.name || '',
+          url: sub.url || '',
+          description: '',
+          payment_address: sub.paymentAddress || '',
+          payment_amount_sats: sub.paymentAmountSats,
+          payment_count: sub.paymentCount,
+          start_epoch: sub.startEpoch,
+          end_epoch: sub.endEpoch,
+        });
+
+        const removed = submissions.remove(id, userId);
+        if (Number(removed) === 0) {
+          // The partial DELETE in proposalSubmissions.remove only
+          // touches rows still in 'prepared' or 'failed'. A race
+          // where another worker transitioned this row out of
+          // 'failed' between our pre-read and the delete is
+          // practically impossible (failed is terminal in the
+          // state machine), but we defend against it anyway so a
+          // future state-machine extension can't create a ghost
+          // draft pointing at a submission we couldn't actually
+          // remove.
+          const e = new Error('status_not_failed');
+          e.__http = {
+            status: 409,
+            body: { error: 'conflict', reason: 'status_not_failed' },
+          };
+          throw e;
+        }
+
+        return draftRow;
+      });
+
+      return res.status(201).json({ draft: jsonDraft(result) });
+    } catch (err) {
+      if (err && err.__http) {
+        return res.status(err.__http.status).json(err.__http.body);
+      }
+      // eslint-disable-next-line no-console
+      console.error('[POST /gov/proposals/submissions/:id/clone-to-draft]', err);
+      return res.status(500).json({ error: 'internal' });
+    }
   });
 
   return router;
