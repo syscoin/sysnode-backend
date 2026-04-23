@@ -73,6 +73,11 @@ let currentTickMs = BASE_TICK_MS;
 let lastGoodAt = 0;         // ms epoch of the last successful commit (observability / tests)
 let tickTimer = null;
 let stopped = false;
+let started = false;        // idempotency guard for start(); set synchronously so two
+                             // near-simultaneous start() calls can't both spawn
+                             // independent scheduler loops (tickTimer alone is not
+                             // sufficient because runAndReschedule() only sets it
+                             // after the in-flight tick finishes / the watchdog fires)
 let tickGen = 0;            // monotonically increasing per tick()
 let lastCommittedGen = 0;   // gen of the newest tick that successfully committed
 let lastCompletedGen = 0;   // gen of the newest tick whose result has been published
@@ -340,7 +345,8 @@ async function runAndReschedule() {
 }
 
 function start() {
-  if (tickTimer) return;
+  if (started) return;
+  started = true;
   stopped = false;
   // Kick off immediately; scheduleNext() will then use currentTickMs.
   runAndReschedule();
@@ -348,6 +354,7 @@ function start() {
 
 function stop() {
   stopped = true;
+  started = false;
   if (tickTimer) {
     clearTimeout(tickTimer);
     tickTimer = null;
@@ -377,6 +384,7 @@ function __resetForTests() {
   lastCompletedGen = 0;
   watchdogFires = 0;
   stopped = false;
+  started = false;
   if (tickTimer) {
     clearTimeout(tickTimer);
     tickTimer = null;

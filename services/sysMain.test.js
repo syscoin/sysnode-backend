@@ -462,6 +462,30 @@ describe('sysMain periodic aggregator', () => {
     }
   });
 
+  test('start() is idempotent even across near-simultaneous calls (no duplicate scheduler loops — Codex round 3 P2)', async () => {
+    // Make the tick stall immediately on the first RPC so neither the tick
+    // nor scheduleNext() has a chance to set tickTimer before the second
+    // start() runs — this is the exact race Codex flagged.
+    axios.get.mockReturnValue(new Promise(() => {})); // hang forever
+
+    expect(sysMain.getDiagnostics().tickGen).toBe(0);
+
+    sysMain.start();
+    sysMain.start();
+    sysMain.start();
+
+    // Let initial microtasks drain (runAndReschedule is async but its
+    // side effects including ++tickGen happen synchronously-ish).
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    // Exactly one runAndReschedule loop should have kicked off, so exactly
+    // one tick generation should have been allocated.
+    expect(sysMain.getDiagnostics().tickGen).toBe(1);
+
+    // And exactly one CoinGecko call should have fired (one tick, one gecko fetch).
+    expect(axios.get).toHaveBeenCalledTimes(1);
+  });
+
   test('consecutive failures apply exponential backoff up to MAX_BACKOFF_MS', async () => {
     axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
     // Run many ticks and confirm the delay never exceeds MAX_BACKOFF_MS and
