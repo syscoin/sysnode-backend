@@ -358,12 +358,21 @@ const reminderDispatcher = createReminderDispatcher({
   voteReceipts: services.voteReceipts,
   reminderLog,
   mailer,
-  // Shape: [{ hash, endEpoch }]. gObject_list returns a map keyed by
-  // gov-object hash, with `DataString` containing the per-proposal
-  // JSON that has end_epoch (unix seconds). We project here rather
-  // than inside the dispatcher because the RPC shape is a
-  // server-side concern (the dispatcher contract is the normalized
-  // shape).
+  // Shape: [{ hash, startEpoch, endEpoch }]. gObject_list returns a
+  // map keyed by gov-object hash, with `DataString` containing the
+  // per-proposal JSON that has start_epoch + end_epoch (unix
+  // seconds). We project here rather than inside the dispatcher
+  // because the RPC shape is a server-side concern (the dispatcher
+  // contract is the normalized shape).
+  //
+  // Both start_epoch and end_epoch are forwarded so the dispatcher
+  // can filter proposals by SB-eligibility
+  // (startEpoch <= nextSbEpochSec <= endEpoch). A missing
+  // start_epoch defaults to 0 inside normalizeProposal, which the
+  // eligibility check treats as "no lower bound" — that keeps any
+  // legacy DataString payload (from clients that predate the
+  // derive-window wizard) in the cycle rather than silently
+  // dropping it.
   getActiveProposals: async () => {
     const raw = await rpcServices(client.callRpc).gObject_list().call();
     const out = [];
@@ -377,10 +386,34 @@ const reminderDispatcher = createReminderDispatcher({
       }
       const endEpoch = Number(data && data.end_epoch);
       if (!Number.isFinite(endEpoch) || endEpoch <= 0) continue;
-      out.push({ hash: entry.Hash, endEpoch });
+      const rawStart = Number(data && data.start_epoch);
+      const startEpoch =
+        Number.isFinite(rawStart) && rawStart > 0 ? rawStart : 0;
+      out.push({ hash: entry.Hash, startEpoch, endEpoch });
     }
     return out;
   },
+  // Next-superblock snapshot: { height, epochSec } read atomically
+  // from the in-memory dataStore (sysMain refreshes every 20s).
+  //
+  //   - `height` is Core's nextSuperBlock block number. It is
+  //     STABLE — it only changes when the SB actually executes and
+  //     jumps by exactly nSuperblockCycle (17520 mainnet). The
+  //     dispatcher uses it for scopeKey so reminderLog.has()
+  //     deduplicates correctly across the 72h reminder window.
+  //   - `epochSec` is sysMain's `Date.now() + diffBlock * avgBlockTime`
+  //     estimate of when the SB will occur. It DRIFTS every 20s
+  //     and is used for time-remaining calculations only (bucket
+  //     thresholds are in hours so minute-scale drift is fine).
+  //
+  // Missing / stale / zero values surface as
+  // `skipped: 'next_superblock_unavailable'` and the dispatcher
+  // retries on the next hourly tick — correct behavior on cold
+  // boot (sysMain hasn't completed its first pass) or RPC hiccups.
+  getNextSuperblock: async () => ({
+    height: Number(dataStore.nextSuperBlock) | 0,
+    epochSec: Number(dataStore.superBlockNextEpochSec) || 0,
+  }),
   log: (level, event, meta) => {
     // eslint-disable-next-line no-console
     console.log(`[reminder] ${level} ${event}`, meta || '');
