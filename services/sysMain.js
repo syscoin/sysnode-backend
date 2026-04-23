@@ -40,8 +40,34 @@ const BASE_TICK_MS = 20_000;
 const MAX_BACKOFF_MS = 5 * 60_000; // 5 min ceiling
 const TICK_WATCHDOG_MS = 60_000;   // 60s hard cap per tick before forced reschedule
 const COINGECKO_TIMEOUT_MS = 10_000;
+// Per-RPC timeout for getSuperblockBudget. The SyscoinRpcClient has no
+// configurable socket timeout, so any individual call that hangs would
+// sit inside Promise.allSettled until the outer tick watchdog fires and
+// abandons the whole tick. With five projected-sb calls and a single
+// repeatedly-hanging height, every generation would get abandoned and
+// /mnstats would stop refreshing even though market/chain/governance
+// reads all succeeded. A per-call race forces each projected budget
+// lookup to fall back to "To be determined" after this deadline.
+const SB_BUDGET_TIMEOUT_MS = 5_000;
 const SUPERBLOCK_INTERVAL = 17520; // mainnet nSuperblockCycle (kept identical to previous logic)
 const GENESIS_HASH = "00000c255f9999002258ddd4d4c86a4b758a5e2ec07e7d69b3e8e7f3fbd44b92";
+
+// Promise.race a work-promise against a timeout timer. The timer is unref'd
+// so it can never keep the event loop alive on its own, and is cleared on
+// either outcome so GC collects it promptly.
+function withTimeout(promise, ms, label) {
+  let timerHandle;
+  const timeout = new Promise((_, reject) => {
+    timerHandle = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms
+    );
+    if (timerHandle && typeof timerHandle.unref === "function") timerHandle.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timerHandle) clearTimeout(timerHandle);
+  });
+}
 
 let currentTickMs = BASE_TICK_MS;
 let lastGoodAt = 0;         // ms epoch of the last successful commit (observability / tests)
@@ -92,15 +118,27 @@ async function fetchChainHead() {
   }
   const blockData = await rpcServices(client.callRpc).getBlock(blockHash).call();
   const nowTime = blockData.time;
+  // Pin the chain-head height BEFORE the one-day-ago retry below. The
+  // original pre-refactor implementation wrote `data.currentBlock = block`
+  // at exactly this point, so a later failure in the one-day-ago loop
+  // (which also decrements `block`) never polluted currentBlock. The
+  // refactor returns this at the end of the function, so we must capture
+  // the head here to preserve that invariant — otherwise a transient
+  // getBlockHash failure would lower currentBlock and skew
+  // superBlockNextEpochSec / voting-deadline math in the committed
+  // snapshot (Codex round 2 P2).
+  const currentBlock = block;
 
-  const oneDayAgoBlock = block - 576;
+  const oneDayAgoBlock = currentBlock - 576;
   let hashOneDayAgo;
-  while (block > 0) {
+  // Separate retry cursor so decrements here never affect currentBlock.
+  let cursor = currentBlock;
+  while (cursor > 0) {
     try {
       hashOneDayAgo = await rpcServices(client.callRpc).getBlockHash(oneDayAgoBlock).call();
       break;
     } catch {
-      block--;
+      cursor--;
     }
   }
   const blockOneDayAgo = await rpcServices(client.callRpc).getBlock(hashOneDayAgo).call();
@@ -111,7 +149,7 @@ async function fetchChainHead() {
     subVersion: network.subversion,
     protocol: network.protocolversion,
     date: moment(genesis.time * 1000).format("MMMM Do YYYY, h:mm:ss a"),
-    currentBlock: block,
+    currentBlock,
     avgBlockTime: (diff * 1000) / 576,
   };
 }
@@ -140,10 +178,21 @@ async function fetchProjectedSuperblocks({ nextSuperBlock, currentBlock, avgBloc
 
   // Allow per-sb budget calls to fail independently — matches the prior
   // .catch(() => "To be determined") semantics — without aborting the whole
-  // tick and throwing away the rest of the atomic payload.
+  // tick and throwing away the rest of the atomic payload. Each call is
+  // also raced against SB_BUDGET_TIMEOUT_MS: without this, a single
+  // perpetually-hanging projected-block RPC (remember: SyscoinRpcClient has
+  // no configurable socket timeout) would starve every future tick out of
+  // ever reaching atomic commit — the outer watchdog would fire, abandon
+  // the tick, and the next tick would hit the same hang. This way a stuck
+  // projection falls back to "To be determined" within a bounded window
+  // and the rest of the payload still commits (Codex round 2 P1).
   const budgetResults = await Promise.allSettled(
     projections.map((p) =>
-      rpcServices(client.callRpc).getSuperblockBudget(p.block).call()
+      withTimeout(
+        rpcServices(client.callRpc).getSuperblockBudget(p.block).call(),
+        SB_BUDGET_TIMEOUT_MS,
+        `getSuperblockBudget(${p.block})`
+      )
     )
   );
 
@@ -353,4 +402,5 @@ module.exports = {
   BASE_TICK_MS,
   MAX_BACKOFF_MS,
   TICK_WATCHDOG_MS,
+  SB_BUDGET_TIMEOUT_MS,
 };

@@ -401,6 +401,67 @@ describe('sysMain periodic aggregator', () => {
     }
   });
 
+  test('currentBlock is pinned BEFORE the one-day-ago retry loop — a transient one-day-ago getBlockHash failure does NOT lower currentBlock (Codex round 2 P2)', async () => {
+    primeHappyRpc();
+    // Make the one-day-ago height lookup fail once then succeed, to force
+    // the retry loop's cursor to decrement. The chain tip must remain at
+    // 1_999_999 in the committed snapshot regardless.
+    let oneDayCall = 0;
+    rpc.getBlockHash.mockImplementation(async (h) => {
+      if (h === 1_999_999) return 'hash:tip-1';
+      if (h === 1_999_999 - 576) {
+        oneDayCall++;
+        if (oneDayCall === 1) throw new Error('transient node pause');
+        return 'hash:tip-577';
+      }
+      return `hash:${h}`;
+    });
+
+    const res = await sysMain.tick();
+    expect(res.ok).toBe(true);
+    expect(data.currentBlock).toBe(1_999_999);
+    // And sb1..sb5 projections are consistent with the pinned head.
+    for (const n of [1, 2, 3, 4, 5]) {
+      expect(data[`sb${n}`]).toBe(2_053_680 + 17520 * n);
+    }
+  });
+
+  test('a single projected-sb budget RPC that hangs is bounded by SB_BUDGET_TIMEOUT_MS and does not prevent commit (Codex round 2 P1)', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'queueMicrotask', 'nextTick'] });
+    try {
+      primeHappyRpc();
+      // sb2 hangs forever; sb1/sb3/sb4/sb5 resolve fine.
+      let heightCalls = 0;
+      rpc.getSuperblockBudget.mockImplementation((height) => {
+        if (height === undefined) return Promise.resolve(1_000_000);
+        heightCalls++;
+        if (heightCalls === 2) return new Promise(() => {}); // hang
+        return Promise.resolve(2_000_000 + height);
+      });
+
+      const tickPromise = sysMain.tick();
+      // Let the tick's awaits progress past the non-hanging work and queue
+      // the withTimeout race for the stuck sb2 call.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      // Advance fake time past the per-sb timeout so the race rejects.
+      jest.advanceTimersByTime(sysMain.SB_BUDGET_TIMEOUT_MS + 100);
+      // Drain the resulting microtasks.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+
+      const res = await tickPromise;
+      expect(res.ok).toBe(true);
+      // sb2 falls back, the rest commit.
+      expect(data.sb2Budget).toBe('To be determined');
+      expect(data.sb1Budget).toBe(2_000_000 + data.sb1);
+      expect(data.sb3Budget).toBe(2_000_000 + data.sb3);
+      // And the main payload landed too.
+      expect(data.budget).toBe(1_000_000);
+      expect(data.mnEnabled).toBe(1_450);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('consecutive failures apply exponential backoff up to MAX_BACKOFF_MS', async () => {
     axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
     // Run many ticks and confirm the delay never exceeds MAX_BACKOFF_MS and
