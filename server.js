@@ -358,12 +358,21 @@ const reminderDispatcher = createReminderDispatcher({
   voteReceipts: services.voteReceipts,
   reminderLog,
   mailer,
-  // Shape: [{ hash, endEpoch }]. gObject_list returns a map keyed by
-  // gov-object hash, with `DataString` containing the per-proposal
-  // JSON that has end_epoch (unix seconds). We project here rather
-  // than inside the dispatcher because the RPC shape is a
-  // server-side concern (the dispatcher contract is the normalized
-  // shape).
+  // Shape: [{ hash, startEpoch, endEpoch }]. gObject_list returns a
+  // map keyed by gov-object hash, with `DataString` containing the
+  // per-proposal JSON that has start_epoch + end_epoch (unix
+  // seconds). We project here rather than inside the dispatcher
+  // because the RPC shape is a server-side concern (the dispatcher
+  // contract is the normalized shape).
+  //
+  // Both start_epoch and end_epoch are forwarded so the dispatcher
+  // can filter proposals by SB-eligibility
+  // (startEpoch <= nextSbEpochSec <= endEpoch). A missing
+  // start_epoch defaults to 0 inside normalizeProposal, which the
+  // eligibility check treats as "no lower bound" — that keeps any
+  // legacy DataString payload (from clients that predate the
+  // derive-window wizard) in the cycle rather than silently
+  // dropping it.
   getActiveProposals: async () => {
     const raw = await rpcServices(client.callRpc).gObject_list().call();
     const out = [];
@@ -377,10 +386,21 @@ const reminderDispatcher = createReminderDispatcher({
       }
       const endEpoch = Number(data && data.end_epoch);
       if (!Number.isFinite(endEpoch) || endEpoch <= 0) continue;
-      out.push({ hash: entry.Hash, endEpoch });
+      const rawStart = Number(data && data.start_epoch);
+      const startEpoch =
+        Number.isFinite(rawStart) && rawStart > 0 ? rawStart : 0;
+      out.push({ hash: entry.Hash, startEpoch, endEpoch });
     }
     return out;
   },
+  // Next-superblock anchor: read from the in-memory dataStore that
+  // sysMain refreshes every 20s. A missing / stale value surfaces
+  // as `skipped: 'next_superblock_unavailable'` in the tick result
+  // and the dispatcher retries on the next interval — this is
+  // correct behavior on a cold boot (sysMain hasn't completed its
+  // first pass yet) or when RPC is briefly unreachable.
+  getNextSuperblockEpochSec: async () =>
+    Number(dataStore.superBlockNextEpochSec) || 0,
   log: (level, event, meta) => {
     // eslint-disable-next-line no-console
     console.log(`[reminder] ${level} ${event}`, meta || '');
