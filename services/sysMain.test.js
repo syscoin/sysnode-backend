@@ -486,6 +486,65 @@ describe('sysMain periodic aggregator', () => {
     expect(axios.get).toHaveBeenCalledTimes(1);
   });
 
+  test('stop()+start() while a tick is still in flight does NOT spawn a duplicate scheduler loop when the pre-stop tick eventually settles (Codex round 4 P2)', async () => {
+    jest.useFakeTimers();
+    try {
+      primeHappyRpc();
+
+      // The first (pre-stop) tick's CoinGecko fetch never resolves on its
+      // own — we'll settle it manually AFTER the restart to reproduce the
+      // "stale callback reschedules on top of new loop" race.
+      let releasePreStopGecko;
+      const preStopGecko = new Promise((resolve) => {
+        releasePreStopGecko = resolve;
+      });
+      axios.get.mockReturnValueOnce(preStopGecko);
+
+      // Run loop #1: kicks off, allocates gen=1, hangs on gecko.
+      sysMain.start();
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+      expect(sysMain.getDiagnostics().tickGen).toBe(1);
+
+      // Stop mid-flight, then restart. The second start must spawn a fresh
+      // run loop whose scheduling is NOT entangled with run loop #1's
+      // still-pending finally / watchdog.
+      sysMain.stop();
+      axios.get.mockResolvedValueOnce(HAPPY_GECKO);
+      sysMain.start();
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // Run loop #2 allocated gen=2 and committed successfully. It has now
+      // scheduled exactly one tickTimer for its own next run.
+      expect(sysMain.getDiagnostics().tickGen).toBe(2);
+      expect(sysMain.getDiagnostics().lastCommittedGen).toBe(2);
+
+      // Settle run loop #1's stale gecko. Pre-fix, its finally{} would fire
+      // rescheduleOnce() on top of loop #2, scheduling a SECOND tickTimer.
+      // Post-fix, the token mismatch makes it a no-op.
+      releasePreStopGecko(HAPPY_GECKO);
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+
+      // Snapshot state before firing whatever tickTimer(s) are queued.
+      const genBefore = sysMain.getDiagnostics().tickGen;
+      const axiosCallsBefore = axios.get.mock.calls.length;
+
+      // Drain ONE full BASE_TICK_MS interval worth of pending timers.
+      // A healthy single-loop system fires exactly one scheduled tick; a
+      // doubled-up system would fire two.
+      jest.advanceTimersByTime(sysMain.BASE_TICK_MS);
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+
+      // Exactly one new tick generation should have fired (run loop #2's
+      // legitimate scheduled tick). A duplicate-loop bug would show +2.
+      expect(sysMain.getDiagnostics().tickGen - genBefore).toBe(1);
+      // And exactly one new CoinGecko fetch should have been issued.
+      expect(axios.get.mock.calls.length - axiosCallsBefore).toBe(1);
+    } finally {
+      sysMain.stop();
+      jest.useRealTimers();
+    }
+  });
+
   test('consecutive failures apply exponential backoff up to MAX_BACKOFF_MS', async () => {
     axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
     // Run many ticks and confirm the delay never exceeds MAX_BACKOFF_MS and

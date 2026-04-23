@@ -78,6 +78,10 @@ let started = false;        // idempotency guard for start(); set synchronously 
                              // independent scheduler loops (tickTimer alone is not
                              // sufficient because runAndReschedule() only sets it
                              // after the in-flight tick finishes / the watchdog fires)
+let activeRunToken = null;  // unique-per-run-loop token. Captured by runAndReschedule,
+                             // invalidated by stop(). rescheduleOnce / watchdog compare
+                             // against this so callbacks created before a stop()+start()
+                             // cycle cannot affect the post-restart loop (Codex round 4 P2).
 let tickGen = 0;            // monotonically increasing per tick()
 let lastCommittedGen = 0;   // gen of the newest tick that successfully committed
 let lastCompletedGen = 0;   // gen of the newest tick whose result has been published
@@ -304,6 +308,14 @@ function scheduleNext() {
 async function runAndReschedule() {
   if (stopped) return;
 
+  // Capture a per-run-loop token. If stop() (or a subsequent restart)
+  // happens while this tick is still in flight, our token will no longer
+  // match `activeRunToken`, and rescheduleOnce / the watchdog will
+  // recognize themselves as belonging to a defunct run loop and no-op
+  // rather than scheduling on top of the fresh loop (Codex round 4 P2).
+  const myToken = {};
+  activeRunToken = myToken;
+
   // Allocate the tick's generation here so the watchdog and the tick
   // body refer to the same in-flight tick. If the watchdog fires first
   // we mark this gen as "completed" (abandoned) so its eventual late
@@ -318,11 +330,18 @@ async function runAndReschedule() {
   let rescheduled = false;
   function rescheduleOnce() {
     if (rescheduled || stopped) return;
+    // Belongs to a run loop that was stopped (and possibly restarted).
+    // The new loop owns scheduling; we must not interfere.
+    if (activeRunToken !== myToken) return;
     rescheduled = true;
     scheduleNext();
   }
 
   const watchdog = setTimeout(() => {
+    // If this run loop was stopped (and maybe restarted) while the tick
+    // was in flight, leave shared state alone — the new loop is driving
+    // things now.
+    if (activeRunToken !== myToken) return;
     // Only act if this tick hasn't already published a result itself.
     if (gen > lastCompletedGen) {
       watchdogFires++;
@@ -355,6 +374,10 @@ function start() {
 function stop() {
   stopped = true;
   started = false;
+  // Invalidate any in-flight run loop's rescheduleOnce / watchdog so that
+  // if start() is called again before their tick settles, those stale
+  // callbacks can't schedule a duplicate loop on top of the new one.
+  activeRunToken = null;
   if (tickTimer) {
     clearTimeout(tickTimer);
     tickTimer = null;
@@ -385,6 +408,7 @@ function __resetForTests() {
   watchdogFires = 0;
   stopped = false;
   started = false;
+  activeRunToken = null;
   if (tickTimer) {
     clearTimeout(tickTimer);
     tickTimer = null;
