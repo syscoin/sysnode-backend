@@ -1,6 +1,7 @@
 const {
   loginKey,
   registerKey,
+  reconcileKey,
   voteKey,
 } = require('./rateLimit');
 
@@ -81,6 +82,20 @@ describe('rate-limit key generators', () => {
     test('falls back to IP bucket when the user is missing (defense in depth)', () => {
       const a = voteKey(mk({}, '1.2.3.4'));
       expect(a).toMatch(/^vote\|ip\|1\.2\.3\.4$/);
+    });
+  });
+
+  describe('reconcileKey', () => {
+    test('buckets by authenticated user.id when present', () => {
+      const a = reconcileKey(mk({}, '1.2.3.4', { id: 42 }));
+      const b = reconcileKey(mk({}, '9.9.9.9', { id: 42 }));
+      expect(a).toBe(b);
+      expect(a).toBe('reconcile|u42');
+    });
+
+    test('falls back to IP bucket when the user is missing', () => {
+      const a = reconcileKey(mk({}, '1.2.3.4'));
+      expect(a).toMatch(/^reconcile\|ip\|1\.2\.3\.4$/);
     });
   });
 });

@@ -77,6 +77,15 @@ function voteKey(req) {
   return `vote|ip|${ipBucket(req)}`;
 }
 
+// Per-user bucket for /gov/receipts/reconcile. This endpoint may issue
+// gobject_getcurrentvotes RPCs, so it needs its own budget instead of
+// sharing /gov/vote's relay budget.
+function reconcileKey(req) {
+  const uid = req.user && req.user.id != null ? String(req.user.id) : null;
+  if (uid) return `reconcile|u${uid}`;
+  return `reconcile|ip|${ipBucket(req)}`;
+}
+
 function loginLimiter() {
   return rateLimit({
     windowMs: 15 * MINUTE,
@@ -135,6 +144,18 @@ function voteLimiter() {
   });
 }
 
+function reconcileLimiter() {
+  return rateLimit({
+    windowMs: 60 * MINUTE,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: reconcileKey,
+    message: { error: 'too_many_reconcile_requests' },
+    handler: trippedHandler('reconcile'),
+  });
+}
+
 function disabled() {
   return (_req, _res, next) => next();
 }
@@ -144,10 +165,12 @@ module.exports = {
   registerLimiter,
   verifyEmailLimiter,
   voteLimiter,
+  reconcileLimiter,
   disabled,
   // Exported for direct unit testing.
   loginKey,
   registerKey,
   verifyEmailKey,
   voteKey,
+  reconcileKey,
 };

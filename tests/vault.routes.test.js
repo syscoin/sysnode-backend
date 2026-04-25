@@ -74,6 +74,16 @@ describe('vault routes', () => {
     expect(res.body.saltV).toBeUndefined();
   });
 
+  test('first PUT /vault requires explicit If-Match wildcard', async () => {
+    const { agent, csrf } = await loggedInAgent(ctx);
+    const res = await agent
+      .put('/vault')
+      .set('X-CSRF-Token', csrf)
+      .send({ blob: 'ciphertext-1' });
+    expect(res.status).toBe(428);
+    expect(res.body.error).toBe('if_match_required');
+  });
+
   test('subsequent PUT requires matching If-Match', async () => {
     const { agent, csrf } = await loggedInAgent(ctx);
     const first = await agent

@@ -19,6 +19,21 @@ const HEX64 = /^[0-9a-f]{64}$/i;
 // a reconcile with `?refresh=1`.
 const DEFAULT_RECEIPTS_FRESHNESS_MS = 2 * 60 * 1000;
 
+function knownOutpointSet(masternodes) {
+  const out = new Set();
+  for (const mn of Array.isArray(masternodes) ? masternodes : []) {
+    if (
+      mn &&
+      typeof mn.collateralHash === 'string' &&
+      HEX64.test(mn.collateralHash) &&
+      Number.isInteger(mn.collateralIndex)
+    ) {
+      out.add(`${mn.collateralHash.toLowerCase()}:${mn.collateralIndex}`);
+    }
+  }
+  return out;
+}
+
 // Governance HTTP surface.
 //
 //   POST /gov/mns/lookup  -> { matches: [{ votingaddress, proTxHash,
@@ -66,6 +81,8 @@ const DEFAULT_RECEIPTS_FRESHNESS_MS = 2 * 60 * 1000;
 //   - nowMs: injectable clock for deterministic time-window tests.
 //   - voteLimiter: an express-rate-limit middleware (or a no-op in
 //                  tests). Mounted only on POST /gov/vote.
+//   - reconcileLimiter: same shape, mounted only on POST
+//                  /gov/receipts/reconcile.
 
 function createGovRouter({
   masternodesProvider,
@@ -77,6 +94,7 @@ function createGovRouter({
   invalidateCurrentVotes = null,
   receiptsFreshnessMs = DEFAULT_RECEIPTS_FRESHNESS_MS,
   voteLimiter = (_req, _res, next) => next(),
+  reconcileLimiter = (_req, _res, next) => next(),
   nowMs = () => Date.now(),
 }) {
   if (typeof masternodesProvider !== 'function') {
@@ -154,10 +172,44 @@ function createGovRouter({
       const parsed = validateVoteBody(req.body, { nowMs: nowMs() });
       if (!parsed.ok) return res.status(400).json({ error: parsed.error });
       try {
-        const out = await relayVotes(voteRaw, parsed, {
-          receipts,
-          userId: req.user && req.user.id,
+        const knownOutpoints = knownOutpointSet(masternodesProvider() || []);
+        const relayEntries = [];
+        const relayIndexes = [];
+        const results = new Array(parsed.entries.length);
+        parsed.entries.forEach((entry, index) => {
+          const key = `${entry.collateralHash}:${entry.collateralIndex}`;
+          if (!knownOutpoints.has(key)) {
+            results[index] = {
+              collateralHash: entry.collateralHash,
+              collateralIndex: entry.collateralIndex,
+              ok: false,
+              error: 'mn_not_found',
+            };
+            return;
+          }
+          relayIndexes.push(index);
+          relayEntries.push(entry);
         });
+
+        if (relayEntries.length > 0) {
+          const relayed = await relayVotes(
+            voteRaw,
+            { ...parsed, entries: relayEntries },
+            {
+              receipts,
+              userId: req.user && req.user.id,
+            }
+          );
+          relayed.results.forEach((result, index) => {
+            results[relayIndexes[index]] = result;
+          });
+        }
+
+        const out = {
+          accepted: results.filter((r) => r && r.ok).length,
+          rejected: results.filter((r) => r && !r.ok).length,
+          results,
+        };
         // Invalidate the cached gobject_getcurrentvotes snapshot for
         // this proposal so the next /gov/receipts read observes the
         // votes we just relayed (or the chain state that followed
@@ -284,6 +336,7 @@ function createGovRouter({
     '/receipts/reconcile',
     sessionMw.requireAuth,
     csrfMw.require,
+    reconcileLimiter,
     async (req, res) => {
       if (!receipts) {
         return res.json({ receipts: [], reconciled: false });
