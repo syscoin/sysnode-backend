@@ -416,6 +416,50 @@ describe('auth routes', () => {
     expect(extractCookies(verify).sid).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  test('issuing a new TOTP challenge invalidates older challenge tokens', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const setup = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+    await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
+
+    const first = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const second = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+
+    expect(first.body.challengeToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.body.challengeToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.body.challengeToken).not.toBe(first.body.challengeToken);
+
+    const stale = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: first.body.challengeToken,
+        code: generateTotpCode(setup.body.secret),
+      });
+    expect(stale.status).toBe(401);
+    expect(stale.body.error).toBe('mfa_challenge_invalid');
+
+    const verify = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: second.body.challengeToken,
+        code: generateTotpCode(setup.body.secret),
+      });
+    expect(verify.status).toBe(200);
+  });
+
   test('TOTP recovery codes are single use during login challenge verification', async () => {
     const { agent, csrf } = await registerAndLogin(ctx);
     const setup = await agent
