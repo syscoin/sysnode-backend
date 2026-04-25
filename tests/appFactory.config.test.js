@@ -101,6 +101,17 @@ describe('appFactory production auth config', () => {
     }
   });
 
+  test('explicit secureCookies option ignores malformed env override', () => {
+    process.env.NODE_ENV = 'test';
+    process.env.SYSNODE_SECURE_COOKIES = '0';
+    const db = openDatabase(':memory:');
+    try {
+      expect(() => buildServices({ db, secureCookies: false })).not.toThrow();
+    } finally {
+      db.close();
+    }
+  });
+
   test('standalone createApp accepts FRONTEND_URL as production CORS origin fallback', () => {
     process.env.NODE_ENV = 'production';
     delete process.env.CORS_ORIGIN;
