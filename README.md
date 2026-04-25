@@ -38,7 +38,22 @@ npm ci
 cp .env.example .env        # then edit — see .env.example for inline docs
 npm run dev                 # nodemon on :3001
 npm test                    # full jest suite (~830 cases)
+npm run audit:prod          # fail on critical production dependency issues
 ```
+
+## Dependency Audit Triage
+
+`npm run audit:prod` is wired into CI and fails on critical production
+vulnerabilities. As of this update, the remaining production audit findings are
+known transitive issues under `syscoinjs-lib`'s Ethereum proof stack
+(`eth-proof` / `isomorphic-fetch` / `node-fetch` and `ethers` v5 helpers).
+`npm audit fix --force` proposes changing `syscoinjs-lib` through a breaking
+path, so that risk is tracked separately instead of forced into a dependency
+maintenance PR.
+
+`pm2` is intentionally not an application dependency. If you use it for process
+supervision, install it globally or through your host image, as shown in the
+single-host deployment notes below.
 
 ## Configuration
 
