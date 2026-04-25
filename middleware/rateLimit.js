@@ -52,12 +52,14 @@ function mfaLoginKey(req) {
 // pair; keying by session contains abuse to that stolen session instead of
 // letting it burn the whole user's account budget. The IP fallback keeps the
 // limiter safe if a future caller mounts it in the wrong order.
-function verifyPasswordKey(req) {
+function authenticatedStepUpKey(req) {
   const sessionId =
     req.session && req.session.id != null ? String(req.session.id) : null;
-  if (sessionId) return `verify-password|s${sessionId}`;
-  return `verify-password|ip|${ipBucket(req)}`;
+  if (sessionId) return `step-up|s${sessionId}`;
+  return `step-up|ip|${ipBucket(req)}`;
 }
+
+const verifyPasswordKey = authenticatedStepUpKey;
 
 function registerKey(req) {
   return `register|${ipBucket(req)}`;
@@ -129,17 +131,19 @@ function mfaLoginLimiter() {
   });
 }
 
-function verifyPasswordLimiter() {
+function authenticatedStepUpLimiter() {
   return rateLimit({
     windowMs: 15 * MINUTE,
     max: 10,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: verifyPasswordKey,
+    keyGenerator: authenticatedStepUpKey,
     message: { error: 'too_many_attempts' },
-    handler: trippedHandler('verify-password'),
+    handler: trippedHandler('authenticated-step-up'),
   });
 }
+
+const verifyPasswordLimiter = authenticatedStepUpLimiter;
 
 function registerLimiter() {
   return rateLimit({
@@ -206,6 +210,7 @@ function disabled() {
 module.exports = {
   loginLimiter,
   mfaLoginLimiter,
+  authenticatedStepUpLimiter,
   verifyPasswordLimiter,
   registerLimiter,
   verifyEmailLimiter,
@@ -215,6 +220,7 @@ module.exports = {
   // Exported for direct unit testing.
   loginKey,
   mfaLoginKey,
+  authenticatedStepUpKey,
   verifyPasswordKey,
   registerKey,
   verifyEmailKey,

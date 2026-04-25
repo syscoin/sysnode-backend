@@ -39,6 +39,10 @@ const TotpEnableSchema = TotpCodeSchema.extend({
   oldAuthHash: HEX_32_SCHEMA,
 });
 
+const TotpDisableSchema = TotpCodeSchema.extend({
+  oldAuthHash: HEX_32_SCHEMA,
+});
+
 // PR 7 — password change now rotates the vault wrap atomically.
 //
 // The client re-derives the new vaultKey from (newPassword, email,
@@ -144,8 +148,10 @@ function createAuthRouter({
   }
   const effectiveLimiters = {
     ...limiters,
-    verifyPassword:
-      limiters && typeof limiters.verifyPassword === 'function'
+    stepUp:
+      limiters && typeof limiters.stepUp === 'function'
+        ? limiters.stepUp
+        : limiters && typeof limiters.verifyPassword === 'function'
         ? limiters.verifyPassword
         : noopMiddleware,
   };
@@ -650,6 +656,7 @@ function createAuthRouter({
     '/totp/setup',
     sessionMw.requireAuth,
     csrfMw.require,
+    effectiveLimiters.stepUp,
     (req, res) => {
       if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
       const parsed = TotpSetupSchema.safeParse(req.body);
@@ -676,6 +683,7 @@ function createAuthRouter({
     '/totp/enable',
     sessionMw.requireAuth,
     csrfMw.require,
+    effectiveLimiters.stepUp,
     (req, res) => {
       if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
       const parsed = TotpEnableSchema.safeParse(req.body);
@@ -712,10 +720,21 @@ function createAuthRouter({
     '/totp/disable',
     sessionMw.requireAuth,
     csrfMw.require,
+    effectiveLimiters.stepUp,
     (req, res) => {
       if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
-      const parsed = TotpCodeSchema.safeParse(req.body);
+      const parsed = TotpDisableSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
+      if (
+        !verifyPasswordStepUp(
+          req,
+          res,
+          parsed.data.oldAuthHash,
+          'auth.totp_disable'
+        )
+      ) {
+        return undefined;
+      }
       try {
         totp.verifyUserCode(req.user.id, parsed.data.code);
         totp.disable(req.user.id);
@@ -742,6 +761,7 @@ function createAuthRouter({
     '/change-password',
     sessionMw.requireAuth,
     csrfMw.require,
+    effectiveLimiters.stepUp,
     asyncHandler(async (req, res) => {
       const parsed = ChangePasswordSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
@@ -938,7 +958,7 @@ function createAuthRouter({
     '/verify-password',
     sessionMw.requireAuth,
     csrfMw.require,
-    effectiveLimiters.verifyPassword,
+    effectiveLimiters.stepUp,
     (req, res) => {
       const parsed = VerifyPasswordSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
@@ -996,6 +1016,7 @@ function createAuthRouter({
     '/account',
     sessionMw.requireAuth,
     csrfMw.require,
+    effectiveLimiters.stepUp,
     asyncHandler(async (req, res) => {
       const parsed = DeleteAccountSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
