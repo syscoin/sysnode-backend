@@ -336,7 +336,7 @@ describe('auth routes', () => {
     const setup = await agent
       .post('/auth/totp/setup')
       .set('X-CSRF-Token', csrf)
-      .send({});
+      .send({ oldAuthHash: SAMPLE_AUTH });
     expect(setup.status).toBe(200);
     expect(setup.body.secret).toEqual(expect.any(String));
     expect(setup.body.otpauthUrl).toMatch(/^otpauth:\/\/totp\//);
@@ -344,14 +344,17 @@ describe('auth routes', () => {
     const bad = await agent
       .post('/auth/totp/enable')
       .set('X-CSRF-Token', csrf)
-      .send({ code: '000000' });
+      .send({ code: '000000', oldAuthHash: SAMPLE_AUTH });
     expect(bad.status).toBe(400);
     expect(bad.body.error).toBe('invalid_totp_code');
 
     const good = await agent
       .post('/auth/totp/enable')
       .set('X-CSRF-Token', csrf)
-      .send({ code: generateTotpCode(setup.body.secret) });
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
     expect(good.status).toBe(200);
     expect(good.body.status).toBe('enabled');
     expect(good.body.recoveryCodes).toHaveLength(10);
@@ -361,16 +364,36 @@ describe('auth routes', () => {
     expect(me.body.user.totpEnabled).toBe(true);
   });
 
+  test('TOTP setup requires current password step-up auth', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+
+    const missing = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(missing.status).toBe(400);
+
+    const wrong = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: 'deadbeef'.repeat(8) });
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error).toBe('invalid_credentials');
+  });
+
   test('TOTP-enabled accounts require a second step before session cookies are issued', async () => {
     const { agent, csrf } = await registerAndLogin(ctx);
     const setup = await agent
       .post('/auth/totp/setup')
       .set('X-CSRF-Token', csrf)
-      .send({});
+      .send({ oldAuthHash: SAMPLE_AUTH });
     await agent
       .post('/auth/totp/enable')
       .set('X-CSRF-Token', csrf)
-      .send({ code: generateTotpCode(setup.body.secret) });
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
     await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
 
     const login = await request(ctx.app)
@@ -398,11 +421,14 @@ describe('auth routes', () => {
     const setup = await agent
       .post('/auth/totp/setup')
       .set('X-CSRF-Token', csrf)
-      .send({});
+      .send({ oldAuthHash: SAMPLE_AUTH });
     const enabled = await agent
       .post('/auth/totp/enable')
       .set('X-CSRF-Token', csrf)
-      .send({ code: generateTotpCode(setup.body.secret) });
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
     await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
 
     const login = await request(ctx.app)

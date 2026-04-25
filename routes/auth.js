@@ -31,6 +31,14 @@ const TotpCodeSchema = z.object({
   code: z.string().min(1).max(32),
 });
 
+const TotpSetupSchema = z.object({
+  oldAuthHash: HEX_32_SCHEMA,
+});
+
+const TotpEnableSchema = TotpCodeSchema.extend({
+  oldAuthHash: HEX_32_SCHEMA,
+});
+
 // PR 7 — password change now rotates the vault wrap atomically.
 //
 // The client re-derives the new vaultKey from (newPassword, email,
@@ -177,6 +185,26 @@ function createAuthRouter({
     sessionMw.setSessionCookie(res, token, expiresAt);
     csrfMw.issueCookie(res, expiresAt);
     return { expiresAt };
+  }
+
+  function verifyPasswordStepUp(req, res, oldAuthHash, eventName) {
+    let confirmed;
+    try {
+      confirmed = users.verifyAuth(req.user.email, oldAuthHash);
+    } catch (err) {
+      if (err && err.code === 'kdf_config') {
+        securityLog.error(`${eventName}_kdf_config`, { req, error: err });
+        res.status(503).json({ error: 'server_misconfigured' });
+        return false;
+      }
+      throw err;
+    }
+    if (!confirmed) {
+      securityLog.warn(`${eventName}_invalid_password`, { req });
+      res.status(401).json({ error: 'invalid_credentials' });
+      return false;
+    }
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -597,6 +625,18 @@ function createAuthRouter({
     csrfMw.require,
     (req, res) => {
       if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
+      const parsed = TotpSetupSchema.safeParse(req.body);
+      if (!parsed.success) return badRequest(res, 'invalid_body');
+      if (
+        !verifyPasswordStepUp(
+          req,
+          res,
+          parsed.data.oldAuthHash,
+          'auth.totp_setup'
+        )
+      ) {
+        return undefined;
+      }
       const out = totp.beginSetup(req.user);
       return res.json({
         secret: out.secret,
@@ -611,8 +651,18 @@ function createAuthRouter({
     csrfMw.require,
     (req, res) => {
       if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
-      const parsed = TotpCodeSchema.safeParse(req.body);
+      const parsed = TotpEnableSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
+      if (
+        !verifyPasswordStepUp(
+          req,
+          res,
+          parsed.data.oldAuthHash,
+          'auth.totp_enable'
+        )
+      ) {
+        return undefined;
+      }
       try {
         const out = totp.enableSetup(req.user.id, parsed.data.code);
         return res.json({
