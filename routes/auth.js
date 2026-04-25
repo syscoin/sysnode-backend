@@ -74,6 +74,16 @@ const VerifySchema = z.object({
   token: z.string().regex(/^[0-9a-f]{64}$/),
 });
 
+// Body schema for /auth/verify-password — a re-prove-password ceremony with
+// no side effects. Used by callers that need to bind a client-side derived
+// secret to the account credential before they act on it (e.g. the vault
+// first-write flow, where the same password derives both authHash AND the
+// client-only vaultKey, and an unverified mismatch would silently lock the
+// vault under a key that diverges from the account credential).
+const VerifyPasswordSchema = z.object({
+  authHash: HEX_32_SCHEMA,
+});
+
 // PR 7 — account deletion (GDPR "right to erasure").
 //
 // Requires the user to re-prove possession of the current password
@@ -888,6 +898,50 @@ function createAuthRouter({
       if (newVaultEtag) body.newVaultEtag = newVaultEtag;
       return res.json(body);
     })
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /auth/verify-password
+  //
+  // Read-only credential check. Caller submits an authHash derived from
+  // a typed password (same client-side PBKDF2 → HKDF chain as /login,
+  // /change-password, /totp/setup), and the server confirms it matches
+  // the stored credential for the authenticated user.
+  //
+  // 204 on match, 401 on mismatch, 400 on malformed body, 503 on KDF
+  // misconfiguration. The handler never mutates server state — no
+  // session rotation, no counter bump, nothing — so it's safe to call
+  // as a precondition step inside other client flows without disturbing
+  // the live session.
+  //
+  // Specifically motivated by the vault first-write path: the same
+  // password is fed into both `deriveAuthHash` (compared here) and
+  // `deriveVaultKey` (used client-side only). Verifying authHash
+  // against the server before saving the encrypted blob guarantees
+  // the vaultKey that wraps the blob is consistent with the account
+  // credential. Without this check a typo at first import diverges the
+  // two and locks the vault to a credential the user no longer
+  // remembers — a bug we hit in practice (Apr 2026).
+  // -------------------------------------------------------------------------
+  router.post(
+    '/verify-password',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    (req, res) => {
+      const parsed = VerifyPasswordSchema.safeParse(req.body);
+      if (!parsed.success) return badRequest(res, 'invalid_body');
+      if (
+        !verifyPasswordStepUp(
+          req,
+          res,
+          parsed.data.authHash,
+          'auth.verify_password'
+        )
+      ) {
+        return undefined;
+      }
+      return res.status(204).end();
+    }
   );
 
   // -------------------------------------------------------------------------
