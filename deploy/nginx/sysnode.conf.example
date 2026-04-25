@@ -12,15 +12,24 @@
 #
 # Layout matches the same-origin model documented in the project README:
 #
-#     https://sysnode.example.com/        -> sysnode-info build (port 3000)
-#     https://sysnode.example.com/auth/*  -> sysnode-backend     (port 3001)
-#     https://sysnode.example.com/vault/* -> sysnode-backend     (port 3001)
-#     https://sysnode.example.com/gov/*   -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/         -> sysnode-info build (port 3000)
+#     https://sysnode.example.com/auth/*   -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/vault    -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/gov/*    -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/mnStats  -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/mnCount  -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/govlist  -> sysnode-backend     (port 3001)
 #
-# Public anonymous routes that the dashboard polls (mnstats, mnCount,
-# masternodes, governance, etc.) are also served by sysnode-backend.
-# They're listed individually so the SPA's catch-all `location /` can
-# fall through to the React static build for everything else.
+# Public anonymous routes that the dashboard polls (/mnStats, /mnCount,
+# /govlist) are listed individually so the SPA's catch-all `location /`
+# can fall through to the React static build for everything else.
+#
+# Heads up — paths like `/governance`, `/masternodes`, `/login`, `/vault`-
+# beyond-the-bare-segment are *client-side React routes* served by the
+# SPA. Don't add nginx `location /governance` / `location /masternodes`
+# blocks: the backend doesn't expose those paths (its public routes
+# are `/govlist`, `/mnSearch`, `/mnList`, `/mnStats`, `/mnCount`), and
+# proxying them to :3001 would 404 the SPA pages users navigate to.
 #
 # Do NOT add `add_header Strict-Transport-Security ...` here. Both apps
 # emit HSTS in code (helmet on the backend, the security-header map in
@@ -39,21 +48,24 @@ server {
     client_max_body_size 5M;
 
     # ---- backend (sysnode-backend on :3001) -------------------------------
-    # The backend mounts auth/vault/gov at the path root, so we proxy
-    # without rewriting. Trailing-slash matching means /auth, /authNNN,
-    # etc. all match — adjust if your backend ever serves something at
-    # /authentication that should NOT be proxied.
-    location /auth/  { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location /vault/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location /gov/   { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    # The backend mounts /auth, /vault, /gov at the path root, so we proxy
+    # without rewriting. Trailing-slash matching (`location /auth/`) means
+    # only paths *under* /auth/ are proxied (e.g. /auth/me, /auth/login);
+    # something else at /authentication would NOT match and would fall
+    # through to the SPA. /vault is matched as an exact location because
+    # the SPA hits exactly `/vault` (GET / PUT of the encrypted blob);
+    # listing it as a prefix would also catch client-side routes like
+    # `/vault/import` that need to fall through to the SPA.
+    location /auth/   { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location = /vault { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location /gov/    { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
 
-    # Public anonymous data routes. Listed exactly so /<random> falls
-    # through to the SPA below. If you add a new public backend route,
-    # add it here too.
-    location = /mnstats        { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location = /mnCount        { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location /masternodes      { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location /governance       { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    # Public anonymous data routes. Each is matched exactly so /<random>
+    # falls through to the SPA below. If you add a new public backend
+    # route that the SPA polls, add it here too.
+    location = /mnStats { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location = /mnCount { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location = /govlist { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
 
     # ---- frontend (sysnode-info on :3000) ---------------------------------
     # Catch-all for the SPA. server.js falls back to index.html for any
