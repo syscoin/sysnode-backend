@@ -46,5 +46,6 @@ module.exports = {
     sb5EstDate: 0,
   
     // Masternodes array (will be populated)
-    masternodesArr: []
+    masternodesArr: [],
+    masternodesUpdatedAt: 0
   };

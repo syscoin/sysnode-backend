@@ -327,12 +327,15 @@ mountAuthAndVault(app, {
   mailer,
   baseUrl: process.env.BASE_URL || 'http://localhost:3001',
   frontendUrl: PUBLIC_BASE_URL,
-  // Read the live tracker array fresh on every call rather than
+  // Read the live tracker snapshot fresh on every call rather than
   // snapshotting it here — the tracker REASSIGNS `masternodesArr`
   // every 10s (`data.masternodesArr = []`), so a captured reference
-  // would go stale after the first refresh. `dataStore.masternodesArr`
-  // is a property access and therefore always returns the current value.
-  masternodesProvider: () => dataStore.masternodesArr,
+  // would go stale after the first refresh. `masternodesUpdatedAt`
+  // lets /gov/vote avoid hard-rejecting outpoints from a stale cache.
+  masternodesProvider: () => ({
+    masternodes: dataStore.masternodesArr,
+    updatedAt: dataStore.masternodesUpdatedAt,
+  }),
   voteRaw: (collateralHash, collateralIndex, governanceHash, signal, outcome, time, voteSig) =>
     rpcServices(client.callRpc)
       .voteRaw(

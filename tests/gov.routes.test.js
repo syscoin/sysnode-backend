@@ -370,6 +370,28 @@ describe('POST /gov/vote', () => {
     }
   });
 
+  test('fails open to voteraw when the masternode cache snapshot is stale', async () => {
+    const { ctx, calls } = buildApp({
+      masternodes: {
+        masternodes: [{ collateralHash: H2, collateralIndex: 0 }],
+        updatedAt: Date.now() - 60_000,
+      },
+    });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(validVoteBody());
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(2);
+      expect(res.body.rejected).toBe(0);
+      expect(calls).toHaveLength(2);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
   test('400 invalid_proposal_hash when proposalHash is malformed', async () => {
     const { ctx } = buildApp();
     try {

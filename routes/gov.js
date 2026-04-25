@@ -18,6 +18,26 @@ const HEX64 = /^[0-9a-f]{64}$/i;
 // say stale" race. Callers that want stricter freshness can force
 // a reconcile with `?refresh=1`.
 const DEFAULT_RECEIPTS_FRESHNESS_MS = 2 * 60 * 1000;
+const DEFAULT_MASTERNODE_CACHE_MAX_AGE_MS = 30 * 1000;
+
+function readMasternodeSnapshot(value, nowMs, maxAgeMs) {
+  const masternodes = Array.isArray(value)
+    ? value
+    : value && Array.isArray(value.masternodes)
+      ? value.masternodes
+      : [];
+  if (Array.isArray(value)) {
+    return { masternodes, fresh: true };
+  }
+  const updatedAt = value && Number.isInteger(value.updatedAt)
+    ? value.updatedAt
+    : 0;
+  const age = nowMs - updatedAt;
+  return {
+    masternodes,
+    fresh: updatedAt > 0 && age >= 0 && age <= maxAgeMs,
+  };
+}
 
 function knownOutpointSet(masternodes) {
   const out = new Set();
@@ -93,6 +113,7 @@ function createGovRouter({
   getCurrentVotes = null,
   invalidateCurrentVotes = null,
   receiptsFreshnessMs = DEFAULT_RECEIPTS_FRESHNESS_MS,
+  masternodeCacheMaxAgeMs = DEFAULT_MASTERNODE_CACHE_MAX_AGE_MS,
   voteLimiter = (_req, _res, next) => next(),
   reconcileLimiter = (_req, _res, next) => next(),
   nowMs = () => Date.now(),
@@ -131,8 +152,12 @@ function createGovRouter({
     (req, res) => {
       const parsed = validateLookupBody(req.body);
       if (!parsed.ok) return res.status(400).json({ error: parsed.error });
-      const mnArr = masternodesProvider() || [];
-      const matches = lookupMatches(mnArr, parsed.votingAddresses);
+      const snapshot = readMasternodeSnapshot(
+        masternodesProvider(),
+        nowMs(),
+        masternodeCacheMaxAgeMs
+      );
+      const matches = lookupMatches(snapshot.masternodes, parsed.votingAddresses);
       return res.json({ matches });
     }
   );
@@ -172,7 +197,14 @@ function createGovRouter({
       const parsed = validateVoteBody(req.body, { nowMs: nowMs() });
       if (!parsed.ok) return res.status(400).json({ error: parsed.error });
       try {
-        const knownOutpoints = knownOutpointSet(masternodesProvider() || []);
+        const snapshot = readMasternodeSnapshot(
+          masternodesProvider(),
+          nowMs(),
+          masternodeCacheMaxAgeMs
+        );
+        const knownOutpoints = snapshot.fresh
+          ? knownOutpointSet(snapshot.masternodes)
+          : new Set();
         const relayEntries = [];
         const relayIndexes = [];
         const results = new Array(parsed.entries.length);
