@@ -120,6 +120,10 @@ function asyncHandler(fn) {
     Promise.resolve(fn(req, res, next)).catch(next);
 }
 
+function noopMiddleware(_req, _res, next) {
+  next();
+}
+
 function createAuthRouter({
   users,
   sessions,
@@ -138,6 +142,13 @@ function createAuthRouter({
   if (typeof runAtomic !== 'function') {
     throw new Error('createAuthRouter: runAtomic is required');
   }
+  const effectiveLimiters = {
+    ...limiters,
+    verifyPassword:
+      limiters && typeof limiters.verifyPassword === 'function'
+        ? limiters.verifyPassword
+        : noopMiddleware,
+  };
   // `vaults` is optional in principle (some test harnesses mount auth
   // alone without a vault store), but /auth/change-password refuses to
   // serve when it is missing and the caller requests a vault-bearing
@@ -927,7 +938,7 @@ function createAuthRouter({
     '/verify-password',
     sessionMw.requireAuth,
     csrfMw.require,
-    limiters.verifyPassword,
+    effectiveLimiters.verifyPassword,
     (req, res) => {
       const parsed = VerifyPasswordSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');

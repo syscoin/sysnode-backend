@@ -1611,6 +1611,23 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
     expect(() => createAuthRouter(buildArgs({ vaults: undefined }))).not.toThrow();
   });
 
+  test('accepts previous limiter shape without verifyPassword', () => {
+    const mw = (_req, _res, next) => next();
+    expect(() =>
+      createAuthRouter(
+        buildArgs({
+          limiters: {
+            login: mw,
+            mfaLogin: mw,
+            register: mw,
+            verifyEmail: mw,
+            vote: mw,
+          },
+        })
+      )
+    ).not.toThrow();
+  });
+
   test('still rejects missing runAtomic regardless of vaults', () => {
     expect(() =>
       createAuthRouter(buildArgs({ vaults: undefined, runAtomic: undefined }))
