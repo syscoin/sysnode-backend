@@ -27,6 +27,7 @@ const {
   buildServices,
   finalizeSessionMw,
   mountAuthAndVault,
+  normalizeProductionCorsOrigin,
 } = require('./lib/appFactory');
 const dataStore = require('./data/dataStore');
 const { client, rpcServices } = require('./services/rpcClient');
@@ -106,10 +107,11 @@ app.use(cookieParser());
 // legacy surface evolves.
 // -----------------------------------------------------------------------------
 const legacyCors = cors({ origin: '*', optionsSuccessStatus: 200 });
-const AUTH_ORIGIN =
+const AUTH_ORIGIN = normalizeProductionCorsOrigin(
   process.env.CORS_ORIGIN ||
-  process.env.FRONTEND_URL ||
-  'http://localhost:3000';
+    process.env.FRONTEND_URL ||
+    'http://localhost:3000'
+);
 const authCors = cors({
   origin: AUTH_ORIGIN,
   credentials: true,

@@ -2,10 +2,12 @@ const {
   assertProductionAuthConfig,
   buildServices,
   createApp,
+  normalizeProductionCorsOrigin,
 } = require('../lib/appFactory');
 const { openDatabase } = require('../lib/db');
 const { createMailer } = require('../lib/mailer');
 const { _resetPepperForTests } = require('../lib/kdf');
+const request = require('supertest');
 
 describe('appFactory production auth config', () => {
   const originalNodeEnv = process.env.NODE_ENV;
@@ -110,5 +112,38 @@ describe('appFactory production auth config', () => {
     } finally {
       db.close();
     }
+  });
+
+  test('standalone createApp emits normalized production CORS origin', async () => {
+    process.env.NODE_ENV = 'production';
+    const db = openDatabase(':memory:');
+    const mailer = createMailer({ transport: 'memory', from: 't@x.com' });
+    const { app } = createApp({
+      db,
+      mailer,
+      corsOrigin: 'https://sysnode.info/',
+      frontendUrl: 'https://sysnode.info/path-that-is-not-used',
+    });
+    try {
+      const res = await request(app)
+        .get('/health')
+        .set('Origin', 'https://sysnode.info');
+      expect(res.headers['access-control-allow-origin']).toBe(
+        'https://sysnode.info'
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('normalizes production CORS origins and preserves development values', () => {
+    process.env.NODE_ENV = 'production';
+    expect(normalizeProductionCorsOrigin('https://sysnode.info/')).toBe(
+      'https://sysnode.info'
+    );
+    process.env.NODE_ENV = 'development';
+    expect(normalizeProductionCorsOrigin('http://localhost:3000')).toBe(
+      'http://localhost:3000'
+    );
   });
 });
