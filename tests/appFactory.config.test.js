@@ -46,6 +46,17 @@ describe('appFactory production auth config', () => {
     ).toThrow('same_origin_cors_required_in_production');
   });
 
+  test('production accepts equivalent same-origin URLs after normalization', () => {
+    process.env.NODE_ENV = 'production';
+    expect(() =>
+      assertProductionAuthConfig({
+        secureCookies: true,
+        corsOrigin: 'https://sysnode.info/',
+        frontendUrl: 'https://sysnode.info/path-that-is-not-used',
+      })
+    ).not.toThrow();
+  });
+
   test('production requires an https frontend origin', () => {
     process.env.NODE_ENV = 'production';
     expect(() =>
