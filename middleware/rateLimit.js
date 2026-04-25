@@ -43,6 +43,10 @@ function loginKey(req) {
   return `login|${ipBucket(req)}|${normalizeEmail(raw)}`;
 }
 
+function mfaLoginKey(req) {
+  return `login-totp|${ipBucket(req)}`;
+}
+
 function registerKey(req) {
   return `register|${ipBucket(req)}`;
 }
@@ -95,6 +99,21 @@ function loginLimiter() {
     keyGenerator: loginKey,
     message: { error: 'too_many_attempts' },
     handler: trippedHandler('login'),
+  });
+}
+
+function mfaLoginLimiter() {
+  return rateLimit({
+    windowMs: 15 * MINUTE,
+    // Per-challenge OTP guessing is capped in the TOTP repository. This
+    // limiter is an endpoint DoS guard, so it must not key on the
+    // attacker-supplied challenge token.
+    max: 50,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: mfaLoginKey,
+    message: { error: 'too_many_attempts' },
+    handler: trippedHandler('login-totp'),
   });
 }
 
@@ -162,6 +181,7 @@ function disabled() {
 
 module.exports = {
   loginLimiter,
+  mfaLoginLimiter,
   registerLimiter,
   verifyEmailLimiter,
   voteLimiter,
@@ -169,6 +189,7 @@ module.exports = {
   disabled,
   // Exported for direct unit testing.
   loginKey,
+  mfaLoginKey,
   registerKey,
   verifyEmailKey,
   voteKey,

@@ -91,6 +91,7 @@ function buildApp({
       csrfMw,
       limiters: {
         login: rateLimiters.disabled(),
+        mfaLogin: rateLimiters.disabled(),
         register: rateLimiters.disabled(),
         verifyEmail: rateLimiters.disabled(),
         vote: rateLimiters.disabled(),
@@ -569,6 +570,7 @@ describe('drafts CRUD', () => {
         csrfMw,
         limiters: {
           login: rateLimiters.disabled(),
+          mfaLogin: rateLimiters.disabled(),
           register: rateLimiters.disabled(),
           verifyEmail: rateLimiters.disabled(),
           vote: rateLimiters.disabled(),

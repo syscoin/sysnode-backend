@@ -1,5 +1,6 @@
 const {
   loginKey,
+  mfaLoginKey,
   registerKey,
   reconcileKey,
   voteKey,
@@ -47,6 +48,25 @@ describe('rate-limit key generators', () => {
       expect(loginKey({ ip: '1.2.3.4', body: {} })).toMatch(
         /^login\|1\.2\.3\.4\|$/
       );
+    });
+  });
+
+  describe('mfaLoginKey', () => {
+    test('ignores challenge token so invalid-token floods cannot rotate buckets', () => {
+      const a = mfaLoginKey(
+        mk({ challengeToken: 'a'.repeat(64) }, '1.2.3.4')
+      );
+      const b = mfaLoginKey(
+        mk({ challengeToken: 'b'.repeat(64) }, '1.2.3.4')
+      );
+      expect(a).toBe(b);
+      expect(a).toBe('login-totp|1.2.3.4');
+    });
+
+    test('distinct IPs produce distinct MFA endpoint buckets', () => {
+      const a = mfaLoginKey(mk({ challengeToken: 'c'.repeat(64) }, '1.2.3.4'));
+      const b = mfaLoginKey(mk({ challengeToken: 'c'.repeat(64) }, '5.6.7.8'));
+      expect(a).not.toBe(b);
     });
   });
 

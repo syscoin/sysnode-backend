@@ -1,5 +1,6 @@
 const request = require('supertest');
 const { buildTestApp } = require('./helpers/buildTestApp');
+const { generateTotpCode } = require('../lib/totp');
 
 const SAMPLE_AUTH =
   'a4f8b3c1d9e7f2a5b1c6d8e4f7a9b2c5d1e8f4a7b3c9d5e1f6a2b8c4d7e3f5a9';
@@ -328,6 +329,176 @@ describe('auth routes', () => {
     const csrf = extractCookies(loginRes).csrf;
     return { agent, csrf };
   }
+
+  test('TOTP setup requires a valid authenticator code before enabling MFA', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+
+    const setup = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    expect(setup.status).toBe(200);
+    expect(setup.body.secret).toEqual(expect.any(String));
+    expect(setup.body.otpauthUrl).toMatch(/^otpauth:\/\/totp\//);
+
+    const bad = await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({ code: '000000', oldAuthHash: SAMPLE_AUTH });
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toBe('invalid_totp_code');
+
+    const good = await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+    expect(good.status).toBe(200);
+    expect(good.body.status).toBe('enabled');
+    expect(good.body.recoveryCodes).toHaveLength(10);
+
+    const me = await agent.get('/auth/me');
+    expect(me.status).toBe(200);
+    expect(me.body.user.totpEnabled).toBe(true);
+  });
+
+  test('TOTP setup requires current password step-up auth', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+
+    const missing = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({});
+    expect(missing.status).toBe(400);
+
+    const wrong = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: 'deadbeef'.repeat(8) });
+    expect(wrong.status).toBe(401);
+    expect(wrong.body.error).toBe('invalid_credentials');
+  });
+
+  test('TOTP-enabled accounts require a second step before session cookies are issued', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const setup = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+    await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
+
+    const login = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    expect(login.status).toBe(200);
+    expect(login.body.mfaRequired).toBe(true);
+    expect(login.body.challengeToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(extractCookies(login).sid).toBeUndefined();
+
+    const verify = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: login.body.challengeToken,
+        code: generateTotpCode(setup.body.secret),
+      });
+    expect(verify.status).toBe(200);
+    expect(verify.body.user.email).toBe('user@example.com');
+    expect(verify.body.user.totpEnabled).toBe(true);
+    expect(extractCookies(verify).sid).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('issuing a new TOTP challenge invalidates older challenge tokens', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const setup = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+    await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
+
+    const first = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const second = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+
+    expect(first.body.challengeToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.body.challengeToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(second.body.challengeToken).not.toBe(first.body.challengeToken);
+
+    const stale = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: first.body.challengeToken,
+        code: generateTotpCode(setup.body.secret),
+      });
+    expect(stale.status).toBe(401);
+    expect(stale.body.error).toBe('mfa_challenge_invalid');
+
+    const verify = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: second.body.challengeToken,
+        code: generateTotpCode(setup.body.secret),
+      });
+    expect(verify.status).toBe(200);
+  });
+
+  test('TOTP recovery codes are single use during login challenge verification', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const setup = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    const enabled = await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+    await agent.post('/auth/logout').set('X-CSRF-Token', csrf);
+
+    const login = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const verify = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: login.body.challengeToken,
+        recoveryCode: enabled.body.recoveryCodes[0],
+      });
+    expect(verify.status).toBe(200);
+    expect(verify.body.recoveryCodeUsed).toBe(true);
+
+    const loginAgain = await request(ctx.app)
+      .post('/auth/login')
+      .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+    const reuse = await request(ctx.app)
+      .post('/auth/login/totp')
+      .send({
+        challengeToken: loginAgain.body.challengeToken,
+        recoveryCode: enabled.body.recoveryCodes[0],
+      });
+    expect(reuse.status).toBe(401);
+    expect(reuse.body.error).toBe('invalid_totp_code');
+  });
 
   test('POST /auth/change-password (with vault): updates both auth AND vault atomically', async () => {
     const { agent, csrf } = await registerAndLogin(ctx);
@@ -1292,7 +1463,7 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
       },
       sessionMw: { requireAuth: mw, parse: mw, setSessionCookie: noop, clearSessionCookie: noop },
       csrfMw: { require: mw, parse: mw, issueCookie: noop, clearCookie: noop },
-      limiters: { login: mw, register: mw, verifyEmail: mw, vote: mw },
+      limiters: { login: mw, mfaLogin: mw, register: mw, verifyEmail: mw, vote: mw },
       baseUrl: 'http://api.test',
       frontendUrl: 'http://app.test',
       scheduler: (fn) => fn(),
