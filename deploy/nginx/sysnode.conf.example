@@ -1,0 +1,98 @@
+# Reverse-proxy vhost for a same-origin sysnode deployment.
+#
+# Replace `sysnode.example.com` with your real public hostname before use.
+# This is a reference, not a drop-in: anything in `# managed by Certbot`
+# blocks below is left for `certbot --nginx` to write on first run, so
+# you typically install this skeleton, then run:
+#
+#     sudo certbot --nginx -d sysnode.example.com
+#
+# and Certbot rewrites the `listen 443 ssl` block plus the HTTP→HTTPS
+# redirect with the real cert paths.
+#
+# Layout matches the same-origin model documented in the project README:
+#
+#     https://sysnode.example.com/        -> sysnode-info build (port 3000)
+#     https://sysnode.example.com/auth/*  -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/vault/* -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/gov/*   -> sysnode-backend     (port 3001)
+#
+# Public anonymous routes that the dashboard polls (mnstats, mnCount,
+# masternodes, governance, etc.) are also served by sysnode-backend.
+# They're listed individually so the SPA's catch-all `location /` can
+# fall through to the React static build for everything else.
+#
+# Do NOT add `add_header Strict-Transport-Security ...` here. Both apps
+# emit HSTS in code (helmet on the backend, the security-header map in
+# sysnode-info/server.js on the frontend); duplicating it at the edge
+# produces two `Strict-Transport-Security` response headers, which is
+# noisy in audits even though browsers only honour the first per
+# RFC 6797 §8.1. The same applies to certbot's default
+# /etc/letsencrypt/options-ssl-nginx.conf — comment its HSTS line out
+# if it's set, or override it here.
+
+server {
+    server_name sysnode.example.com;
+
+    # Vault PUTs are small (encrypted JSON blob), but leave room for
+    # the encoded ciphertext + base64 overhead.
+    client_max_body_size 5M;
+
+    # ---- backend (sysnode-backend on :3001) -------------------------------
+    # The backend mounts auth/vault/gov at the path root, so we proxy
+    # without rewriting. Trailing-slash matching means /auth, /authNNN,
+    # etc. all match — adjust if your backend ever serves something at
+    # /authentication that should NOT be proxied.
+    location /auth/  { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location /vault/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location /gov/   { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+
+    # Public anonymous data routes. Listed exactly so /<random> falls
+    # through to the SPA below. If you add a new public backend route,
+    # add it here too.
+    location = /mnstats        { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location = /mnCount        { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location /masternodes      { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location /governance       { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+
+    # ---- frontend (sysnode-info on :3000) ---------------------------------
+    # Catch-all for the SPA. server.js falls back to index.html for any
+    # path it doesn't have a static asset for, so client-side routing
+    # (e.g. /login, /vault, /governance/proposal/<hash>) works.
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        include /etc/nginx/snippets/sysnode-proxy.conf;
+    }
+
+    # listen 443 ssl;                                       # managed by Certbot
+    # ssl_certificate     /etc/letsencrypt/live/.../fullchain.pem;  # managed by Certbot
+    # ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;    # managed by Certbot
+    # include             /etc/letsencrypt/options-ssl-nginx.conf;  # managed by Certbot
+    # ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;        # managed by Certbot
+}
+
+# HTTP→HTTPS redirect. Certbot generates an equivalent block; this is
+# here so the file is self-contained when read for review.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name sysnode.example.com;
+    return 301 https://$host$request_uri;
+}
+
+# ---------------------------------------------------------------------------
+# Companion file: /etc/nginx/snippets/sysnode-proxy.conf
+# ---------------------------------------------------------------------------
+# Create the snippet referenced above so we don't repeat headers across
+# every location. `proxy_set_header Host $host` and X-Forwarded-Proto
+# are required for the backend's `TRUST_PROXY=1` config to recover the
+# real client IP and the original https:// scheme — without them, the
+# production startup assertion on `req.secure` will fail.
+#
+#     proxy_http_version 1.1;
+#     proxy_set_header Host              $host;
+#     proxy_set_header X-Real-IP         $remote_addr;
+#     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+#     proxy_set_header X-Forwarded-Proto $scheme;
+#     proxy_read_timeout 60s;
+#     proxy_send_timeout 60s;

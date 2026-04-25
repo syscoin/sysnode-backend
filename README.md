@@ -97,6 +97,16 @@ SYSNODE_AUTH_PEPPER=<32-byte-hex-secret>
 
 Production startup refuses non-secure cookies, non-HTTPS `FRONTEND_URL`, or a credentialed CORS origin that differs from `FRONTEND_URL`.
 
+### Reverse proxy reference
+
+A working same-origin nginx vhost lives at [`deploy/nginx/sysnode.conf.example`](deploy/nginx/sysnode.conf.example). The example is the canonical reference, not a drop-in: copy it to `/etc/nginx/conf.d/sysnode.conf`, replace `sysnode.example.com` with your real hostname, then run `sudo certbot --nginx -d <hostname>` to obtain a Let's Encrypt cert and let Certbot rewrite the `listen 443 ssl` block. Any TLS terminator that preserves `Host` and forwards `X-Forwarded-Proto: https` will work — the example is nginx because that's what we run, not because nginx is special.
+
+### HSTS
+
+Both apps emit `Strict-Transport-Security` from their own code: the backend via helmet's defaults (`max-age=31536000; includeSubDomains`), the frontend via the security-header map in `sysnode-info/server.js`. Do **not** add `add_header Strict-Transport-Security` at the edge — duplicating it produces two response headers, which is noisy in audits even though browsers only honour the first per RFC 6797 §8.1. The default Certbot snippet at `/etc/letsencrypt/options-ssl-nginx.conf` ships with HSTS enabled; comment that line out (or override per-vhost) when standing up a new box, otherwise every response will carry it twice.
+
+Owning HSTS in code means any deployer — behind nginx, Caddy, a managed load balancer, or directly on a TLS-terminating Node — gets HSTS without having to remember to add it at their edge.
+
 ### Cookie vs static RPC auth
 
 The backend supports both authentication modes and picks **cookie over static** when both are configured (with a one-line warning at boot). Cookie auth is zero-secret-management: `syscoind` rewrites the cookie on every restart, and the backend picks up the new token automatically via a 401-driven replay. Use it for any deployment where the backend runs on the same host as `syscoind`.
