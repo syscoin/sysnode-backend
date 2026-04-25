@@ -17,6 +17,20 @@ const RegisterSchema = z.object({
 
 const LoginSchema = RegisterSchema;
 
+const TotpLoginSchema = z
+  .object({
+    challengeToken: z.string().regex(/^[0-9a-fA-F]{64}$/),
+    code: z.string().min(1).max(32).optional(),
+    recoveryCode: z.string().min(1).max(64).optional(),
+  })
+  .refine((v) => Boolean(v.code) !== Boolean(v.recoveryCode), {
+    message: 'Provide exactly one of code or recoveryCode',
+  });
+
+const TotpCodeSchema = z.object({
+  code: z.string().min(1).max(32),
+});
+
 // PR 7 — password change now rotates the vault wrap atomically.
 //
 // The client re-derives the new vaultKey from (newPassword, email,
@@ -91,6 +105,7 @@ function asyncHandler(fn) {
 function createAuthRouter({
   users,
   sessions,
+  totp,
   pendingRegistrations,
   vaults,
   mailer,
@@ -141,6 +156,27 @@ function createAuthRouter({
 
   function mailLink(token) {
     return `${verifyBase}/verify-email?token=${token}`;
+  }
+
+  function userBody(user) {
+    return {
+      id: user.id,
+      email: user.email,
+      emailVerified: user.emailVerified,
+      notificationPrefs: user.notificationPrefs,
+      saltV: user.saltV,
+      totpEnabled: totp ? totp.status(user.id).enabled : false,
+    };
+  }
+
+  function issueLoginSession(req, res, user) {
+    const { token, expiresAt } = sessions.issue(user.id, {
+      userAgent: req.get('user-agent') || null,
+      ip: req.ip,
+    });
+    sessionMw.setSessionCookie(res, token, expiresAt);
+    csrfMw.issueCookie(res, expiresAt);
+    return { expiresAt };
   }
 
   // -------------------------------------------------------------------------
@@ -401,17 +437,20 @@ function createAuthRouter({
       });
       return res.status(403).json({ error: 'email_not_verified' });
     }
+    if (totp && totp.status(user.id).enabled) {
+      const { challengeToken, expiresAt } = totp.createChallenge(user.id);
+      return res.json({
+        mfaRequired: true,
+        challengeToken,
+        expiresAt,
+      });
+    }
     // sessions.issue / setSessionCookie / issueCookie may also throw on
     // transient DB failures. They ran unprotected before (Codex round-9
     // P1 "Guard login session creation"); asyncHandler now forwards any
     // rejection to the error middleware instead of producing an
     // unhandled promise rejection.
-    const { token, expiresAt } = sessions.issue(user.id, {
-      userAgent: req.get('user-agent') || null,
-      ip: req.ip,
-    });
-    sessionMw.setSessionCookie(res, token, expiresAt);
-    csrfMw.issueCookie(res, expiresAt);
+    const { expiresAt } = issueLoginSession(req, res, user);
     return res.json({
       // saltV is delivered here (and on /auth/me) so the client has the
       // per-user vault salt in memory immediately after login, without a
@@ -421,13 +460,36 @@ function createAuthRouter({
       // Data Key inside the encrypted vault blob. Delivered on login
       // rather than gated behind /vault so an empty-vault first-write
       // ("create vault") does not need to round-trip for salt material.
-      user: {
-        id: user.id,
-        email: user.email,
-        emailVerified: user.emailVerified,
-        saltV: user.saltV,
-      },
+      user: userBody(user),
       expiresAt,
+    });
+  }));
+
+  router.post('/login/totp', limiters.login, asyncHandler(async (req, res) => {
+    if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
+    const parsed = TotpLoginSchema.safeParse(req.body);
+    if (!parsed.success) return badRequest(res, 'invalid_body');
+    let out;
+    try {
+      out = totp.verifyChallenge(parsed.data);
+    } catch (err) {
+      if (
+        err &&
+        (err.code === 'mfa_challenge_invalid' || err.code === 'invalid_totp_code')
+      ) {
+        return res.status(401).json({ error: err.code });
+      }
+      throw err;
+    }
+    const user = users.findById(out.userId);
+    if (!user || !user.emailVerified) {
+      return res.status(401).json({ error: 'mfa_challenge_invalid' });
+    }
+    const { expiresAt } = issueLoginSession(req, res, user);
+    return res.json({
+      user: userBody(user),
+      expiresAt,
+      recoveryCodeUsed: out.recoveryCodeUsed,
     });
   }));
 
@@ -465,13 +527,7 @@ function createAuthRouter({
       // fields as /auth/login — otherwise a rehydrated client would
       // silently lose saltV and be unable to unlock the vault until
       // it re-logs-in.
-      user: {
-        id: req.user.id,
-        email: req.user.email,
-        emailVerified: req.user.emailVerified,
-        notificationPrefs: req.user.notificationPrefs,
-        saltV: req.user.saltV,
-      },
+      user: userBody(req.user),
     });
   });
 
@@ -527,6 +583,75 @@ function createAuthRouter({
       // Echo back the stored value so the caller can update local
       // state without a follow-up GET.
       return res.json({ notificationPrefs: parsed.data });
+    }
+  );
+
+  router.get('/totp', sessionMw.requireAuth, (req, res) => {
+    if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
+    return res.json(totp.status(req.user.id));
+  });
+
+  router.post(
+    '/totp/setup',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    (req, res) => {
+      if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
+      const out = totp.beginSetup(req.user);
+      return res.json({
+        secret: out.secret,
+        otpauthUrl: out.otpauthUrl,
+      });
+    }
+  );
+
+  router.post(
+    '/totp/enable',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    (req, res) => {
+      if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
+      const parsed = TotpCodeSchema.safeParse(req.body);
+      if (!parsed.success) return badRequest(res, 'invalid_body');
+      try {
+        const out = totp.enableSetup(req.user.id, parsed.data.code);
+        return res.json({
+          status: 'enabled',
+          recoveryCodes: out.recoveryCodes,
+        });
+      } catch (err) {
+        if (
+          err &&
+          (err.code === 'totp_setup_not_started' || err.code === 'invalid_totp_code')
+        ) {
+          return res.status(400).json({ error: err.code });
+        }
+        throw err;
+      }
+    }
+  );
+
+  router.post(
+    '/totp/disable',
+    sessionMw.requireAuth,
+    csrfMw.require,
+    (req, res) => {
+      if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
+      const parsed = TotpCodeSchema.safeParse(req.body);
+      if (!parsed.success) return badRequest(res, 'invalid_body');
+      try {
+        totp.verifyUserCode(req.user.id, parsed.data.code);
+        totp.disable(req.user.id);
+      } catch (err) {
+        if (
+          err &&
+          (err.code === 'totp_not_enabled' || err.code === 'invalid_totp_code')
+        ) {
+          return res.status(400).json({ error: err.code });
+        }
+        throw err;
+      }
+      return res.json({ status: 'disabled' });
     }
   );
 
