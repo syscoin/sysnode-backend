@@ -4,7 +4,7 @@ const express = require('express');
 const request = require('supertest');
 const { openDatabase } = require('../lib/db');
 const { createMasternodeCountRepo } = require('../lib/masternodeCountRepo');
-const { createMnCountRouter } = require('./mnCount');
+const { createMnCountRouter } = require('./mncount');
 
 function mountApp(router) {
   const app = express();
@@ -12,7 +12,7 @@ function mountApp(router) {
   return app;
 }
 
-describe('GET /mnCount', () => {
+describe('GET /mncount', () => {
   let db;
   let repo;
 
@@ -25,7 +25,7 @@ describe('GET /mnCount', () => {
 
   test('empty table → 200 with []', async () => {
     const app = mountApp(createMnCountRouter({ repo }));
-    const res = await request(app).get('/mnCount');
+    const res = await request(app).get('/mncount');
     expect(res.status).toBe(200);
     expect(res.body).toEqual([]);
   });
@@ -36,7 +36,7 @@ describe('GET /mnCount', () => {
     repo.upsertByDate('2024-03-16', 2201, Date.parse('2024-03-16T00:00:05Z'));
 
     const app = mountApp(createMnCountRouter({ repo }));
-    const res = await request(app).get('/mnCount');
+    const res = await request(app).get('/mncount');
     expect(res.status).toBe(200);
     expect(res.body).toEqual([
       { date: '2024-03-14', users: 2199 },
@@ -58,7 +58,7 @@ describe('GET /mnCount', () => {
         log: (level, event, meta) => logs.push({ level, event, meta }),
       })
     );
-    const res = await request(app).get('/mnCount');
+    const res = await request(app).get('/mncount');
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'internal' });
     expect(logs.some((l) => l.event === 'mncount_read_failed')).toBe(true);

@@ -11,7 +11,6 @@ require('./services/masternodeTracker');
 // Legacy public routes (no cookies, no credentials; stats + governance list
 // + masternode list etc. consumed by sysnode-info and third parties).
 const mnStatsRoute = require('./routes/mnStats');
-const masternodesRoute = require('./routes/masternodes');
 const governanceRoute = require('./routes/governance');
 const { createMnCountRouter } = require('./routes/mnCount');
 const mnListRoute = require('./routes/mnList');
@@ -132,10 +131,10 @@ app.use((req, res, next) => {
 const dbPath = process.env.SYSNODE_DB_PATH || './data/sysnode.db';
 const db = openDatabase(dbPath);
 
-// Historical masternode-count store (feeds the /mnCount endpoint +
+// Historical masternode-count store (feeds the /mncount endpoint +
 // the homepage TrendChart). We construct the repo up front because
 // three independent callers need it: the one-time seeder, the daily
-// logger that appends new rows, and the /mnCount HTTP route.
+// logger that appends new rows, and the /mncount HTTP route.
 //
 // seedMasternodeCount is idempotent: it loads the committed CSV
 // (db/seeds/masternode-count.csv) only when the table is empty, so
@@ -362,7 +361,6 @@ mountAuthAndVault(app, {
 // registration exactly as it was before this PR.
 // -----------------------------------------------------------------------------
 app.use(mnStatsRoute);
-app.use(masternodesRoute);
 app.use(governanceRoute);
 app.use(
   createMnCountRouter({

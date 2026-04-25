@@ -16,19 +16,25 @@
 #     https://sysnode.example.com/auth/*   -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/vault    -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/gov/*    -> sysnode-backend     (port 3001)
-#     https://sysnode.example.com/mnStats  -> sysnode-backend     (port 3001)
-#     https://sysnode.example.com/mnCount  -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/mnstats  -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/mncount  -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/mnlist   -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/mnsearch -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/govlist  -> sysnode-backend     (port 3001)
 #
-# Public anonymous routes that the dashboard polls (/mnStats, /mnCount,
-# /govlist) are listed individually so the SPA's catch-all `location /`
-# can fall through to the React static build for everything else.
+# Public anonymous routes (/mnstats, /mncount, /mnlist, /mnsearch,
+# /govlist) are matched with a case-insensitive regex so the SPA's
+# catch-all `location /` falls through to the React static build for
+# everything else, while legacy camelCase callers (browser bookmarks,
+# external integrations that predate the lowercase canonical such as
+# the historical `https://syscoin.dev/mnstats` URL still referenced
+# by older syshub builds) keep working through the same-origin proxy.
 #
 # Heads up — paths like `/governance`, `/masternodes`, `/login`, `/vault`-
 # beyond-the-bare-segment are *client-side React routes* served by the
 # SPA. Don't add nginx `location /governance` / `location /masternodes`
 # blocks: the backend doesn't expose those paths (its public routes
-# are `/govlist`, `/mnSearch`, `/mnList`, `/mnStats`, `/mnCount`), and
+# are `/govlist`, `/mnsearch`, `/mnlist`, `/mnstats`, `/mncount`), and
 # proxying them to :3001 would 404 the SPA pages users navigate to.
 #
 # Do NOT add `add_header Strict-Transport-Security ...` here. Both apps
@@ -60,12 +66,20 @@ server {
     location = /vault { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
     location /gov/    { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
 
-    # Public anonymous data routes. Each is matched exactly so /<random>
-    # falls through to the SPA below. If you add a new public backend
-    # route that the SPA polls, add it here too.
-    location = /mnStats { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location = /mnCount { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
-    location = /govlist { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    # Public anonymous data routes. Canonical casing is lowercase
+    # (matches the historical `https://syscoin.dev/mnstats` URL still
+    # used by older syshub builds and the existing `/govlist`).
+    # `~*` is a case-INsensitive regex match so legacy callers using
+    # camelCase URLs (`/mnStats`, `/mnList`, …) keep working through
+    # the same-origin proxy — this mirrors Express's own default
+    # case-insensitive route matching at the route layer. The anchored
+    # `^/...$` keeps `/mnstatsfoo` etc. from being proxied so they fall
+    # through to the SPA's catch-all `location /` below. If you add a
+    # new public backend route, extend this alternation.
+    location ~* ^/(mnstats|mncount|mnlist|mnsearch|govlist)$ {
+        proxy_pass http://127.0.0.1:3001;
+        include /etc/nginx/snippets/sysnode-proxy.conf;
+    }
 
     # ---- frontend (sysnode-info on :3000) ---------------------------------
     # Catch-all for the SPA. server.js falls back to index.html for any

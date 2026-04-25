@@ -6,17 +6,28 @@ The public dashboard is served by [sysnode-info](https://github.com/syscoin/sysn
 
 ## Runtime surface
 
-Public, unauthenticated routes (cached, read-only):
+Public, unauthenticated routes (read-only). Canonical URL casing is
+**lowercase**, matching the historical `https://syscoin.dev/mnstats`
+convention and the existing `/govlist`. Express's default routing is
+case-insensitive, so legacy camelCase callers (`/mnStats`, `/mnList`,
+…) continue to work at the route layer; the bundled nginx config
+(`deploy/nginx/sysnode.conf.example`) uses a case-insensitive regex
+match for the same reason, so external bookmarks/clients with mixed
+casing keep working through the same-origin proxy. New integrations
+should use lowercase.
 
-- `/mnstats`, `/masternodes`, `/mnlist`, `/mnsearch` — masternode data
-- `/governance` — active and historical governance proposals
-- `/csvparser` — CSV-ingest helper used by the dashboard
+- `GET  /mnstats` — chain + market + masternode summary, refreshed by `services/sysMain.js`
+- `GET  /mncount` — historical masternode count series
+- `GET  /mnlist` — fresh `masternode_list` RPC passthrough
+- `POST /mnsearch` — paginated/searched view over the in-memory tracker snapshot
+- `POST /govlist` — active + historical governance proposals (Syscoin Core `gobject list`)
 
 Authenticated routes (cookie + CSRF, same-site):
 
 - `/auth/*` — registration, verification, login, session, delete account
-- `/vault/*` — encrypted per-user blobs (notification prefs, proposal drafts)
-- `/gov/proposals/*` — governance proposal wizard, submissions, collateral PSBT, vote receipts
+- `/vault` — encrypted per-user blob (notification prefs, proposal drafts; one row per user, conditional GET/PUT with ETag)
+- `/gov/*` — masternode lookup, vote relay, vote receipts (`/gov/mns/lookup`, `/gov/vote`, `/gov/receipts`, …)
+- `/gov/proposals/*` — governance proposal wizard, submissions, collateral PSBT
 
 ## Requirements
 
