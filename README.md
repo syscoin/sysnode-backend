@@ -57,6 +57,31 @@ All configuration is via environment variables. `.env.example` is the source of 
 | `SYSCOIN_RPC_USER`, `SYSCOIN_RPC_PASS` | Fallback static creds for remote RPC nodes |
 | `SYSCOIN_NETWORK`, `SYSCOIN_BLOCKBOOK_URL` | Enables the Pay-with-Pali collateral PSBT path |
 
+## Production authenticated deployment
+
+Real voting-key custody should use a same-origin deployment for the authenticated API surface. Serve the SPA and proxy `/auth`, `/vault`, and `/gov` from the same public HTTPS origin:
+
+```text
+https://sysnode.info/        -> sysnode-info build
+https://sysnode.info/auth/*  -> sysnode-backend
+https://sysnode.info/vault/* -> sysnode-backend
+https://sysnode.info/gov/*   -> sysnode-backend
+```
+
+This keeps the `sid` and `csrf` cookies host-only with `Secure; SameSite=Lax`, and lets the SPA read the `csrf` cookie from the same host before mirroring it into `X-CSRF-Token`. Do not deploy the real-key auth/vault/voting surface as `sysnode.info` plus a cross-site API host.
+
+For production, set at least:
+
+```bash
+NODE_ENV=production
+FRONTEND_URL=https://sysnode.info
+CORS_ORIGIN=https://sysnode.info
+TRUST_PROXY=1              # or the exact trusted proxy/CIDR for your edge
+SYSNODE_AUTH_PEPPER=<32-byte-hex-secret>
+```
+
+Production startup refuses non-secure cookies, non-HTTPS `FRONTEND_URL`, or a credentialed CORS origin that differs from `FRONTEND_URL`.
+
 ### Cookie vs static RPC auth
 
 The backend supports both authentication modes and picks **cookie over static** when both are configured (with a one-line warning at boot). Cookie auth is zero-secret-management: `syscoind` rewrites the cookie on every restart, and the backend picks up the new token automatically via a 401-driven replay. Use it for any deployment where the backend runs on the same host as `syscoind`.
