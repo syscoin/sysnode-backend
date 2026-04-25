@@ -43,6 +43,27 @@ jobs:
       - name: Run tests
         run: npm test -- --runInBand --ci --colors
 
+  audit:
+    name: Production dependency audit
+    runs-on: ubuntu-latest
+    env:
+      CI: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm run audit:prod
+
   lint-sql:
     name: Schema sanity
     runs-on: ubuntu-latest
