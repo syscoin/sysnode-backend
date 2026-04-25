@@ -304,6 +304,119 @@ describe('auth routes', () => {
   });
 
   // ---------------------------------------------------------------------
+  // POST /auth/verify-password — read-only "is this the user's current
+  // password?" probe. Used by callers that need to bind a client-side
+  // derivation to the account credential before acting on it (vault
+  // first-write being the motivating case). MUST be a no-op on success
+  // (204) and not rotate sessions / counters / anything.
+  // ---------------------------------------------------------------------
+
+  describe('POST /auth/verify-password', () => {
+    test('204 on matching authHash; the session and the stored credential are untouched', async () => {
+      const agent = request.agent(ctx.app);
+      await agent
+        .post('/auth/register')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+      await agent.post('/auth/verify-email').send({ token });
+      const loginRes = await agent
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const csrf = extractCookies(loginRes).csrf;
+
+      const res = await agent
+        .post('/auth/verify-password')
+        .set('X-CSRF-Token', csrf)
+        .send({ authHash: SAMPLE_AUTH });
+      expect(res.status).toBe(204);
+      // 204 → no body.
+      expect(res.text).toBe('');
+
+      // The current session is still usable (verify did not log us out).
+      const me = await agent.get('/auth/me');
+      expect(me.status).toBe(200);
+
+      // And the credential itself was not rotated by the call — a fresh
+      // login with the same authHash still succeeds.
+      const fresh = await request(ctx.app)
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      expect(fresh.status).toBe(200);
+    });
+
+    test('401 on mismatching authHash; subsequent login with the real password still works', async () => {
+      const agent = request.agent(ctx.app);
+      await agent
+        .post('/auth/register')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+      await agent.post('/auth/verify-email').send({ token });
+      const loginRes = await agent
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const csrf = extractCookies(loginRes).csrf;
+
+      const bad = await agent
+        .post('/auth/verify-password')
+        .set('X-CSRF-Token', csrf)
+        .send({ authHash: 'deadbeef'.repeat(8) });
+      expect(bad.status).toBe(401);
+      expect(bad.body.error).toBe('invalid_credentials');
+
+      // Re-prove the credential really wasn't rotated.
+      const fresh = await request(ctx.app)
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      expect(fresh.status).toBe(200);
+    });
+
+    test('400 on malformed body', async () => {
+      const agent = request.agent(ctx.app);
+      await agent
+        .post('/auth/register')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+      await agent.post('/auth/verify-email').send({ token });
+      const loginRes = await agent
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const csrf = extractCookies(loginRes).csrf;
+
+      const res = await agent
+        .post('/auth/verify-password')
+        .set('X-CSRF-Token', csrf)
+        .send({ authHash: 'not-hex' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('invalid_body');
+    });
+
+    test('401 when unauthenticated', async () => {
+      const res = await request(ctx.app)
+        .post('/auth/verify-password')
+        .send({ authHash: SAMPLE_AUTH });
+      expect(res.status).toBe(401);
+    });
+
+    test('403 when CSRF header is missing', async () => {
+      const agent = request.agent(ctx.app);
+      await agent
+        .post('/auth/register')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+      const token = ctx.mailer.outbox[0].html.match(/token=([0-9a-f]{64})/)[1];
+      await agent.post('/auth/verify-email').send({ token });
+      await agent
+        .post('/auth/login')
+        .send({ email: 'user@example.com', authHash: SAMPLE_AUTH });
+
+      const res = await agent
+        .post('/auth/verify-password')
+        .send({ authHash: SAMPLE_AUTH });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('csrf_missing');
+    });
+  });
+
+  // ---------------------------------------------------------------------
   // PR 7 — atomic vault rewrap inside /auth/change-password
   // ---------------------------------------------------------------------
   //
@@ -1463,7 +1576,7 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
       },
       sessionMw: { requireAuth: mw, parse: mw, setSessionCookie: noop, clearSessionCookie: noop },
       csrfMw: { require: mw, parse: mw, issueCookie: noop, clearCookie: noop },
-      limiters: { login: mw, mfaLogin: mw, register: mw, verifyEmail: mw, vote: mw },
+      limiters: { login: mw, mfaLogin: mw, verifyPassword: mw, register: mw, verifyEmail: mw, vote: mw },
       baseUrl: 'http://api.test',
       frontendUrl: 'http://app.test',
       scheduler: (fn) => fn(),
@@ -1496,6 +1609,23 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
 
   test('accepts vaults: undefined (auth-only mount, per optional contract)', () => {
     expect(() => createAuthRouter(buildArgs({ vaults: undefined }))).not.toThrow();
+  });
+
+  test('accepts previous limiter shape without verifyPassword', () => {
+    const mw = (_req, _res, next) => next();
+    expect(() =>
+      createAuthRouter(
+        buildArgs({
+          limiters: {
+            login: mw,
+            mfaLogin: mw,
+            register: mw,
+            verifyEmail: mw,
+            vote: mw,
+          },
+        })
+      )
+    ).not.toThrow();
   });
 
   test('still rejects missing runAtomic regardless of vaults', () => {
