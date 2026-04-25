@@ -1,6 +1,7 @@
 const {
   loginKey,
   mfaLoginKey,
+  authenticatedStepUpKey,
   verifyPasswordKey,
   registerKey,
   reconcileKey,
@@ -71,27 +72,33 @@ describe('rate-limit key generators', () => {
     });
   });
 
-  describe('verifyPasswordKey', () => {
+  describe('authenticatedStepUpKey', () => {
     function mkSession(body, ip, session) {
       return { ...mk(body, ip, { id: 42 }), session };
     }
 
     test('buckets by authenticated session.id when present', () => {
-      const a = verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 100 }));
-      const b = verifyPasswordKey(mkSession({}, '9.9.9.9', { id: 100 }));
+      const a = authenticatedStepUpKey(mkSession({}, '1.2.3.4', { id: 100 }));
+      const b = authenticatedStepUpKey(mkSession({}, '9.9.9.9', { id: 100 }));
       expect(a).toBe(b);
-      expect(a).toBe('verify-password|s100');
+      expect(a).toBe('step-up|s100');
     });
 
     test('two sessions for the same user get distinct password-check buckets', () => {
-      const a = verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 100 }));
-      const b = verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 200 }));
+      const a = authenticatedStepUpKey(mkSession({}, '1.2.3.4', { id: 100 }));
+      const b = authenticatedStepUpKey(mkSession({}, '1.2.3.4', { id: 200 }));
       expect(a).not.toBe(b);
     });
 
     test('falls back to IP bucket when the user is missing', () => {
-      const a = verifyPasswordKey(mk({}, '1.2.3.4'));
-      expect(a).toBe('verify-password|ip|1.2.3.4');
+      const a = authenticatedStepUpKey(mk({}, '1.2.3.4'));
+      expect(a).toBe('step-up|ip|1.2.3.4');
+    });
+
+    test('verifyPasswordKey remains an alias for older imports', () => {
+      expect(verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 100 }))).toBe(
+        authenticatedStepUpKey(mkSession({}, '1.2.3.4', { id: 100 }))
+      );
     });
   });
 

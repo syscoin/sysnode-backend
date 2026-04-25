@@ -613,6 +613,57 @@ describe('auth routes', () => {
     expect(reuse.body.error).toBe('invalid_totp_code');
   });
 
+  test('TOTP disable requires current password step-up and a valid authenticator code', async () => {
+    const { agent, csrf } = await registerAndLogin(ctx);
+    const setup = await agent
+      .post('/auth/totp/setup')
+      .set('X-CSRF-Token', csrf)
+      .send({ oldAuthHash: SAMPLE_AUTH });
+    await agent
+      .post('/auth/totp/enable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+
+    const missingPassword = await agent
+      .post('/auth/totp/disable')
+      .set('X-CSRF-Token', csrf)
+      .send({ code: generateTotpCode(setup.body.secret) });
+    expect(missingPassword.status).toBe(400);
+
+    const wrongPassword = await agent
+      .post('/auth/totp/disable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: 'deadbeef'.repeat(8),
+      });
+    expect(wrongPassword.status).toBe(401);
+    expect(wrongPassword.body.error).toBe('invalid_credentials');
+
+    const wrongCode = await agent
+      .post('/auth/totp/disable')
+      .set('X-CSRF-Token', csrf)
+      .send({ code: '000000', oldAuthHash: SAMPLE_AUTH });
+    expect(wrongCode.status).toBe(400);
+    expect(wrongCode.body.error).toBe('invalid_totp_code');
+
+    const good = await agent
+      .post('/auth/totp/disable')
+      .set('X-CSRF-Token', csrf)
+      .send({
+        code: generateTotpCode(setup.body.secret),
+        oldAuthHash: SAMPLE_AUTH,
+      });
+    expect(good.status).toBe(200);
+    expect(good.body.status).toBe('disabled');
+
+    const me = await agent.get('/auth/me');
+    expect(me.body.user.totpEnabled).toBe(false);
+  });
+
   test('POST /auth/change-password (with vault): updates both auth AND vault atomically', async () => {
     const { agent, csrf } = await registerAndLogin(ctx);
 
@@ -1576,7 +1627,7 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
       },
       sessionMw: { requireAuth: mw, parse: mw, setSessionCookie: noop, clearSessionCookie: noop },
       csrfMw: { require: mw, parse: mw, issueCookie: noop, clearCookie: noop },
-      limiters: { login: mw, mfaLogin: mw, verifyPassword: mw, register: mw, verifyEmail: mw, vote: mw },
+      limiters: { login: mw, mfaLogin: mw, stepUp: mw, verifyPassword: mw, register: mw, verifyEmail: mw, vote: mw },
       baseUrl: 'http://api.test',
       frontendUrl: 'http://app.test',
       scheduler: (fn) => fn(),
@@ -1626,6 +1677,60 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
         })
       )
     ).not.toThrow();
+  });
+
+  test('mounts the shared step-up limiter on sensitive authenticated routes', async () => {
+    const express = require('express');
+    const stepUp = jest.fn((_req, res) =>
+      res.status(429).json({ error: 'step_up_limited' })
+    );
+    const mw = (_req, _res, next) => next();
+    const app = express();
+    app.use(express.json());
+    app.use(
+      '/auth',
+      createAuthRouter(
+        buildArgs({
+          sessionMw: {
+            requireAuth: (req, _res, next) => {
+              req.user = { id: 1, email: 'user@example.com' };
+              req.session = { id: 10 };
+              next();
+            },
+            parse: mw,
+            setSessionCookie: () => {},
+            clearSessionCookie: () => {},
+          },
+          limiters: {
+            login: mw,
+            mfaLogin: mw,
+            stepUp,
+            register: mw,
+            verifyEmail: mw,
+            vote: mw,
+          },
+        })
+      )
+    );
+
+    const cases = [
+      request(app).post('/auth/verify-password').send({ authHash: SAMPLE_AUTH }),
+      request(app).post('/auth/totp/setup').send({ oldAuthHash: SAMPLE_AUTH }),
+      request(app)
+        .post('/auth/totp/enable')
+        .send({ code: '123456', oldAuthHash: SAMPLE_AUTH }),
+      request(app)
+        .post('/auth/totp/disable')
+        .send({ code: '123456', oldAuthHash: SAMPLE_AUTH }),
+      request(app)
+        .post('/auth/change-password')
+        .send({ oldAuthHash: SAMPLE_AUTH, newAuthHash: 'b'.repeat(64) }),
+      request(app).delete('/auth/account').send({ oldAuthHash: SAMPLE_AUTH }),
+    ];
+
+    const results = await Promise.all(cases);
+    expect(results.map((r) => r.status)).toEqual([429, 429, 429, 429, 429, 429]);
+    expect(stepUp).toHaveBeenCalledTimes(6);
   });
 
   test('still rejects missing runAtomic regardless of vaults', () => {
