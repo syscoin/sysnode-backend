@@ -42,11 +42,6 @@
 -- sessions
 --   Cookie-backed session rows. Also hashed at rest.
 --
--- user_totp, mfa_challenges
---   Optional TOTP second factor. Shared secrets are encrypted with the
---   server pepper before storage; recovery codes and login challenge
---   tokens are hashed at rest.
---
 -- vaults
 --   1:1 with users, created lazily on first PUT. No salt_v here — that
 --   lives on the user row (see above).
@@ -145,27 +140,6 @@ CREATE TABLE sessions (
 
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE INDEX idx_sessions_expires ON sessions(expires_at);
-
-CREATE TABLE user_totp (
-  user_id             INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  secret_enc          TEXT,
-  pending_secret_enc  TEXT,
-  recovery_hashes     TEXT    NOT NULL DEFAULT '[]',
-  enabled             INTEGER NOT NULL DEFAULT 0,
-  created_at          INTEGER NOT NULL,
-  updated_at          INTEGER NOT NULL
-);
-
-CREATE TABLE mfa_challenges (
-  token_hash  TEXT    PRIMARY KEY,
-  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  expires_at  INTEGER NOT NULL,
-  attempts    INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
-);
-
-CREATE INDEX idx_mfa_challenges_user ON mfa_challenges(user_id);
-CREATE INDEX idx_mfa_challenges_expires ON mfa_challenges(expires_at);
 
 CREATE TABLE vaults (
   user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
