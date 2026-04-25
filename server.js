@@ -23,9 +23,11 @@ const { createMailer } = require('./lib/mailer');
 const { selectMailTransport } = require('./lib/mailTransport');
 const { assertPepperConfigured } = require('./lib/kdf');
 const {
+  assertProductionAuthConfig,
   buildServices,
   finalizeSessionMw,
   mountAuthAndVault,
+  normalizeProductionCorsOrigin,
 } = require('./lib/appFactory');
 const dataStore = require('./data/dataStore');
 const { client, rpcServices } = require('./services/rpcClient');
@@ -105,8 +107,13 @@ app.use(cookieParser());
 // legacy surface evolves.
 // -----------------------------------------------------------------------------
 const legacyCors = cors({ origin: '*', optionsSuccessStatus: 200 });
+const AUTH_ORIGIN = normalizeProductionCorsOrigin(
+  process.env.CORS_ORIGIN ||
+    process.env.FRONTEND_URL ||
+    'http://localhost:3000'
+);
 const authCors = cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  origin: AUTH_ORIGIN,
   credentials: true,
 });
 const { isCredentialedPath } = require('./lib/credentialedPaths');
@@ -182,6 +189,11 @@ const mailer = createMailer({
   publicBaseUrl: PUBLIC_BASE_URL,
 });
 const services = finalizeSessionMw(buildServices({ db }));
+assertProductionAuthConfig({
+  secureCookies: services.secureCookies,
+  corsOrigin: AUTH_ORIGIN,
+  frontendUrl: PUBLIC_BASE_URL,
+});
 
 // Session parsing must cover every route that reads `req.user`. /gov
 // uses `requireAuth` in its router; without parse running here first
