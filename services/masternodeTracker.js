@@ -74,6 +74,7 @@ setInterval(() => {
     }
 
     data.masternodesArr.sort((a, b) => b.lastpaidtime - a.lastpaidtime);
+    data.masternodesUpdatedAt = Date.now();
 
     data.highestMN = Math.max(...Object.values(data.mapData).map(e => e.masternodes || 0));
 

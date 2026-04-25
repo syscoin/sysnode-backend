@@ -53,7 +53,10 @@ async function loggedInAgent(ctx, email = 'user@example.com') {
 // mutable `state` object whose `masternodes` property can be swapped
 // between requests.
 function buildApp({
-  masternodes = [],
+  masternodes = [
+    { collateralHash: H2, collateralIndex: 0 },
+    { collateralHash: H3, collateralIndex: 1 },
+  ],
   voteRaw,
   getCurrentVotes,
   invalidateCurrentVotes,
@@ -319,6 +322,71 @@ describe('POST /gov/vote', () => {
       expect(res.body.results.every((r) => r.error === 'rpc_error')).toBe(
         true
       );
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('prechecks collateral outpoints against the current masternode cache before voteraw', async () => {
+    const { ctx, calls } = buildApp({
+      masternodes: [{ collateralHash: H2, collateralIndex: 0 }],
+    });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(validVoteBody());
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(1);
+      expect(res.body.rejected).toBe(1);
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0]).toBe(H2);
+      expect(res.body.results[1]).toMatchObject({
+        collateralHash: H3,
+        collateralIndex: 1,
+        ok: false,
+        error: 'mn_not_found',
+      });
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('fails open to voteraw while the masternode cache is empty or warming', async () => {
+    const { ctx, calls } = buildApp({ masternodes: [] });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(validVoteBody());
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(2);
+      expect(res.body.rejected).toBe(0);
+      expect(calls).toHaveLength(2);
+    } finally {
+      ctx.db.close();
+    }
+  });
+
+  test('fails open to voteraw when the masternode cache snapshot is stale', async () => {
+    const { ctx, calls } = buildApp({
+      masternodes: {
+        masternodes: [{ collateralHash: H2, collateralIndex: 0 }],
+        updatedAt: Date.now() - 60_000,
+      },
+    });
+    try {
+      const { agent, csrf } = await loggedInAgent(ctx);
+      const res = await agent
+        .post('/gov/vote')
+        .set('X-CSRF-Token', csrf)
+        .send(validVoteBody());
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(2);
+      expect(res.body.rejected).toBe(0);
+      expect(calls).toHaveLength(2);
     } finally {
       ctx.db.close();
     }
