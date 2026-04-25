@@ -353,7 +353,7 @@ describe('POST /gov/vote', () => {
     }
   });
 
-  test('does not call voteraw when the masternode cache has no matching outpoints', async () => {
+  test('fails open to voteraw while the masternode cache is empty or warming', async () => {
     const { ctx, calls } = buildApp({ masternodes: [] });
     try {
       const { agent, csrf } = await loggedInAgent(ctx);
@@ -362,12 +362,9 @@ describe('POST /gov/vote', () => {
         .set('X-CSRF-Token', csrf)
         .send(validVoteBody());
       expect(res.status).toBe(200);
-      expect(res.body.accepted).toBe(0);
-      expect(res.body.rejected).toBe(2);
-      expect(res.body.results.every((r) => r.error === 'mn_not_found')).toBe(
-        true
-      );
-      expect(calls).toHaveLength(0);
+      expect(res.body.accepted).toBe(2);
+      expect(res.body.rejected).toBe(0);
+      expect(calls).toHaveLength(2);
     } finally {
       ctx.db.close();
     }

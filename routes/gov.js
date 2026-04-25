@@ -178,7 +178,7 @@ function createGovRouter({
         const results = new Array(parsed.entries.length);
         parsed.entries.forEach((entry, index) => {
           const key = `${entry.collateralHash}:${entry.collateralIndex}`;
-          if (!knownOutpoints.has(key)) {
+          if (knownOutpoints.size > 0 && !knownOutpoints.has(key)) {
             results[index] = {
               collateralHash: entry.collateralHash,
               collateralIndex: entry.collateralIndex,
