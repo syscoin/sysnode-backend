@@ -513,10 +513,13 @@ function createAuthRouter({
     if (!user || !user.emailVerified) {
       return res.status(401).json({ error: 'mfa_challenge_invalid' });
     }
-    const { expiresAt } = issueLoginSession(req, res, user);
     if (out.recoveryCode) {
-      totp.consumeUserRecoveryCode(out.userId, out.recoveryCode);
+      const consumed = totp.consumeUserRecoveryCode(out.userId, out.recoveryCode);
+      if (!consumed) {
+        return res.status(401).json({ error: 'invalid_totp_code' });
+      }
     }
+    const { expiresAt } = issueLoginSession(req, res, user);
     return res.json({
       user: userBody(user),
       expiresAt,
