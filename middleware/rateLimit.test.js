@@ -1,6 +1,7 @@
 const {
   loginKey,
   mfaLoginKey,
+  verifyPasswordKey,
   registerKey,
   reconcileKey,
   voteKey,
@@ -67,6 +68,30 @@ describe('rate-limit key generators', () => {
       const a = mfaLoginKey(mk({ challengeToken: 'c'.repeat(64) }, '1.2.3.4'));
       const b = mfaLoginKey(mk({ challengeToken: 'c'.repeat(64) }, '5.6.7.8'));
       expect(a).not.toBe(b);
+    });
+  });
+
+  describe('verifyPasswordKey', () => {
+    function mkSession(body, ip, session) {
+      return { ...mk(body, ip, { id: 42 }), session };
+    }
+
+    test('buckets by authenticated session.id when present', () => {
+      const a = verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 100 }));
+      const b = verifyPasswordKey(mkSession({}, '9.9.9.9', { id: 100 }));
+      expect(a).toBe(b);
+      expect(a).toBe('verify-password|s100');
+    });
+
+    test('two sessions for the same user get distinct password-check buckets', () => {
+      const a = verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 100 }));
+      const b = verifyPasswordKey(mkSession({}, '1.2.3.4', { id: 200 }));
+      expect(a).not.toBe(b);
+    });
+
+    test('falls back to IP bucket when the user is missing', () => {
+      const a = verifyPasswordKey(mk({}, '1.2.3.4'));
+      expect(a).toBe('verify-password|ip|1.2.3.4');
     });
   });
 

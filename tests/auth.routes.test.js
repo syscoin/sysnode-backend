@@ -1576,7 +1576,7 @@ describe('createAuthRouter factory contract (Codex round-2 P3)', () => {
       },
       sessionMw: { requireAuth: mw, parse: mw, setSessionCookie: noop, clearSessionCookie: noop },
       csrfMw: { require: mw, parse: mw, issueCookie: noop, clearCookie: noop },
-      limiters: { login: mw, mfaLogin: mw, register: mw, verifyEmail: mw, vote: mw },
+      limiters: { login: mw, mfaLogin: mw, verifyPassword: mw, register: mw, verifyEmail: mw, vote: mw },
       baseUrl: 'http://api.test',
       frontendUrl: 'http://app.test',
       scheduler: (fn) => fn(),

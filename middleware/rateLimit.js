@@ -47,6 +47,18 @@ function mfaLoginKey(req) {
   return `login-totp|${ipBucket(req)}`;
 }
 
+// Per-session bucket for authenticated password re-checks. This endpoint is
+// a credential oracle only after an attacker already has a live session+CSRF
+// pair; keying by session contains abuse to that stolen session instead of
+// letting it burn the whole user's account budget. The IP fallback keeps the
+// limiter safe if a future caller mounts it in the wrong order.
+function verifyPasswordKey(req) {
+  const sessionId =
+    req.session && req.session.id != null ? String(req.session.id) : null;
+  if (sessionId) return `verify-password|s${sessionId}`;
+  return `verify-password|ip|${ipBucket(req)}`;
+}
+
 function registerKey(req) {
   return `register|${ipBucket(req)}`;
 }
@@ -117,6 +129,18 @@ function mfaLoginLimiter() {
   });
 }
 
+function verifyPasswordLimiter() {
+  return rateLimit({
+    windowMs: 15 * MINUTE,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: verifyPasswordKey,
+    message: { error: 'too_many_attempts' },
+    handler: trippedHandler('verify-password'),
+  });
+}
+
 function registerLimiter() {
   return rateLimit({
     windowMs: 60 * MINUTE,
@@ -182,6 +206,7 @@ function disabled() {
 module.exports = {
   loginLimiter,
   mfaLoginLimiter,
+  verifyPasswordLimiter,
   registerLimiter,
   verifyEmailLimiter,
   voteLimiter,
@@ -190,6 +215,7 @@ module.exports = {
   // Exported for direct unit testing.
   loginKey,
   mfaLoginKey,
+  verifyPasswordKey,
   registerKey,
   verifyEmailKey,
   voteKey,

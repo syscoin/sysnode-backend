@@ -927,6 +927,7 @@ function createAuthRouter({
     '/verify-password',
     sessionMw.requireAuth,
     csrfMw.require,
+    limiters.verifyPassword,
     (req, res) => {
       const parsed = VerifyPasswordSchema.safeParse(req.body);
       if (!parsed.success) return badRequest(res, 'invalid_body');
