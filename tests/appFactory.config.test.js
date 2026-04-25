@@ -1,13 +1,17 @@
 const {
   assertProductionAuthConfig,
   buildServices,
+  createApp,
 } = require('../lib/appFactory');
 const { openDatabase } = require('../lib/db');
+const { createMailer } = require('../lib/mailer');
 const { _resetPepperForTests } = require('../lib/kdf');
 
 describe('appFactory production auth config', () => {
   const originalNodeEnv = process.env.NODE_ENV;
   const originalSecureCookies = process.env.SYSNODE_SECURE_COOKIES;
+  const originalCorsOrigin = process.env.CORS_ORIGIN;
+  const originalFrontendUrl = process.env.FRONTEND_URL;
 
   beforeEach(() => {
     _resetPepperForTests();
@@ -21,6 +25,16 @@ describe('appFactory production auth config', () => {
       delete process.env.SYSNODE_SECURE_COOKIES;
     } else {
       process.env.SYSNODE_SECURE_COOKIES = originalSecureCookies;
+    }
+    if (originalCorsOrigin === undefined) {
+      delete process.env.CORS_ORIGIN;
+    } else {
+      process.env.CORS_ORIGIN = originalCorsOrigin;
+    }
+    if (originalFrontendUrl === undefined) {
+      delete process.env.FRONTEND_URL;
+    } else {
+      process.env.FRONTEND_URL = originalFrontendUrl;
     }
   });
 
@@ -76,6 +90,19 @@ describe('appFactory production auth config', () => {
       expect(() => buildServices({ db })).toThrow(
         'secure_cookies_required_in_production'
       );
+    } finally {
+      db.close();
+    }
+  });
+
+  test('standalone createApp accepts FRONTEND_URL as production CORS origin fallback', () => {
+    process.env.NODE_ENV = 'production';
+    delete process.env.CORS_ORIGIN;
+    process.env.FRONTEND_URL = 'https://sysnode.info';
+    const db = openDatabase(':memory:');
+    const mailer = createMailer({ transport: 'memory', from: 't@x.com' });
+    try {
+      expect(() => createApp({ db, mailer })).not.toThrow();
     } finally {
       db.close();
     }
