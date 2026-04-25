@@ -153,7 +153,7 @@ describe('appFactory production auth config', () => {
       'https://sysnode.info'
     );
     process.env.NODE_ENV = 'development';
-    expect(normalizeProductionCorsOrigin('http://localhost:3000')).toBe(
+    expect(normalizeProductionCorsOrigin('http://localhost:3000/app')).toBe(
       'http://localhost:3000'
     );
   });
