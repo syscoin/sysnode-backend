@@ -514,6 +514,9 @@ function createAuthRouter({
       return res.status(401).json({ error: 'mfa_challenge_invalid' });
     }
     const { expiresAt } = issueLoginSession(req, res, user);
+    if (out.recoveryCode) {
+      totp.consumeUserRecoveryCode(out.userId, out.recoveryCode);
+    }
     return res.json({
       user: userBody(user),
       expiresAt,

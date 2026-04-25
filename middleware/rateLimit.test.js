@@ -52,21 +52,21 @@ describe('rate-limit key generators', () => {
   });
 
   describe('mfaLoginKey', () => {
-    test('buckets by challenge token so shared IP users do not collide', () => {
+    test('ignores challenge token so invalid-token floods cannot rotate buckets', () => {
       const a = mfaLoginKey(
         mk({ challengeToken: 'a'.repeat(64) }, '1.2.3.4')
       );
       const b = mfaLoginKey(
         mk({ challengeToken: 'b'.repeat(64) }, '1.2.3.4')
       );
-      expect(a).not.toBe(b);
-      expect(a).toMatch(/^login-totp\|1\.2\.3\.4\|[0-9a-f]{64}$/);
+      expect(a).toBe(b);
+      expect(a).toBe('login-totp|1.2.3.4');
     });
 
-    test('does not store the raw challenge token in the limiter key', () => {
-      const token = 'c'.repeat(64);
-      const key = mfaLoginKey(mk({ challengeToken: token }, '1.2.3.4'));
-      expect(key).not.toContain(token);
+    test('distinct IPs produce distinct MFA endpoint buckets', () => {
+      const a = mfaLoginKey(mk({ challengeToken: 'c'.repeat(64) }, '1.2.3.4'));
+      const b = mfaLoginKey(mk({ challengeToken: 'c'.repeat(64) }, '5.6.7.8'));
+      expect(a).not.toBe(b);
     });
   });
 

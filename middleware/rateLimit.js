@@ -1,6 +1,5 @@
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
-const crypto = require('crypto');
 const { normalizeEmail } = require('../lib/email');
 const securityLog = require('../lib/securityLog');
 
@@ -45,11 +44,7 @@ function loginKey(req) {
 }
 
 function mfaLoginKey(req) {
-  const raw = (req.body && req.body.challengeToken) || '';
-  const tokenHash = /^[0-9a-fA-F]{64}$/.test(raw)
-    ? crypto.createHash('sha256').update(raw.toLowerCase(), 'utf8').digest('hex')
-    : '';
-  return `login-totp|${ipBucket(req)}|${tokenHash}`;
+  return `login-totp|${ipBucket(req)}`;
 }
 
 function registerKey(req) {
@@ -110,7 +105,10 @@ function loginLimiter() {
 function mfaLoginLimiter() {
   return rateLimit({
     windowMs: 15 * MINUTE,
-    max: 5,
+    // Per-challenge OTP guessing is capped in the TOTP repository. This
+    // limiter is an endpoint DoS guard, so it must not key on the
+    // attacker-supplied challenge token.
+    max: 50,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: mfaLoginKey,
