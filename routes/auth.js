@@ -465,7 +465,7 @@ function createAuthRouter({
     });
   }));
 
-  router.post('/login/totp', limiters.login, asyncHandler(async (req, res) => {
+  router.post('/login/totp', limiters.mfaLogin, asyncHandler(async (req, res) => {
     if (!totp) return res.status(503).json({ error: 'server_misconfigured' });
     const parsed = TotpLoginSchema.safeParse(req.body);
     if (!parsed.success) return badRequest(res, 'invalid_body');

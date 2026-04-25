@@ -1,5 +1,6 @@
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
+const crypto = require('crypto');
 const { normalizeEmail } = require('../lib/email');
 const securityLog = require('../lib/securityLog');
 
@@ -41,6 +42,14 @@ function ipBucket(req) {
 function loginKey(req) {
   const raw = (req.body && req.body.email) || '';
   return `login|${ipBucket(req)}|${normalizeEmail(raw)}`;
+}
+
+function mfaLoginKey(req) {
+  const raw = (req.body && req.body.challengeToken) || '';
+  const tokenHash = /^[0-9a-fA-F]{64}$/.test(raw)
+    ? crypto.createHash('sha256').update(raw.toLowerCase(), 'utf8').digest('hex')
+    : '';
+  return `login-totp|${ipBucket(req)}|${tokenHash}`;
 }
 
 function registerKey(req) {
@@ -95,6 +104,18 @@ function loginLimiter() {
     keyGenerator: loginKey,
     message: { error: 'too_many_attempts' },
     handler: trippedHandler('login'),
+  });
+}
+
+function mfaLoginLimiter() {
+  return rateLimit({
+    windowMs: 15 * MINUTE,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: mfaLoginKey,
+    message: { error: 'too_many_attempts' },
+    handler: trippedHandler('login-totp'),
   });
 }
 
@@ -162,6 +183,7 @@ function disabled() {
 
 module.exports = {
   loginLimiter,
+  mfaLoginLimiter,
   registerLimiter,
   verifyEmailLimiter,
   voteLimiter,
@@ -169,6 +191,7 @@ module.exports = {
   disabled,
   // Exported for direct unit testing.
   loginKey,
+  mfaLoginKey,
   registerKey,
   verifyEmailKey,
   voteKey,
