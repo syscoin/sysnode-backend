@@ -56,7 +56,7 @@ function buildSmokeApp() {
   app.get('/health', (_req, res) => res.json({ ok: true }));
 
   // Mimic a legacy route (without requiring a live RPC) to prove coexistence.
-  app.get('/mnStats', (_req, res) => res.json({ legacy: true }));
+  app.get('/mnstats', (_req, res) => res.json({ legacy: true }));
 
   return { app, db };
 }
@@ -74,9 +74,9 @@ describe('server smoke: legacy + auth/vault coexistence', () => {
     expect(res.body.ok).toBe(true);
   });
 
-  test('GET /mnStats (legacy) has permissive CORS and responds', async () => {
+  test('GET /mnstats (legacy) has permissive CORS and responds', async () => {
     const res = await request(ctx.app)
-      .get('/mnStats')
+      .get('/mnstats')
       .set('Origin', 'https://anywhere.example');
     expect(res.status).toBe(200);
     expect(res.headers['access-control-allow-origin']).toBe('*');

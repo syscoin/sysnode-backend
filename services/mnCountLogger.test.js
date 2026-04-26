@@ -435,7 +435,7 @@ describe('createMnCountLogger', () => {
   // outside runAndReschedule()'s try/catch. A transient SQLite
   // read failure there would reject the returned promise, the
   // setTimeout callback didn't attach a .catch, and the scheduler
-  // silently died — daily /mnCount updates would halt until
+  // silently died — daily /mncount updates would halt until
   // process restart. This test wires a repo whose getLatestDate()
   // throws once on the first tick, then recovers, and asserts the
   // logger stays alive and rearms.

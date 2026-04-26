@@ -1,14 +1,27 @@
 const express = require("express");
 const moment = require("moment");
 const router = express.Router();
-const { masternodesArr } = require("../data/dataStore");
 
-router.post("/mnSearch", (req, res) => {
+// IMPORTANT: do NOT destructure `masternodesArr` at require time. The
+// masternode tracker REASSIGNS `dataStore.masternodesArr = []` every
+// 10 seconds (see services/masternodeTracker.js) and pushes into the
+// fresh array, so a captured reference would forever see the original
+// empty `[]` from data/dataStore.js. Read the property on every call
+// to pick up whatever the tracker most recently published. The same
+// reasoning is documented at server.js (`masternodesProvider`), which
+// uses an arrow function for exactly this reason.
+const dataStore = require("../data/dataStore");
+
+router.post("/mnsearch", (req, res) => {
   const { page = 1, sortBy = "", sortDesc = false } = req.body;
   const perPage = req.body.perPage > 0 && req.body.perPage <= 90 ? req.body.perPage : 30;
   const search = (req.body.search || "").replace(/ /g, "");
 
   const query = search.includes(":") ? search.split(":")[0] : search;
+
+  const masternodesArr = Array.isArray(dataStore.masternodesArr)
+    ? dataStore.masternodesArr
+    : [];
 
   const filtered = masternodesArr
     .filter(mn =>

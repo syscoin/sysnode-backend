@@ -2,7 +2,7 @@
 
 const express = require('express');
 
-// GET /mnCount
+// GET /mncount
 // ------------
 // Historical daily total of masternodes on the network, used by the
 // TrendChart component on sysnode-info's homepage.
@@ -28,7 +28,7 @@ function createMnCountRouter({ repo, log = () => {} } = {}) {
   }
   const router = express.Router();
 
-  router.get('/mnCount', (_req, res) => {
+  router.get('/mncount', (_req, res) => {
     try {
       const rows = repo.getAll();
       res.json(rows);
