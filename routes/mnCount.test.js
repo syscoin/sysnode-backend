@@ -4,7 +4,7 @@ const express = require('express');
 const request = require('supertest');
 const { openDatabase } = require('../lib/db');
 const { createMasternodeCountRepo } = require('../lib/masternodeCountRepo');
-const { createMnCountRouter } = require('./mncount');
+const { createMnCountRouter } = require('./mnCount');
 
 function mountApp(router) {
   const app = express();

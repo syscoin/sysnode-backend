@@ -30,7 +30,7 @@ const request = require('supertest');
 
 const rpcClientMock = require('../services/rpcClient');
 const securityLogMock = require('../lib/securityLog');
-const mnListRoute = require('../routes/mnlist');
+const mnListRoute = require('../routes/mnList');
 
 function buildApp() {
   const app = express();

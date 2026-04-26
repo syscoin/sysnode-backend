@@ -28,7 +28,7 @@ const bodyParser = require('body-parser');
 const request = require('supertest');
 
 const dataStore = require('../data/dataStore');
-const mnSearchRoute = require('../routes/mnsearch');
+const mnSearchRoute = require('../routes/mnSearch');
 
 function buildApp() {
   const app = express();
