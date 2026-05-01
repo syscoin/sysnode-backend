@@ -118,6 +118,21 @@ Both apps emit `Strict-Transport-Security` from their own code: the backend via 
 
 Owning HSTS in code means any deployer — behind nginx, Caddy, a managed load balancer, or directly on a TLS-terminating Node — gets HSTS without having to remember to add it at their edge.
 
+### Production host hardening
+
+On production hosts, expose only SSH and the TLS terminator publicly. The Node processes on `:3000` and `:3001` are implementation details behind nginx and should not be reachable directly from the internet. If the app processes bind all interfaces, enforce this with the host firewall or cloud security group:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Do **not** allow `3000/tcp` or `3001/tcp` on production. The `/auth`, `/vault`, `/gov`, `/mnstats`, `/mncount`, `/mnlist`, `/mnsearch`, and `/govlist` paths should be reachable only through the same-origin nginx vhost described above. Before `syscoind` is running, the backend is expected to fail closed if `SYSCOIN_RPC_COOKIE_PATH` is missing; nginx will return `502` for backend routes rather than exposing partial authenticated functionality.
+
 ### Cookie vs static RPC auth
 
 The backend supports both authentication modes and picks **cookie over static** when both are configured (with a one-line warning at boot). Cookie auth is zero-secret-management: `syscoind` rewrites the cookie on every restart, and the backend picks up the new token automatically via a 401-driven replay. Use it for any deployment where the backend runs on the same host as `syscoind`.
