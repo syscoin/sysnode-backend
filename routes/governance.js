@@ -6,10 +6,23 @@ const securityLog = require("../lib/securityLog");
 router.post("/govlist", async (req, res) => {
   try {
     const gobj = await rpcServices(client.callRpc).gObject_list().call();
-    const list = Object.keys(gobj).map(key => {
+    const list = [];
+    Object.keys(gobj).forEach(key => {
       const entry = gobj[key];
-      const dataString = JSON.parse(entry.DataString);
-      return {
+      let dataString;
+      try {
+        dataString = JSON.parse(entry.DataString);
+      } catch (e) {
+        securityLog.event('govlist.malformed_data_string', {
+          req,
+          key,
+          hash: entry && entry.Hash,
+          message: e && e.message,
+        });
+        return;
+      }
+
+      list.push({
         Key: key,
         Hash: entry.Hash,
         ColHash: entry.CollateralHash,
@@ -26,7 +39,7 @@ router.post("/govlist", async (req, res) => {
         fCachedDelete: entry.fCachedDelete,
         fCachedEndorsed: entry.fCachedEndorsed,
         ...dataString
-      };
+      });
     });
 
     list.sort((a, b) => b.AbsoluteYesCount - a.AbsoluteYesCount);
