@@ -130,6 +130,18 @@ describe('POST /mnsearch — live dataStore read', () => {
     expect(res.body.returnArr[0].address).toBe('2001:db8::1:18370');
   });
 
+  test('filters unbracketed IPv6 endpoints when the search includes the port', async () => {
+    dataStore.masternodesArr = [
+      makeNode({ address: '2001:db8::1:18370', payee: 'sys1qa' }),
+      makeNode({ address: '2001:db8::2:18370', payee: 'sys1qb' }),
+    ];
+    const res = await request(buildApp())
+      .post('/mnsearch')
+      .send({ search: '2001:db8::1:18370' });
+    expect(res.body.mnNumb).toBe(1);
+    expect(res.body.returnArr[0].address).toBe('2001:db8::1:18370');
+  });
+
   test('filters bracketed IPv6 endpoints by host', async () => {
     dataStore.masternodesArr = [
       makeNode({ address: '[2001:db8::1]:18370', payee: 'sys1qa' }),

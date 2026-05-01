@@ -37,13 +37,20 @@ function endpointHost(value, { stripUnbracketedIpv6Port = false } = {}) {
   return text;
 }
 
+function searchHostCandidates(search) {
+  const base = endpointHost(search);
+  const stripped = endpointHost(search, { stripUnbracketedIpv6Port: true });
+  return [...new Set([base, stripped].filter(Boolean))];
+}
+
 router.post("/mnsearch", (req, res) => {
   const { page = 1, sortBy = "", sortDesc = false } = req.body;
   const perPage = req.body.perPage > 0 && req.body.perPage <= 90 ? req.body.perPage : 30;
   const search = (req.body.search || "").replace(/ /g, "");
 
   const query = endpointHost(search);
-  const isIpv6Query = query.includes(":");
+  const queryHosts = searchHostCandidates(search);
+  const isIpv6Query = queryHosts.some(candidate => candidate.includes(":"));
 
   const masternodesArr = Array.isArray(dataStore.masternodesArr)
     ? dataStore.masternodesArr
@@ -55,7 +62,7 @@ router.post("/mnsearch", (req, res) => {
         stripUnbracketedIpv6Port: true,
       });
       const addressMatch = isIpv6Query
-        ? addressHost === query
+        ? queryHosts.includes(addressHost)
         : addressHost.includes(query);
       return (
         addressMatch ||
