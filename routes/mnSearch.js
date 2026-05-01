@@ -12,22 +12,63 @@ const router = express.Router();
 // uses an arrow function for exactly this reason.
 const dataStore = require("../data/dataStore");
 
+function endpointHost(value, { stripUnbracketedIpv6Port = false } = {}) {
+  const text = String(value || "");
+  if (!text) return "";
+
+  if (text.startsWith("[")) {
+    const end = text.indexOf("]");
+    if (end > 0) return text.slice(1, end);
+  }
+
+  const firstColon = text.indexOf(":");
+  const lastColon = text.lastIndexOf(":");
+  if (firstColon === -1) return text;
+
+  const tail = text.slice(lastColon + 1);
+  if (firstColon === lastColon) {
+    return /^\d+$/.test(tail) ? text.slice(0, lastColon) : text;
+  }
+
+  if (stripUnbracketedIpv6Port && /^\d+$/.test(tail)) {
+    return text.slice(0, lastColon);
+  }
+
+  return text;
+}
+
+function searchHostCandidates(search) {
+  const base = endpointHost(search);
+  const stripped = endpointHost(search, { stripUnbracketedIpv6Port: true });
+  return [...new Set([base, stripped].filter(Boolean))];
+}
+
 router.post("/mnsearch", (req, res) => {
   const { page = 1, sortBy = "", sortDesc = false } = req.body;
   const perPage = req.body.perPage > 0 && req.body.perPage <= 90 ? req.body.perPage : 30;
   const search = (req.body.search || "").replace(/ /g, "");
 
-  const query = search.includes(":") ? search.split(":")[0] : search;
+  const query = endpointHost(search);
+  const queryHosts = searchHostCandidates(search);
+  const isIpv6Query = queryHosts.some(candidate => candidate.includes(":"));
 
   const masternodesArr = Array.isArray(dataStore.masternodesArr)
     ? dataStore.masternodesArr
     : [];
 
   const filtered = masternodesArr
-    .filter(mn =>
-      mn.address.split(":")[0].includes(query) ||
-      mn.payee.toUpperCase().includes(query.toUpperCase())
-    )
+    .filter(mn => {
+      const addressHost = endpointHost(mn.address, {
+        stripUnbracketedIpv6Port: true,
+      });
+      const addressMatch = isIpv6Query
+        ? queryHosts.includes(addressHost)
+        : addressHost.includes(query);
+      return (
+        addressMatch ||
+        String(mn.payee || "").toUpperCase().includes(query.toUpperCase())
+      );
+    })
     .map(mn => {
       const clone = { ...mn };
       clone.lastpaidtimeS = clone.lastpaidtime || -Infinity;
@@ -53,3 +94,4 @@ router.post("/mnsearch", (req, res) => {
 });
 
 module.exports = router;
+module.exports.endpointHost = endpointHost;

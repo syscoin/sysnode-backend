@@ -118,6 +118,42 @@ describe('POST /mnsearch — live dataStore read', () => {
     expect(res.body.returnArr[0].address).toBe('203.0.113.7:18370');
   });
 
+  test('filters exact IPv6 hosts without truncating at the first colon', async () => {
+    dataStore.masternodesArr = [
+      makeNode({ address: '2001:db8::1:18370', payee: 'sys1qa' }),
+      makeNode({ address: '2001:db8::2:18370', payee: 'sys1qb' }),
+    ];
+    const res = await request(buildApp())
+      .post('/mnsearch')
+      .send({ search: '2001:db8::1' });
+    expect(res.body.mnNumb).toBe(1);
+    expect(res.body.returnArr[0].address).toBe('2001:db8::1:18370');
+  });
+
+  test('filters unbracketed IPv6 endpoints when the search includes the port', async () => {
+    dataStore.masternodesArr = [
+      makeNode({ address: '2001:db8::1:18370', payee: 'sys1qa' }),
+      makeNode({ address: '2001:db8::2:18370', payee: 'sys1qb' }),
+    ];
+    const res = await request(buildApp())
+      .post('/mnsearch')
+      .send({ search: '2001:db8::1:18370' });
+    expect(res.body.mnNumb).toBe(1);
+    expect(res.body.returnArr[0].address).toBe('2001:db8::1:18370');
+  });
+
+  test('filters bracketed IPv6 endpoints by host', async () => {
+    dataStore.masternodesArr = [
+      makeNode({ address: '[2001:db8::1]:18370', payee: 'sys1qa' }),
+      makeNode({ address: '[2001:db8::2]:18370', payee: 'sys1qb' }),
+    ];
+    const res = await request(buildApp())
+      .post('/mnsearch')
+      .send({ search: '[2001:db8::2]:18370' });
+    expect(res.body.mnNumb).toBe(1);
+    expect(res.body.returnArr[0].address).toBe('[2001:db8::2]:18370');
+  });
+
   test('paginates with caller-supplied perPage (clamped to <=90)', async () => {
     dataStore.masternodesArr = Array.from({ length: 50 }, (_, i) =>
       makeNode({ address: `10.0.0.${i}:18370`, payee: `sys1qpayee${i}` })
