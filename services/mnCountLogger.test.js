@@ -4,6 +4,7 @@ const { openDatabase } = require('../lib/db');
 const { createMasternodeCountRepo } = require('../lib/masternodeCountRepo');
 const {
   createMnCountLogger,
+  evaluateCoreSyncReadiness,
   utcDateString,
   msUntilNextMidnightUtc,
   BASE_RETRY_MS,
@@ -95,16 +96,65 @@ describe('msUntilNextMidnightUtc', () => {
   });
 });
 
+describe('evaluateCoreSyncReadiness', () => {
+  test('requires Core to be out of initial block download', () => {
+    expect(
+      evaluateCoreSyncReadiness({
+        blockchainInfo: { initialblockdownload: true },
+        mnSyncStatus: { IsBlockchainSynced: true, IsSynced: true },
+      })
+    ).toMatchObject({
+      ready: false,
+      reason: 'initial_block_download',
+    });
+  });
+
+  test('requires masternode sync to be complete', () => {
+    expect(
+      evaluateCoreSyncReadiness({
+        blockchainInfo: { initialblockdownload: false },
+        mnSyncStatus: {
+          IsBlockchainSynced: true,
+          IsSynced: false,
+          AssetName: 'MASTERNODE_SYNC_LIST',
+        },
+      })
+    ).toMatchObject({
+      ready: false,
+      reason: 'masternode_sync_incomplete',
+      isSynced: false,
+    });
+  });
+
+  test('accepts a fully synced Core and masternode layer', () => {
+    expect(
+      evaluateCoreSyncReadiness({
+        blockchainInfo: { initialblockdownload: false },
+        mnSyncStatus: {
+          IsBlockchainSynced: true,
+          IsSynced: true,
+          AssetName: 'MASTERNODE_SYNC_FINISHED',
+        },
+      })
+    ).toEqual({ ready: true });
+  });
+});
+
 describe('createMnCountLogger', () => {
   let db;
   let repo;
   let clock;
   let scheduler;
   let fetchTotal;
+  let isReadyForSample;
   let logs;
   let logger;
 
-  function setup({ rpcSequence = [], startAtIso = '2024-03-15T12:00:00Z' } = {}) {
+  function setup({
+    rpcSequence = [],
+    readinessSequence = [],
+    startAtIso = '2024-03-15T12:00:00Z',
+  } = {}) {
     db = openDatabase(':memory:');
     repo = createMasternodeCountRepo(db);
     clock = { nowMs: msAt(startAtIso) };
@@ -121,10 +171,20 @@ describe('createMnCountLogger', () => {
       return item;
     });
 
+    let readinessIdx = 0;
+    isReadyForSample = jest.fn(async () => {
+      if (readinessIdx >= readinessSequence.length) return { ready: true };
+      const item = readinessSequence[readinessIdx++];
+      if (typeof item === 'function') return item();
+      if (item instanceof Error) throw item;
+      return item;
+    });
+
     logs = [];
     logger = createMnCountLogger({
       repo,
       fetchTotal,
+      isReadyForSample,
       now: () => clock.nowMs,
       log: (level, event, meta) => logs.push({ level, event, meta }),
       setTimeoutImpl: scheduler.setTimeoutImpl,
@@ -177,6 +237,47 @@ describe('createMnCountLogger', () => {
     expect(result.err).toBe('rpc down');
     expect(repo.isEmpty()).toBe(true);
     expect(logs.some((l) => l.event === 'mncount_catchup_failed')).toBe(true);
+  });
+
+  test('catchUpIfNeeded skips the write while Core or mnsync is not ready', async () => {
+    setup({
+      rpcSequence: [2239],
+      readinessSequence: [
+        {
+          ready: false,
+          reason: 'masternode_sync_incomplete',
+          isBlockchainSynced: true,
+          isSynced: false,
+        },
+      ],
+      startAtIso: '2024-03-15T12:00:00Z',
+    });
+
+    const result = await logger.catchUpIfNeeded();
+
+    expect(result).toMatchObject({
+      skipped: true,
+      reason: 'error',
+      err: 'mncount source not synced: masternode_sync_incomplete',
+    });
+    expect(fetchTotal).not.toHaveBeenCalled();
+    expect(repo.isEmpty()).toBe(true);
+    expect(logs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          level: 'warn',
+          event: 'mncount_skip_not_synced',
+          meta: expect.objectContaining({
+            reason: 'masternode_sync_incomplete',
+            isSynced: false,
+          }),
+        }),
+        expect.objectContaining({
+          level: 'error',
+          event: 'mncount_catchup_failed',
+        }),
+      ])
+    );
   });
 
   test('repeated writes for the same UTC date are idempotent (skip + PK on date)', async () => {
@@ -266,6 +367,37 @@ describe('createMnCountLogger', () => {
     expect(afterSuccess).toHaveLength(1);
     // Post-success from roughly 06:02Z, next midnight is ~18h out.
     expect(afterSuccess[0]).toBeGreaterThan(17 * 3600 * 1000);
+  });
+
+  test('start() retries inside the same UTC day until sync is ready', async () => {
+    setup({
+      rpcSequence: [2239],
+      readinessSequence: [
+        {
+          ready: false,
+          reason: 'initial_block_download',
+          initialblockdownload: true,
+        },
+        { ready: true },
+      ],
+      startAtIso: '2024-03-15T06:00:00Z',
+    });
+
+    logger.start();
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+
+    expect(fetchTotal).not.toHaveBeenCalled();
+    expect(repo.isEmpty()).toBe(true);
+    expect(logs.some((l) => l.event === 'mncount_skip_not_synced')).toBe(true);
+    expect(scheduler.pending()).toHaveLength(1);
+    expect(scheduler.pending()[0].delay).toBeLessThan(
+      18 * 3600 * 1000 + POST_MIDNIGHT_SKEW_MS
+    );
+
+    await scheduler.fireNext();
+
+    expect(fetchTotal).toHaveBeenCalledTimes(1);
+    expect(repo.getAll()).toEqual([{ date: '2024-03-15', users: 2239 }]);
   });
 
   test('start() keeps backing off on repeated RPC failure, still inside today', async () => {

@@ -45,6 +45,32 @@ const BASE_RETRY_MS = 60 * 1000;
 const MAX_RETRY_MS = 60 * 60 * 1000;
 const POST_MIDNIGHT_SKEW_MS = 5 * 1000;
 
+function evaluateCoreSyncReadiness({ blockchainInfo, mnSyncStatus } = {}) {
+  if (!blockchainInfo || blockchainInfo.initialblockdownload !== false) {
+    return {
+      ready: false,
+      reason: 'initial_block_download',
+      initialblockdownload: blockchainInfo && blockchainInfo.initialblockdownload,
+    };
+  }
+
+  if (
+    !mnSyncStatus ||
+    mnSyncStatus.IsBlockchainSynced !== true ||
+    mnSyncStatus.IsSynced !== true
+  ) {
+    return {
+      ready: false,
+      reason: 'masternode_sync_incomplete',
+      isBlockchainSynced: mnSyncStatus && mnSyncStatus.IsBlockchainSynced,
+      isSynced: mnSyncStatus && mnSyncStatus.IsSynced,
+      assetName: mnSyncStatus && mnSyncStatus.AssetName,
+    };
+  }
+
+  return { ready: true };
+}
+
 function utcDateString(ms) {
   return new Date(ms).toISOString().slice(0, 10);
 }
@@ -69,6 +95,7 @@ function msUntilNextMidnightUtc(fromMs) {
 function createMnCountLogger({
   repo,
   fetchTotal,
+  isReadyForSample = async () => ({ ready: true }),
   now = () => Date.now(),
   log = () => {},
   setTimeoutImpl = setTimeout,
@@ -77,6 +104,9 @@ function createMnCountLogger({
   if (!repo) throw new Error('createMnCountLogger: repo is required');
   if (typeof fetchTotal !== 'function') {
     throw new Error('createMnCountLogger: fetchTotal must be a function');
+  }
+  if (typeof isReadyForSample !== 'function') {
+    throw new Error('createMnCountLogger: isReadyForSample must be a function');
   }
 
   let timer = null;
@@ -88,6 +118,22 @@ function createMnCountLogger({
   let currentRetryMs = BASE_RETRY_MS;
 
   async function sampleAndWrite(label) {
+    const readiness = await isReadyForSample();
+    const ready =
+      readiness === true ||
+      (readiness && typeof readiness === 'object' && readiness.ready === true);
+    if (!ready) {
+      const meta =
+        readiness && typeof readiness === 'object'
+          ? { label, ...readiness }
+          : { label, ready: false };
+      log('warn', 'mncount_skip_not_synced', meta);
+      const err = new Error(`mncount source not synced: ${meta.reason || 'unknown'}`);
+      err.code = 'mncount_not_synced';
+      err.meta = meta;
+      throw err;
+    }
+
     const total = await fetchTotal();
     if (!Number.isInteger(total) || total < 0) {
       throw new Error(
@@ -283,6 +329,7 @@ function createMnCountLogger({
 
 module.exports = {
   createMnCountLogger,
+  evaluateCoreSyncReadiness,
   utcDateString,
   msUntilNextMidnightUtc,
   BASE_RETRY_MS,

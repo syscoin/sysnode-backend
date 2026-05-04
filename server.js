@@ -44,7 +44,10 @@ const {
   createMasternodeCountRepo,
 } = require('./lib/masternodeCountRepo');
 const { seedMasternodeCount } = require('./lib/mnCountSeed');
-const { createMnCountLogger } = require('./services/mnCountLogger');
+const {
+  createMnCountLogger,
+  evaluateCoreSyncReadiness,
+} = require('./services/mnCountLogger');
 
 // Per-process cache for `gobject_getcurrentvotes`. Concurrent callers
 // hitting GET /gov/receipts for the same proposal share one RPC; a
@@ -155,6 +158,12 @@ seedMasternodeCount({
 // to exit on SIGINT even if a tick is scheduled.
 const mnCountLogger = createMnCountLogger({
   repo: mnCountRepo,
+  isReadyForSample: async () => {
+    const services = rpcServices(client.callRpc);
+    const blockchainInfo = await services.getBlockchainInfo().call();
+    const mnSyncStatus = await services.mnSync('status').call();
+    return evaluateCoreSyncReadiness({ blockchainInfo, mnSyncStatus });
+  },
   fetchTotal: async () => {
     const r = await rpcServices(client.callRpc).masternode_count().call();
     const total = r && r.total;
