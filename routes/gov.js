@@ -202,9 +202,15 @@ function createGovRouter({
           nowMs(),
           masternodeCacheMaxAgeMs
         );
-        const knownOutpoints = snapshot.fresh
-          ? knownOutpointSet(snapshot.masternodes)
-          : new Set();
+        if (!snapshot.fresh) {
+          return res.status(503).json({ error: 'masternode_cache_stale' });
+        }
+
+        const knownOutpoints = knownOutpointSet(snapshot.masternodes);
+        if (knownOutpoints.size === 0) {
+          return res.status(503).json({ error: 'masternode_cache_empty' });
+        }
+
         const relayEntries = [];
         const relayIndexes = [];
         const results = new Array(parsed.entries.length);
