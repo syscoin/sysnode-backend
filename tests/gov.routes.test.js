@@ -353,7 +353,7 @@ describe('POST /gov/vote', () => {
     }
   });
 
-  test('fails open to voteraw while the masternode cache is empty or warming', async () => {
+  test('fails closed while the masternode cache is empty or warming', async () => {
     const { ctx, calls } = buildApp({ masternodes: [] });
     try {
       const { agent, csrf } = await loggedInAgent(ctx);
@@ -361,16 +361,15 @@ describe('POST /gov/vote', () => {
         .post('/gov/vote')
         .set('X-CSRF-Token', csrf)
         .send(validVoteBody());
-      expect(res.status).toBe(200);
-      expect(res.body.accepted).toBe(2);
-      expect(res.body.rejected).toBe(0);
-      expect(calls).toHaveLength(2);
+      expect(res.status).toBe(503);
+      expect(res.body.error).toBe('masternode_cache_empty');
+      expect(calls).toHaveLength(0);
     } finally {
       ctx.db.close();
     }
   });
 
-  test('fails open to voteraw when the masternode cache snapshot is stale', async () => {
+  test('fails closed when the masternode cache snapshot is stale', async () => {
     const { ctx, calls } = buildApp({
       masternodes: {
         masternodes: [{ collateralHash: H2, collateralIndex: 0 }],
@@ -383,10 +382,9 @@ describe('POST /gov/vote', () => {
         .post('/gov/vote')
         .set('X-CSRF-Token', csrf)
         .send(validVoteBody());
-      expect(res.status).toBe(200);
-      expect(res.body.accepted).toBe(2);
-      expect(res.body.rejected).toBe(0);
-      expect(calls).toHaveLength(2);
+      expect(res.status).toBe(503);
+      expect(res.body.error).toBe('masternode_cache_stale');
+      expect(calls).toHaveLength(0);
     } finally {
       ctx.db.close();
     }
