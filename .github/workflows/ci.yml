@@ -43,6 +43,9 @@ jobs:
       - name: Run tests
         run: npm test -- --runInBand --ci --colors
 
+      - name: Verify Sentry codec integration
+        run: npm run test:sentry-codec
+
   audit:
     name: Production dependency audit
     runs-on: ubuntu-latest
