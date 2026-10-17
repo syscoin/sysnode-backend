@@ -204,12 +204,6 @@ assertProductionAuthConfig({
   frontendUrl: PUBLIC_BASE_URL,
 });
 
-// Session parsing must cover every route that reads `req.user`. /gov
-// uses `requireAuth` in its router; without parse running here first
-// `req.user` would always be undefined and every authenticated caller
-// would see a 401.
-app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
-
 // Proposal RPC adapter.
 //
 // The governance-proposals code (dispatcher + prepare pre-flight)
