@@ -33,6 +33,7 @@ const { client, rpcServices } = require('./services/rpcClient');
 const { createCurrentVotesCache } = require('./lib/voteReceipts');
 const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
+const { createReminderSource, createReminderRpc } = require('./lib/reminderSource');
 const { createProposalDispatcher } = require('./lib/proposalDispatcher');
 const { createProposalRpc } = require('./lib/proposalRpc');
 const {
@@ -405,87 +406,20 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000).unref();
 
-// Governance reminder dispatcher (PR 7).
-//
-// Fires hourly. The dispatcher itself decides whether any email is
-// owed on a given tick by comparing the current time to the earliest
-// proposal deadline. Users who have voted in the current cycle are
-// skipped by the dispatcher's internal gating; users who have opted
-// out of reminders in notification_prefs are never considered.
-//
-// We intentionally source active proposals from `gObject_list` RPC
-// on each tick rather than reading a cached view: the tick cadence
-// is hourly and the RPC is cheap, so adding a cache layer only
-// inflates the code surface. If reminders ever graduate to sub-hour
-// cadence, wrap this with a short-lived memo.
-//
-// Mailer is the same instance wired into /auth above (line ~121);
-// createMailer is idempotent in the 'log' / 'memory' transports and
-// fine to share for 'smtp' since nodemailer pools internally. We
-// deliberately reuse rather than re-create to avoid a double-pooled
-// SMTP connection for what is semantically one mail pipeline.
+// Hourly reminders read a bounded, same-tip Core snapshot directly. They do
+// not depend on the cached market/dashboard worker or its empirical ETA.
+const reminderSource = createReminderSource({
+  rpcCall: createReminderRpc(client),
+  network: PALI_NETWORK_KEY,
+});
 const reminderLog = createReminderLog(db);
 const reminderDispatcher = createReminderDispatcher({
   users: services.users,
   voteReceipts: services.voteReceipts,
   reminderLog,
   mailer,
-  // Shape: [{ hash, startEpoch, endEpoch }]. gObject_list returns a
-  // map keyed by gov-object hash, with `DataString` containing the
-  // per-proposal JSON that has start_epoch + end_epoch (unix
-  // seconds). We project here rather than inside the dispatcher
-  // because the RPC shape is a server-side concern (the dispatcher
-  // contract is the normalized shape).
-  //
-  // Both start_epoch and end_epoch are forwarded so the dispatcher
-  // can filter proposals by SB-eligibility
-  // (startEpoch <= nextSbEpochSec <= endEpoch). A missing
-  // start_epoch defaults to 0 inside normalizeProposal, which the
-  // eligibility check treats as "no lower bound" — that keeps any
-  // legacy DataString payload (from clients that predate the
-  // derive-window wizard) in the cycle rather than silently
-  // dropping it.
-  getActiveProposals: async () => {
-    const raw = await rpcServices(client.callRpc).gObject_list().call();
-    const out = [];
-    for (const key of Object.keys(raw)) {
-      const entry = raw[key];
-      let data;
-      try {
-        data = JSON.parse(entry.DataString);
-      } catch {
-        continue;
-      }
-      const endEpoch = Number(data && data.end_epoch);
-      if (!Number.isFinite(endEpoch) || endEpoch <= 0) continue;
-      const rawStart = Number(data && data.start_epoch);
-      const startEpoch =
-        Number.isFinite(rawStart) && rawStart > 0 ? rawStart : 0;
-      out.push({ hash: entry.Hash, startEpoch, endEpoch });
-    }
-    return out;
-  },
-  // Next-superblock snapshot: { height, epochSec } read atomically
-  // from the in-memory dataStore (sysMain refreshes every 20s).
-  //
-  //   - `height` is Core's nextSuperBlock block number. It is
-  //     STABLE — it only changes when the SB actually executes and
-  //     jumps by exactly nSuperblockCycle (17520 mainnet). The
-  //     dispatcher uses it for scopeKey so reminderLog.has()
-  //     deduplicates correctly across the 72h reminder window.
-  //   - `epochSec` is sysMain's `Date.now() + diffBlock * avgBlockTime`
-  //     estimate of when the SB will occur. It DRIFTS every 20s
-  //     and is used for time-remaining calculations only (bucket
-  //     thresholds are in hours so minute-scale drift is fine).
-  //
-  // Missing / stale / zero values surface as
-  // `skipped: 'next_superblock_unavailable'` and the dispatcher
-  // retries on the next hourly tick — correct behavior on cold
-  // boot (sysMain hasn't completed its first pass) or RPC hiccups.
-  getNextSuperblock: async () => ({
-    height: Number(dataStore.nextSuperBlock) | 0,
-    epochSec: Number(dataStore.superBlockNextEpochSec) || 0,
-  }),
+  getNextSuperblock: reminderSource.getNextSuperblock,
+  getActiveProposals: reminderSource.getActiveProposals,
   log: (level, event, meta) => {
     // eslint-disable-next-line no-console
     console.log(`[reminder] ${level} ${event}`, meta || '');

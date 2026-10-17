@@ -171,6 +171,31 @@ npm install -g pm2 serve
 
 Email delivery (account verification, password-change notices, vote reminders, proposal status updates) goes through any SMTP provider you choose — SMTP2GO, SendGrid, Brevo, Postmark, Mailgun, AWS SES, or a corporate mail relay all work identically from the app's perspective. Pick one, verify a sender domain you control on their dashboard, and note its SMTP host / port / username / password. You'll paste those into `.env` in the next section.
 
+Governance reminders use a fresh, same-tip Core snapshot, not the market/dashboard
+cache. `SYSCOIN_NETWORK` must be `mainnet` or `testnet`; the service verifies the
+configured network's genesis, sync state and governance parameters before sending.
+Reads abort after a 20-second overall budget and a moving tip gets one retry.
+The two reminder buckets are 24–72 hours and at most 24 hours before **estimated
+payout-trigger selection**, using Core's 150-second block projection and its RPC
+maturity-block count. Reminders stop once the maturity height is reached. This
+is not a claim that Core refuses later proposal votes.
+
+Only valid proposal objects with a supported calendar window are included.
+Timestamp fields must be integer Unix seconds with `0 <= start < end <= 253402300799`
+(year 9999). This notification/presentation bound does not change Core validity:
+malformed or millisecond-looking on-chain dates are excluded, never reinterpreted.
+Payment eligibility follows Core's two-hour window tolerance. Vote receipts are
+matched to the governance **object ID**, not its separate data hash. A locally
+recorded relayed/confirmed vote on any eligible proposal suppresses both buckets;
+votes made through other tools may be unknown, so email copy does not assert that
+the recipient has not voted. Preferences and their existing defaults are unchanged.
+
+The log deduplicates by user, next-superblock height and bucket; one in-process
+tick runs at a time to avoid overlap while SMTP is pending. A snapshot older than
+60 seconds stops further deliveries until a fresh tick. SMTP and SQLite are not
+one atomic transaction: a crash or log failure after SMTP accepts a message can
+still cause a retry, so this is best-effort delivery, not exactly-once mail.
+
 In production the backend refuses to boot unless `SMTP_HOST` is set (or `MAIL_TRANSPORT=log` is set explicitly for stdout-only dry-run), so this step is required before the backend will start with `NODE_ENV=production`.
 
 ### 3. Clone both repos

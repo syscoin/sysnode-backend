@@ -93,4 +93,19 @@ describe('POST /govlist', () => {
       expect.objectContaining({ message: 'rpc down' })
     );
   });
+
+  test('untrusted proposal JSON cannot replace Core identity, counts, or validity metadata', async () => {
+    mockGObjectList({ ['a'.repeat(64)]: {
+      Hash: 'b'.repeat(64), ObjectType: 1, fCachedValid: false,
+      fBlockchainValidity: false, fCachedDelete: true, AbsoluteYesCount: 0,
+      DataString: JSON.stringify({ name: 'payload name', Key: 'c'.repeat(64),
+        Hash: 'd'.repeat(64), ObectType: 1, fCachedValid: true,
+        fBlockchainValidity: true, fCachedDelete: false, AbsoluteYesCount: 9000 }),
+    } });
+    const res = await request(buildApp()).post('/govlist').send({});
+    expect(res.status).toBe(200);
+    expect(res.body[0]).toMatchObject({ name: 'payload name', Key: 'a'.repeat(64),
+      Hash: 'b'.repeat(64), ObectType: 1, fCachedValid: false,
+      fBlockchainValidity: false, fCachedDelete: true, AbsoluteYesCount: 0 });
+  });
 });
