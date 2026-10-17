@@ -126,7 +126,7 @@ async function verifySentryDeployment(options = {}) {
     throw failure('pq_not_disabled', 'Legacy rollout requires PQ preparation to be explicitly disabled.');
   }
   const unauthorized = await readJson(config, '/api/sentry/v1/operations', 401);
-  if (unauthorized.error !== 'unauthorized') {
+  if (unauthorized.error !== 'unauthorized' || Object.keys(unauthorized).length !== 1) {
     throw failure('invalid_auth_boundary', 'Unauthenticated management reads must return the standard unauthorized response.');
   }
   const checks = ['capabilities', 'expected-chain', 'expected-operations', 'unauthenticated-management'];

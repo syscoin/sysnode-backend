@@ -87,6 +87,12 @@ test('rejects an incorrect unauthorized envelope', async () => {
     ? jsonHandler(capabilities())(request, response) : jsonHandler({ error: 'other' }, 401)(request, response);
   await expect(verify()).rejects.toMatchObject({ code: 'invalid_auth_boundary' });
 });
+test('rejects protected data added to an unauthorized response', async () => {
+  handler = (request, response) => request.url.endsWith('/capabilities')
+    ? jsonHandler(capabilities())(request, response)
+    : jsonHandler({ error: 'unauthorized', operations: [{ id: 'private-operation' }] }, 401)(request, response);
+  await expect(verify()).rejects.toMatchObject({ code: 'invalid_auth_boundary' });
+});
 test('rejects a different public node context', async () => {
   const normal = handler;
   handler = (request, response) => request.url.includes('/context?')
