@@ -16,6 +16,7 @@
 #     https://sysnode.example.com/auth/*   -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/vault    -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/gov/*    -> sysnode-backend     (port 3001)
+#     https://sysnode.example.com/api/sentry/v1/* -> backend     (port 3001)
 #     https://sysnode.example.com/mnstats  -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/mncount  -> sysnode-backend     (port 3001)
 #     https://sysnode.example.com/mnlist   -> sysnode-backend     (port 3001)
@@ -54,7 +55,7 @@ server {
     client_max_body_size 5M;
 
     # ---- backend (sysnode-backend on :3001) -------------------------------
-    # The backend mounts /auth, /vault, /gov at the path root, so we proxy
+    # The backend mounts /auth, /vault, /gov, /api/sentry/v1 at the path root, so we proxy
     # without rewriting. Trailing-slash matching (`location /auth/`) means
     # only paths *under* /auth/ are proxied (e.g. /auth/me, /auth/login);
     # something else at /authentication would NOT match and would fall
