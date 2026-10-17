@@ -29,7 +29,7 @@
     ]
   },
   "dependencies": {
-    "@sidhujag/sysweb3-sentry": "0.1.0",
+    "@sidhujag/sysweb3-sentry": "0.1.1",
     "@syscoin/syscoin-js": "git+https://github.com/syscoin/syscoind-rpc.git#637a1de10522d1ce34a4e0f283c59b9d55bde814",
     "axios": "^1.15.2",
     "better-sqlite3": "^12.9.0",
