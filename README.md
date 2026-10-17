@@ -358,6 +358,29 @@ The existing live proxy and Core metadata APIs must be verified after rollout;
 updating these repository examples alone does not update deployed systems.
 No route accepts an RPC URL, RPC method name, or owner/operator private key.
 
+After deployment, run the anonymous, read-only verifier with independently
+trusted chain expectations (do not copy the genesis from the service being
+checked):
+
+```bash
+npm run verify:sentry-deployment -- \
+  --origin https://sysnode.info --network mainnet \
+  --genesis <trusted-genesis-hash> --era legacy-v3
+```
+
+Optionally add `--pro-tx-hash <known-node-hash>` to check the public node-context
+route. The command requires HTTPS, rejects redirects, bounds each request to
+10 seconds and 128 KiB, and exits nonzero on an HTML/rewritten route, mismatched
+chain, missing operations or broken anonymous-auth boundary. A `legacy-v3`
+check also requires PQ preparation to be explicitly false and rejects advertised
+PQ operations. `--era pq-v4` is an explicit different expectation, not an
+automatic fallback. `--timeout-ms` can set a request deadline up to 30 seconds.
+Successful output is JSON with `ok: true`; no server bodies or credentials are
+printed on failure. It sends only unauthenticated GETs to capabilities,
+operations and, when requested, context. It does not log in, inspect a user's
+history, sign or broadcast. Authenticated writes and a real operator lifecycle
+still require their separate rollout validation; this check cannot certify them.
+
 Preparation uses the shared `@sidhujag/sysweb3-sentry` codec and public fee-account
 data. `/operations/:id/authorize` checks completed wallet authorizations and
 returns a fee-signing PSBT. `/operations/:id/submit` checks the stored immutable
