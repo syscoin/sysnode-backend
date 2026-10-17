@@ -207,6 +207,18 @@ function disabled() {
   return (_req, _res, next) => next();
 }
 
+function sentryReadLimiter() {
+  return rateLimit({ windowMs: MINUTE, max: 120, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => `sentry-read|${ipBucket(req)}`,
+    message: { error: 'too_many_sentry_requests' }, handler: trippedHandler('sentry-read') });
+}
+
+function sentryManagementLimiter() {
+  return rateLimit({ windowMs: 60 * MINUTE, max: 120, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => `sentry-management|${req.user?.id || ipBucket(req)}`,
+    message: { error: 'too_many_sentry_requests' }, handler: trippedHandler('sentry-management') });
+}
+
 module.exports = {
   loginLimiter,
   mfaLoginLimiter,
@@ -216,6 +228,8 @@ module.exports = {
   verifyEmailLimiter,
   voteLimiter,
   reconcileLimiter,
+  sentryReadLimiter,
+  sentryManagementLimiter,
   disabled,
   // Exported for direct unit testing.
   loginKey,

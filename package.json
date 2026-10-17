@@ -1,6 +1,7 @@
 {
   "name": "sysnode",
   "version": "1.0.0",
+  "engines": { "node": ">=20.19.0" },
   "description": "Syscoin backend for masternode and governance stats",
   "main": "server.js",
   "scripts": {
@@ -8,6 +9,8 @@
     "dev": "nodemon server.js",
     "test": "jest",
     "test:watch": "jest --watch",
+    "test:sentry-codec": "node --test tests/sentry-codec.integration.mjs",
+    "test:sentry-core": "node scripts/sentry-core-regtest.mjs",
     "test:coverage": "jest --coverage",
     "audit:prod": "npm audit --omit=dev --audit-level=high"
   },

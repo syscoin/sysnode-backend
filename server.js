@@ -40,6 +40,7 @@ const {
   createDefaultSyscoinClient,
 } = require('./lib/proposalPsbt');
 const { createPaliChainGuard } = require('./lib/paliChainGuard');
+const { createConfiguredSentryAdapter, createSentryRpc } = require('./lib/sentryAdapter');
 const {
   createMasternodeCountRepo,
 } = require('./lib/masternodeCountRepo');
@@ -363,6 +364,12 @@ mountAuthAndVault(app, {
   governanceNetworkInfo: paliNetworkInfo,
   buildCollateralPsbt: paliPsbtBuilder,
   paliChainGuard,
+  sentryAdapter: createConfiguredSentryAdapter({
+    rpcCall: createSentryRpc(client),
+    network: PALI_NETWORK_KEY,
+    genesisHash: String(process.env.SYSCOIN_SENTRY_GENESIS_HASH || '').trim(),
+    fundingClient: paliSyscoinClient,
+  }),
 });
 
 // -----------------------------------------------------------------------------

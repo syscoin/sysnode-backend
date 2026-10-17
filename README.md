@@ -335,6 +335,46 @@ pm2 restart sysnode-backend sysnode-info
 | Verification emails never arrive | SMTP creds wrong, sender domain not verified at the provider, or mail filtered into spam | Check backend logs for 5xx SMTP responses, the provider's dashboard for bounces/delivery status, and the recipient's spam folder |
 | Frontend hits `https://syscoin.dev` instead of the test backend | `REACT_APP_API_BASE` not set at build time | Rebuild with the env var inline |
 
+## Sentry management API
+
+Enable `/api/sentry/v1/` with the existing `SYSCOIN_NETWORK` and
+`SYSCOIN_BLOCKBOOK_URL` settings plus `SYSCOIN_SENTRY_GENESIS_HASH` for the exact
+configured network. The Core node must provide `protx_capabilities` and, for PQ
+operators, extended `protx_operator_key_info`. Missing capability metadata disables
+signing; the backend never guesses an activation state from key length.
+
+`GET /capabilities` and `GET /context` are rate-limited public chain reads for
+wallets. All node-watch and operation endpoints require a verified session;
+writes also require the configured exact Origin and the existing CSRF token.
+The proxy example includes this same-origin path. No route accepts an RPC URL,
+RPC method name, or owner/operator private key.
+
+Preparation uses the shared `@sidhujag/sysweb3-sentry` codec and public fee-account
+data. `/operations/:id/authorize` checks completed wallet authorizations and
+returns a fee-signing PSBT. `/operations/:id/submit` checks the stored immutable
+transaction, current authority, fee limit and `testmempoolaccept`, then records
+the exact signed bytes and transaction ID before one broadcast attempt.
+`GET /operations/:id` reconciles uncertain submissions and verifies on-chain
+readback. It never creates a replacement transaction. SQLite journals contain
+public transaction data only and are isolated by authenticated user ID.
+After a network failure, the user may explicitly request
+`POST /operations/:id/retry` with an empty body. The backend checks for the
+original transaction first, then revalidates and republishes only the stored
+signed bytes if needed. A per-operation cooldown and atomic claim bound retries;
+no new signature, new transaction ID, replacement transaction or fee bump occurs.
+
+Run `npm test -- --runInBand` and `npm run test:sentry-codec`. Codec integration
+uses real legacy/PQ signatures and fee signatures with synthetic RPC fixtures;
+it does not submit transactions to a public network.
+
+For the actual legacy consensus smoke test, set `SENTRY_CORE_BIN` to a directory
+containing the metadata-enabled `syscoind` and `syscoin-cli`, then run
+`npm run test:sentry-core`. It creates a fresh disconnected regtest and synthetic
+wallet, registers a node, signs NEVM add/update/remove requests with the shared
+SDK, and requires Core mempool acceptance plus mined registration readback.
+The test stops its Core process and prints its isolated temporary data directory
+for inspection. It never uses a configured service RPC or an existing wallet.
+
 ## License
 
 MIT
