@@ -350,10 +350,13 @@ treated as transaction absence and do not demote confirmed operation records.
 `GET /capabilities` and `GET /context` are rate-limited public chain reads for
 wallets. All node-watch and operation endpoints require a verified session;
 writes also require the configured exact Origin and the existing CSRF token.
-The proxy example includes this same-origin path. Apply the
-`location /api/sentry/v1/` block without a `proxy_pass` URI rewrite when deploying;
-otherwise Pali's default `https://sysnode.info/api/sentry/v1/context` request
-would fall through to the frontend instead of receiving chain metadata.
+The public API remains `/api/sentry/v1/`, including Pali's default
+`https://sysnode.info/api/sentry/v1/context`. The proxy example forwards that
+path without rewriting. Existing proxies that strip the leading `/api` are
+also supported through the internal `/sentry/v1/` prefix. Both forms mount the
+same router, session/CSRF checks and rate-limit buckets; the internal prefix is
+not a separate public API or a weaker authentication path. Do not expose raw
+backend ports or change the wallet's trusted service URL to accommodate a proxy.
 The existing live proxy and Core metadata APIs must be verified after rollout;
 updating these repository examples alone does not update deployed systems.
 No route accepts an RPC URL, RPC method name, or owner/operator private key.
