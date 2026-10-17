@@ -85,6 +85,10 @@ All configuration is via environment variables. `.env.example` is the source of 
 
 ## Production authenticated deployment
 
+Automatic, SHA-pinned deployment on the existing persistent host is documented in
+[`deploy/automation/README.md`](deploy/automation/README.md). It runs only after
+successful default-branch CI and preserves the live environment and database.
+
 Real voting-key custody should use a same-origin deployment for the authenticated API surface. Serve the SPA and proxy `/auth`, `/vault`, and `/gov` from the same public HTTPS origin:
 
 ```text

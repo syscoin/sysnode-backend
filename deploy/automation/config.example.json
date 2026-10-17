@@ -1,0 +1,12 @@
+{
+  "appsRoot": "/home/ubuntu/apps",
+  "stateRoot": "/home/ubuntu/.local/state/sysnode-deploy",
+  "pm2": "/home/ubuntu/.npm-global/bin/pm2",
+  "flock": "/usr/bin/flock",
+  "origin": "https://sysnode.info",
+  "network": "mainnet",
+  "era": "legacy-v3",
+  "backendPort": 3001,
+  "genesisHash": "0000022642db0346b6e01c2a397471f4f12e65d4f4251ec96c1f85367a61a7ab",
+  "minFreeBytes": 4294967296
+}
