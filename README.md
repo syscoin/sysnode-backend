@@ -214,6 +214,8 @@ retry; elapsed time or a cached/failed read alone cannot do so. Reconciliation
 uses conditional updates so late reads cannot overwrite a newer request. No vote
 signatures or private keys are stored in receipt rows, and no database migration
 is needed for the additional status.
+Relay completions are also monotonic by signed vote time; a late old response or
+equal-time weaker result cannot overwrite a newer intent or known success.
 When the configured receipt store cannot be read, that entry is not submitted:
 availability must not bypass an unresolved delivery hold. Other independent
 entries may still proceed. This does not change vote signatures or key custody.

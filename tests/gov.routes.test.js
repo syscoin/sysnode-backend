@@ -710,11 +710,12 @@ describe('POST /gov/vote — receipts integration', () => {
     const { ctx, calls } = buildApp();
     try {
       const { agent, csrf } = await loggedInAgent(ctx, 'eve@example.com');
+      const firstVoteTime = Math.floor(Date.now() / 1000) - 1;
       // First vote: yes.
       await agent
         .post('/gov/vote')
         .set('X-CSRF-Token', csrf)
-        .send(vote(H1, { voteOutcome: 'yes' }))
+        .send(vote(H1, { voteOutcome: 'yes', time: firstVoteTime }))
         .expect(200);
       calls.length = 0;
       // Flip to no. Both entries should relay again (not skip)
@@ -722,7 +723,7 @@ describe('POST /gov/vote — receipts integration', () => {
       const res = await agent
         .post('/gov/vote')
         .set('X-CSRF-Token', csrf)
-        .send(vote(H1, { voteOutcome: 'no' }));
+        .send(vote(H1, { voteOutcome: 'no', time: firstVoteTime + 1 }));
       expect(res.status).toBe(200);
       expect(calls).toHaveLength(2);
       expect(
