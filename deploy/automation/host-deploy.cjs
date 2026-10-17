@@ -188,7 +188,8 @@ function sourceSchemaFence(root, previous, candidate) {
   return git(root, 'diff', '--name-only', previous, candidate, '--', 'db/migrations', 'lib/db.js').length === 0;
 }
 function sourceRuntimeFence(root, previous, candidate, app, readGit = git) {
-  const protectedPaths = ['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules/', app === 'frontend' ? 'build/' : 'data/'];
+  // Bare directory names also match a newly tracked file or symlink at that path.
+  const protectedPaths = ['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules', app === 'frontend' ? 'build' : 'data'];
   return readGit(root, 'diff', '--name-only', previous, candidate, '--', ...protectedPaths).length === 0;
 }
 async function rehearseSchema(config, stage, job, source, oldSchema) {

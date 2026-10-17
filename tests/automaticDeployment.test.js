@@ -51,10 +51,27 @@ test('CI job pages must be complete and bounded before accepting any success lis
 test.each(['frontend', 'backend'])('the %s source fence covers runtime files before git can overwrite them', app => {
   const read = jest.fn(() => '');
   expect(sourceRuntimeFence('/app', 'old', 'new', app, read)).toBe(true);
-  expect(read.mock.calls[0].slice(6)).toEqual(['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules/', app === 'frontend' ? 'build/' : 'data/']);
+  expect(read.mock.calls[0].slice(6)).toEqual(['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules', app === 'frontend' ? 'build' : 'data']);
   read.mockReturnValue('.env');
   expect(sourceRuntimeFence('/app', 'old', 'new', app, read)).toBe(false);
 });
+
+test.each(['file', 'directory', 'symlink'])('real Git runtime fence rejects a protected %s path', shape => {
+  for (const [app, member] of [['frontend', 'build'], ['backend', 'data'], ['frontend', 'node_modules'], ['backend', 'node_modules']]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sysnode-path-fence-'));
+    const git = (...args) => cp.execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    try {
+      git('init', '-q'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'Deployment fixture');
+      fs.writeFileSync(path.join(root, 'README'), 'fixture'); git('add', 'README'); git('commit', '-qm', 'baseline');
+      const previous = git('rev-parse', 'HEAD'), target = path.join(root, member);
+      if (shape === 'directory') { fs.mkdirSync(target); fs.writeFileSync(path.join(target, 'member'), 'fixture'); }
+      else if (shape === 'symlink') fs.symlinkSync('/synthetic-missing-target', target);
+      else fs.writeFileSync(target, 'fixture');
+      git('add', '--', member); git('commit', '-qm', 'candidate');
+      expect(sourceRuntimeFence(root, previous, 'HEAD', app)).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true }); }
+  }
+}, 15000);
 test('client never admits PRs, forks, wrong refs or SSH argument injection', () => {
   expect(inputs('backend', env).command).toBe(`deploy ${sha} 123 2`);
   for (const mutation of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REPOSITORY: 'fork/repo' }, { GITHUB_REF: 'refs/heads/master' }, { SYSNODE_DEPLOY_HOST: '-oProxyCommand=bad' }, { SYSNODE_DEPLOY_USER: 'ubuntu;bad' }, { GITHUB_RUN_ATTEMPT: '1;bad' }]) expect(() => inputs('backend', { ...env, ...mutation })).toThrow();
