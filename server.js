@@ -31,6 +31,7 @@ const {
 const dataStore = require('./data/dataStore');
 const { client, rpcServices } = require('./services/rpcClient');
 const { createCurrentVotesCache } = require('./lib/voteReceipts');
+const { createGovernanceRpc } = require('./lib/governanceRpc');
 const { createReminderLog } = require('./lib/reminderLog');
 const { createReminderDispatcher } = require('./lib/reminderDispatcher');
 const { createReminderSource, createReminderRpc } = require('./lib/reminderSource');
@@ -60,9 +61,9 @@ const {
 // The RPC name on syscoin-js is resolved dynamically via the stub's
 // `callee.name.toLowerCase()` trick — camelCase `gObject_getCurrentVotes`
 // maps to snake_case `gobject_getcurrentvotes` at call time.
+const governanceRpc = createGovernanceRpc(client);
 const currentVotesCache = createCurrentVotesCache({
-  callRpc: (proposalHash) =>
-    rpcServices(client.callRpc).gObject_getCurrentVotes(proposalHash).call(),
+  callRpc: governanceRpc.getCurrentVotes,
 });
 
 const app = express();
@@ -340,19 +341,8 @@ mountAuthAndVault(app, {
     masternodes: dataStore.masternodesArr,
     updatedAt: dataStore.masternodesUpdatedAt,
   }),
-  voteRaw: (collateralHash, collateralIndex, governanceHash, signal, outcome, time, voteSig) =>
-    rpcServices(client.callRpc)
-      .voteRaw(
-        collateralHash,
-        collateralIndex,
-        governanceHash,
-        signal,
-        outcome,
-        time,
-        voteSig
-      )
-      .call(true),
-  getCurrentVotes: (proposalHash) => currentVotesCache.get(proposalHash),
+  voteRaw: governanceRpc.voteRaw,
+  getCurrentVotes: (proposalHash, options) => currentVotesCache.get(proposalHash, options),
   invalidateCurrentVotes: (proposalHash) =>
     currentVotesCache.invalidate(proposalHash),
   proposalRpc,
