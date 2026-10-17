@@ -188,9 +188,13 @@ function sourceSchemaFence(root, previous, candidate) {
   return git(root, 'diff', '--name-only', previous, candidate, '--', 'db/migrations', 'lib/db.js').length === 0;
 }
 function sourceRuntimeFence(root, previous, candidate, app, readGit = git) {
-  // Bare directory names also match a newly tracked file or symlink at that path.
-  const protectedPaths = ['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules', app === 'frontend' ? 'build' : 'data'];
-  return readGit(root, 'diff', '--name-only', previous, candidate, '--', ...protectedPaths).length === 0;
+  // NUL paths and disabled rename detection cover both sides of a rename and
+  // every entry type/descendant without relying on Git's glob pathspec rules.
+  const names = readGit(root, 'diff', '--name-only', '-z', '--no-renames', previous, candidate, '--').split('\0').filter(Boolean);
+  return !names.some(name => {
+    const first = name.split('/')[0];
+    return ['.env', '.env.local', 'node_modules', app === 'frontend' ? 'build' : 'data'].includes(first) || /^\.env\..*\.local$/.test(first) || /^\.env\.bak/.test(first);
+  });
 }
 async function rehearseSchema(config, stage, job, source, oldSchema) {
   const copy = path.join(job, 'schema-rehearsal.sqlite');
@@ -289,7 +293,7 @@ async function deploy(config, app, request, job, io = {}) {
     stopped = true;
     op.command(config.pm2, ['stop', APPS[app].directory]);
     if (app === 'backend') await op.checkDatabase(config, before.database.path, path.join(backup, 'precutover.sqlite'));
-    op.command('git', ['-C', root, 'merge', '--ff-only', request.sha]);
+    op.command('git', ['-C', root, 'merge', '--ff-only', '--no-overwrite-ignore', request.sha]);
     for (const member of app === 'frontend' ? ['node_modules', 'build'] : ['node_modules']) {
       safeDirectory(path.join(root, member)); safeDirectory(path.join(stage, member));
       fs.renameSync(path.join(root, member), path.join(backup, member));

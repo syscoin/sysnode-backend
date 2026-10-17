@@ -11,7 +11,7 @@ const sha = 'a'.repeat(40);
 const request = { sha, runId: '123', attempt: '2' };
 const run = { id: 123, run_attempt: 2, event: 'push', head_branch: 'main', head_sha: sha, repository: { full_name: 'syscoin/sysnode-backend' }, head_repository: { full_name: 'syscoin/sysnode-backend' }, path: '.github/workflows/ci.yml', status: 'in_progress' };
 const jobs = ['Jest (Node 20)', 'Jest (Node 22)', 'Production dependency audit', 'Schema sanity'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
-const env = { GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'syscoin/sysnode-backend', GITHUB_REF: 'refs/heads/main', GITHUB_SERVER_URL: 'https://github.com', GITHUB_SHA: sha, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', SYSNODE_DEPLOY_HOST: '62.238.27.161', SYSNODE_DEPLOY_USER: 'ubuntu', SYSNODE_DEPLOY_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-only\n-----END OPENSSH PRIVATE KEY-----', SYSNODE_KNOWN_HOSTS: 'host ssh-ed25519 synthetic' };
+const env = { GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'syscoin/sysnode-backend', GITHUB_REF: 'refs/heads/main', GITHUB_SERVER_URL: 'https://github.com', GITHUB_SHA: sha, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', SYSNODE_DEPLOY_HOST: '192.0.2.10', SYSNODE_DEPLOY_USER: 'ubuntu', SYSNODE_DEPLOY_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-only\n-----END OPENSSH PRIVATE KEY-----', SYSNODE_KNOWN_HOSTS: 'host ssh-ed25519 synthetic' };
 
 test('real OpenSSH keys remain parseable when secrets omit final LF or use CRLF', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sysnode-key-format-'));
@@ -51,13 +51,13 @@ test('CI job pages must be complete and bounded before accepting any success lis
 test.each(['frontend', 'backend'])('the %s source fence covers runtime files before git can overwrite them', app => {
   const read = jest.fn(() => '');
   expect(sourceRuntimeFence('/app', 'old', 'new', app, read)).toBe(true);
-  expect(read.mock.calls[0].slice(6)).toEqual(['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules', app === 'frontend' ? 'build' : 'data']);
+  expect(read.mock.calls[0]).toEqual(['/app', 'diff', '--name-only', '-z', '--no-renames', 'old', 'new', '--']);
   read.mockReturnValue('.env');
   expect(sourceRuntimeFence('/app', 'old', 'new', app, read)).toBe(false);
 });
 
 test.each(['file', 'directory', 'symlink'])('real Git runtime fence rejects a protected %s path', shape => {
-  for (const [app, member] of [['frontend', 'build'], ['backend', 'data'], ['frontend', 'node_modules'], ['backend', 'node_modules']]) {
+  for (const [app, member] of [['frontend', 'build'], ['backend', 'data'], ['frontend', 'node_modules'], ['backend', 'node_modules'], ['frontend', '.env.production.local'], ['backend', '.env.bak.test']]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sysnode-path-fence-'));
     const git = (...args) => cp.execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     try {
@@ -72,9 +72,30 @@ test.each(['file', 'directory', 'symlink'])('real Git runtime fence rejects a pr
     } finally { fs.rmSync(root, { recursive: true }); }
   }
 }, 15000);
+
+test('actual Git fast-forward never overwrites an ignored runtime file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sysnode-ignore-fence-'));
+  const git = (...args) => cp.execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  try {
+    git('init', '-q'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'Deployment fixture');
+    fs.writeFileSync(path.join(root, '.gitignore'), 'runtime-state.txt\n'); git('add', '.gitignore'); git('commit', '-qm', 'baseline');
+    const previous = git('rev-parse', 'HEAD');
+    fs.writeFileSync(path.join(root, 'runtime-state.txt'), 'candidate contents'); git('add', '-f', 'runtime-state.txt'); git('commit', '-qm', 'force added file');
+    const candidate = git('rev-parse', 'HEAD'); git('switch', '--detach', previous);
+    fs.writeFileSync(path.join(root, 'runtime-state.txt'), 'live runtime data');
+    expect(() => git('merge', '--ff-only', '--no-overwrite-ignore', candidate)).toThrow();
+    expect(git('rev-parse', 'HEAD')).toBe(previous);
+    expect(fs.readFileSync(path.join(root, 'runtime-state.txt'), 'utf8')).toBe('live runtime data');
+  } finally { fs.rmSync(root, { recursive: true }); }
+});
 test('client never admits PRs, forks, wrong refs or SSH argument injection', () => {
   expect(inputs('backend', env).command).toBe(`deploy ${sha} 123 2`);
   for (const mutation of [{ GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_REPOSITORY: 'fork/repo' }, { GITHUB_REF: 'refs/heads/master' }, { SYSNODE_DEPLOY_HOST: '-oProxyCommand=bad' }, { SYSNODE_DEPLOY_USER: 'ubuntu;bad' }, { GITHUB_RUN_ATTEMPT: '1;bad' }]) expect(() => inputs('backend', { ...env, ...mutation })).toThrow();
+});
+test('the workflow treats the origin host as a masked secret', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/ci.yml'), 'utf8');
+  expect(workflow).toContain('SYSNODE_DEPLOY_HOST: ${{ secrets.SYSNODE_DEPLOY_HOST }}');
+  expect(workflow).not.toContain('vars.SYSNODE_DEPLOY_HOST');
 });
 test('configuration comparison ignores property insertion order but rejects material changes', () => {
   expect(JSON.stringify(canonical({ b: 1, a: { y: 3, x: 2 } }))).toBe(JSON.stringify(canonical({ a: { x: 2, y: 3 }, b: 1 })));

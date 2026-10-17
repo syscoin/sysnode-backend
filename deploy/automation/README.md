@@ -46,7 +46,7 @@ For each repo's branch-restricted `production` environment:
 
 - Secret `SYSNODE_DEPLOY_KEY`: that repository's new private key only.
 - Secret `SYSNODE_KNOWN_HOSTS`: independently verified pinned host key entry.
-- Variable `SYSNODE_DEPLOY_HOST`: the existing host, currently `62.238.27.161`.
+- Secret `SYSNODE_DEPLOY_HOST`: the private origin address (for example `192.0.2.10`).
 - Variable `SYSNODE_DEPLOY_USER`: currently `ubuntu`.
 
 The client uses a temporary mode-0600 key and known-hosts file, refuses unknown
@@ -86,6 +86,8 @@ the frontend `build` or backend `data` directory are rejected before staging or
 stopping an app. This also prevents Git from replacing an ignored runtime file
 with a newly tracked file. A staged environment path must be a regular file, not
 a directory or symbolic link.
+The fast-forward also uses Git's `--no-overwrite-ignore` safeguard, so an ignored
+runtime file outside the explicitly protected names cannot be silently replaced.
 
 Only the affected PM2 application is stopped. Its previous source revision,
 dependencies and frontend build are retained. The live `.env`, PM2 launch
