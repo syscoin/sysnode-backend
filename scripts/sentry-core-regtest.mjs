@@ -30,8 +30,15 @@ let wallet = false;
 let indexer;
 let database;
 async function rpc(method, params = []) {
-  const result = await exec(resolve(core, 'syscoin-cli'), ['-regtest', `-datadir=${datadir}`, `-rpcport=${port}`, ...(wallet ? ['-rpcwallet=sentry-qa'] : []), method,
-    ...params.map((param) => typeof param === 'string' ? param : JSON.stringify(param))], { maxBuffer: 4 * 1024 * 1024 });
+  let result;
+  try {
+    result = await exec(resolve(core, 'syscoin-cli'), ['-regtest', `-datadir=${datadir}`, `-rpcport=${port}`, ...(wallet ? ['-rpcwallet=sentry-qa'] : []), method,
+      ...params.map((param) => typeof param === 'string' ? param : JSON.stringify(param))], { maxBuffer: 4 * 1024 * 1024 });
+  } catch (error) {
+    const rpcError = error.stderr?.match(/^error code: (-?\d+)\r?\nerror message:\r?\n([\s\S]*)/);
+    if (rpcError) throw Object.assign(new Error(rpcError[2].trim()), { code: Number(rpcError[1]) });
+    throw error;
+  }
   const value = result.stdout.trim();
   try { return JSON.parse(value); } catch { return value; }
 }
@@ -125,26 +132,33 @@ try {
   assert(collateralVout >= 0, 'External collateral output must exist');
   const externalCollateral = { txid: externalCollateralTxid, vout: collateralVout };
   const managementBody = { network: 'regtest', xpub: 'vpub-synthetic-regtest-fee-account', changeAddress: feeAddress, feeRate: 10 };
+  const lifecycleManagement = createSentryManagement({ repository, adapter, now: () => now });
   async function completeManagement(body, authority) {
-    const prepared = await adapter.prepare({ ...managementBody, ...body });
+    const row = await lifecycleManagement.prepare(1, { ...managementBody, ...body });
+    const prepared = row.prepared;
     const context = await adapter.context('regtest', body.proTxHash, body.collateralOutpoint);
     const inputs = sdk.decodeSentryTransaction(prepared.request.transactionHex).inputs;
     assert(!inputs.some((input) => input.txid === externalCollateral.txid && input.vout === externalCollateral.vout), 'Collateral may never fund a management operation');
     const previousTransactions = await Promise.all([...new Set(inputs.map((input) => input.txid))].map((txid) => rpc('getrawtransaction', [txid, false])));
     const authorization = await sdk.signSentryManagementOperation(prepared.request, { ...context, previousTransactions, maxFeeSatoshis: '1000000' }, authority);
     assert.equal(authorization.complete, true);
-    const row = { network: 'regtest', protx_hash: body.proTxHash || body.collateralOutpoint.txid, prepared };
-    const authorized = await adapter.authorize(row, authorization);
+    const authorized = await lifecycleManagement.authorize(1, row.id, { authorization });
     const signed = await rpc('walletprocesspsbt', [authorized.psbt.psbt]);
     assert.equal(signed.complete, true, 'Core must sign only the fee inputs after SDK node authorization');
-    const verified = await adapter.validateSigned(row, signed.psbt);
-    assert.equal(await adapter.broadcast(verified.transactionHex), verified.txid);
-    assert.deepEqual(await adapter.readback({ ...row, txid: verified.txid }), { confirmed: false, matches: false, known: true });
+    const submitted = await lifecycleManagement.submit(1, row.id, { signedPsbt: signed.psbt });
+    assert.equal(submitted.status, 'submitted');
+    const txid = submitted.txid;
+    const expectedNode = body.operation === 'register' ? txid : body.proTxHash;
+    assert.equal(lifecycleManagement.operations(1).find((entry) => entry.id === row.id).proTxHash, expectedNode);
+    assert.deepEqual(await adapter.readback({ ...row, txid }), { confirmed: false, matches: false, known: true });
     await rpc('generatetoaddress', [1, mining]);
-    assert.deepEqual(await adapter.readback({ ...row, txid: verified.txid }), { confirmed: true, matches: true });
+    const confirmed = await lifecycleManagement.reconcile(1, row.id);
+    assert.equal(confirmed.status, 'confirmed');
+    assert.equal(confirmed.proTxHash, expectedNode);
+    assert.equal((await adapter.context('regtest', confirmed.proTxHash)).node.proTxHash, expectedNode);
     assert(await rpc('gettxout', [externalCollateral.txid, externalCollateral.vout, true]), 'Management must leave collateral unspent');
-    managementLifecycle.push({ operation: body.operation, txid: verified.txid });
-    return verified.txid;
+    managementLifecycle.push({ operation: body.operation, txid, proTxHash: confirmed.proTxHash });
+    return txid;
   }
   const createdProTxHash = await completeManagement({
     operation: 'register', collateralOutpoint: externalCollateral,

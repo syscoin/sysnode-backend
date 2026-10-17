@@ -342,6 +342,10 @@ Enable `/api/sentry/v1/` with the existing `SYSCOIN_NETWORK` and
 configured network. The Core node must provide `protx_capabilities` and, for PQ
 operators, extended `protx_operator_key_info`. Missing capability metadata disables
 signing; the backend never guesses an activation state from key length.
+Run Core with `txindex=1` and wait for the transaction index to synchronize before
+enabling management: historical registration and transaction readback use
+`getrawtransaction`. Transport errors or an unavailable/syncing index are not
+treated as transaction absence and do not demote confirmed operation records.
 
 `GET /capabilities` and `GET /context` are rate-limited public chain reads for
 wallets. All node-watch and operation endpoints require a verified session;
