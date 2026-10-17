@@ -1,6 +1,7 @@
 {
   "name": "sysnode",
   "version": "1.0.0",
+  "engines": { "node": ">=20.19.0" },
   "description": "Syscoin backend for masternode and governance stats",
   "main": "server.js",
   "scripts": {
@@ -8,6 +9,8 @@
     "dev": "nodemon server.js",
     "test": "jest",
     "test:watch": "jest --watch",
+    "test:sentry-codec": "node --test tests/sentry-codec.integration.mjs",
+    "test:sentry-core": "node scripts/sentry-core-regtest.mjs",
     "test:coverage": "jest --coverage",
     "audit:prod": "npm audit --omit=dev --audit-level=high"
   },
@@ -25,6 +28,7 @@
     ]
   },
   "dependencies": {
+    "@sidhujag/sysweb3-sentry": "0.1.0",
     "@syscoin/syscoin-js": "git+https://github.com/syscoin/syscoind-rpc.git#637a1de10522d1ce34a4e0f283c59b9d55bde814",
     "axios": "^1.15.2",
     "better-sqlite3": "^12.9.0",
@@ -39,12 +43,11 @@
     "helmet": "^8.1.0",
     "i18n-iso-countries": "7.5.0",
     "moment": "^2.30.1",
-    "nodemailer": "^8.0.5",
+    "nodemailer": "^10.1.2",
     "numeral": "2.0.6",
     "papaparse": "^5.5.3",
     "pretty-ms": "6.0.1",
     "syscoinjs-lib": "^1.0.268",
-    "systeminformation": "^5.31.5",
     "websocket": "1.0.34",
     "zod": "^4.3.6"
   },
@@ -66,6 +69,7 @@
   "overrides": {
     "node-fetch": "2.7.0",
     "elliptic": "6.6.1",
-    "ip-address": "10.2.0"
+    "ip-address": "10.7.4",
+    "ws": "8.21.3"
   }
 }

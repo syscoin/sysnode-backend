@@ -40,6 +40,7 @@ const {
   createDefaultSyscoinClient,
 } = require('./lib/proposalPsbt');
 const { createPaliChainGuard } = require('./lib/paliChainGuard');
+const { createConfiguredSentryAdapter, createSentryRpc } = require('./lib/sentryAdapter');
 const {
   createMasternodeCountRepo,
 } = require('./lib/masternodeCountRepo');
@@ -203,12 +204,6 @@ assertProductionAuthConfig({
   frontendUrl: PUBLIC_BASE_URL,
 });
 
-// Session parsing must cover every route that reads `req.user`. /gov
-// uses `requireAuth` in its router; without parse running here first
-// `req.user` would always be undefined and every authenticated caller
-// would see a 401.
-app.use(['/auth', '/vault', '/gov'], services.sessionMw.parse);
-
 // Proposal RPC adapter.
 //
 // The governance-proposals code (dispatcher + prepare pre-flight)
@@ -363,6 +358,12 @@ mountAuthAndVault(app, {
   governanceNetworkInfo: paliNetworkInfo,
   buildCollateralPsbt: paliPsbtBuilder,
   paliChainGuard,
+  sentryAdapter: createConfiguredSentryAdapter({
+    rpcCall: createSentryRpc(client),
+    network: PALI_NETWORK_KEY,
+    genesisHash: String(process.env.SYSCOIN_SENTRY_GENESIS_HASH || '').trim(),
+    fundingClient: paliSyscoinClient,
+  }),
 });
 
 // -----------------------------------------------------------------------------
