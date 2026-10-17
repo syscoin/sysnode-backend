@@ -5,13 +5,30 @@ const path = require('node:path');
 const cp = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const { parseCommand, validateRun, validateJobsPage, validateCapabilities, sourceRuntimeFence, canonical, compareState, schema, stageEnvironment, supervise, requestDeploy, retainSuccessful } = require('../deploy/automation/host-deploy.cjs');
-const { inputs } = require('../scripts/request-deploy.cjs');
+const { inputs, privateKeyText } = require('../scripts/request-deploy.cjs');
 
 const sha = 'a'.repeat(40);
 const request = { sha, runId: '123', attempt: '2' };
 const run = { id: 123, run_attempt: 2, event: 'push', head_branch: 'main', head_sha: sha, repository: { full_name: 'syscoin/sysnode-backend' }, head_repository: { full_name: 'syscoin/sysnode-backend' }, path: '.github/workflows/ci.yml', status: 'in_progress' };
 const jobs = ['Jest (Node 20)', 'Jest (Node 22)', 'Production dependency audit', 'Schema sanity'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
-const env = { GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'syscoin/sysnode-backend', GITHUB_REF: 'refs/heads/main', GITHUB_SERVER_URL: 'https://github.com', GITHUB_SHA: sha, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', SYSNODE_DEPLOY_HOST: '62.238.27.161', SYSNODE_DEPLOY_USER: 'ubuntu', SYSNODE_DEPLOY_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-only', SYSNODE_KNOWN_HOSTS: 'host ssh-ed25519 synthetic' };
+const env = { GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'syscoin/sysnode-backend', GITHUB_REF: 'refs/heads/main', GITHUB_SERVER_URL: 'https://github.com', GITHUB_SHA: sha, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', SYSNODE_DEPLOY_HOST: '62.238.27.161', SYSNODE_DEPLOY_USER: 'ubuntu', SYSNODE_DEPLOY_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-only\n-----END OPENSSH PRIVATE KEY-----', SYSNODE_KNOWN_HOSTS: 'host ssh-ed25519 synthetic' };
+
+test('real OpenSSH keys remain parseable when secrets omit final LF or use CRLF', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sysnode-key-format-'));
+  fs.chmodSync(root, 0o700);
+  try {
+    const original = path.join(root, 'generated');
+    cp.execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', original], { stdio: 'ignore' });
+    const source = fs.readFileSync(original, 'utf8');
+    const expectedPublic = cp.execFileSync('ssh-keygen', ['-y', '-f', original], { encoding: 'utf8' });
+    for (const variant of [source, source.trimEnd(), source.replace(/\n/g, '\r\n'), source.trimEnd().replace(/\n/g, '\r\n')]) {
+      const normalized = path.join(root, 'normalized');
+      fs.writeFileSync(normalized, privateKeyText(variant), { mode: 0o600 });
+      const parsedPublic = cp.execFileSync('ssh-keygen', ['-y', '-f', normalized], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      expect(parsedPublic).toBe(expectedPublic);
+    }
+  } finally { fs.rmSync(root, { recursive: true }); }
+});
 
 test('forced command accepts only exact status or SHA/run/attempt deployment', () => {
   expect(parseCommand('status')).toEqual({ status: true });
