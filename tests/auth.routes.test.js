@@ -1582,10 +1582,10 @@ describe('/auth/verify-email DoS bound (rate limiter)', () => {
   // trivial DoS.
   //
   // Note the default max is 100, so we need to fire 101 requests to
-  // observe the 429. We parallelise with Promise.all because sequential
-  // supertest round-trips over 101 calls is multi-second; concurrent
-  // issues share the same in-memory limiter bucket and one of them
-  // will be the trip wire. We also build a dedicated app with
+  // observe the 429. Use one listening server so Supertest does not
+  // create and close a separate listener for each parallel request.
+  // This keeps the exact per-IP boundary deterministic under CI load.
+  // We also build a dedicated app with
   // `disableRateLimit: false` because the shared helper disables
   // limiters by default.
   let ctx;
@@ -1599,18 +1599,21 @@ describe('/auth/verify-email DoS bound (rate limiter)', () => {
   test('returns 429 too_many_attempts once the per-IP cap is exceeded', async () => {
     const fakeToken = 'f'.repeat(64); // shape-valid but never issued
     const total = 105;
-    const results = await Promise.all(
-      Array.from({ length: total }, () =>
-        request(ctx.app).post('/auth/verify-email').send({ token: fakeToken })
-      )
-    );
+    const server = ctx.app.listen(0, '127.0.0.1');
+    await new Promise((resolve) => server.once('listening', resolve));
+    const results = [];
+    try {
+      for (let attempt = 0; attempt < total; attempt += 1) {
+        results.push(await request(server).post('/auth/verify-email').send({ token: fakeToken }));
+      }
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
     const statuses = results.map((r) => r.status);
     const rateLimited = statuses.filter((s) => s === 429);
     // The limiter allows at most 100 through in a 15-min window, so at
-    // least (total - 100) must be 429. We don't assert exactly 5
-    // because any concurrent-ordering slop in supertest can count
-    // requests in flight against the bucket.
-    expect(rateLimited.length).toBeGreaterThanOrEqual(total - 100);
+    // exactly the last five must be rejected, not merely some requests.
+    expect(rateLimited).toHaveLength(total - 100);
     const tripped = results.find((r) => r.status === 429);
     expect(tripped.body).toEqual({ error: 'too_many_attempts' });
   }, 15_000);
