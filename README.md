@@ -361,6 +361,36 @@ The existing live proxy and Core metadata APIs must be verified after rollout;
 updating these repository examples alone does not update deployed systems.
 No route accepts an RPC URL, RPC method name, or owner/operator private key.
 
+`POST /api/sentry/v1/nodes` accepts a public watch record
+`{ network, proTxHash, label?, preserveExisting? }`. The optional boolean
+`preserveExisting: true` is intended for batch imports: an existing label for
+the same user, network and ProTx hash is retained atomically, even if another
+tab saved it during the on-chain lookup. It still validates the registered node
+independently before inserting. Omit the option (or use `false`) to retain the
+existing single-node label-update behavior. The response remains the user's
+complete watch list. Watching a node grants no signing authority and imports
+no private key.
+
+`GET /api/sentry/v1/voting-context?network=testnet&proposalHash=<hash>&proTxHashes=<hash1>,<hash2>`
+is a public, read-only observation for Pali's governance-vote approval. It accepts
+at most 20 unique lowercase ProTx hashes and uses the same independently pinned
+Core network/genesis check. Its fixed `gobject_get` call verifies a valid,
+non-deleted proposal and returns the on-chain name/URL, not a dapp-provided title.
+The optional URL is omitted unless it is an HTTP(S) address without credentials;
+this does not reject an otherwise valid proposal with a non-web URI.
+The response is `{ chain, now, proposalHash, proposal: { name, url? }, nodes }`;
+each node has `{ proTxHash, collateralOutpoint: { txid, vout }, votingKeyId,
+valid: true }`. `valid` means a confirmed registered identity with a voting key,
+not a claim about its hosting provider or operational status. Active PQ voting
+is not supported by this legacy ECDSA context and is explicitly rejected.
+The request has a 10-second total deadline, at most four concurrent node reads,
+and a 64-KiB limit per Core response. It has a separate 12-request-per-minute IP
+limit shared across both proxy prefixes, in addition to the normal read limit.
+A changed chain tip rejects the combined
+observation so the wallet can request a fresh one. This endpoint does not sign,
+relay, import or persist anything; the existing `/gov/vote` relay and encrypted
+browser-vault voting path are unchanged.
+
 After deployment, run the anonymous, read-only verifier with independently
 trusted chain expectations (do not copy the genesis from the service being
 checked):

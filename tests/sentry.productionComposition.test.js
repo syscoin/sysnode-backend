@@ -32,6 +32,8 @@ function mount(disableRateLimit = true) {
     disableRateLimit,
     sentryAdapter: {
       context: async () => ({ node: { proTxHash: HASH } }),
+      votingContext: async (network, proposalHash, hashes) => ({ chain: { genesisHash: HASH, era: 'legacy-v3' },
+        now: 1800000000, proposalHash, proposal: { name: 'verified-proposal' }, nodes: hashes.map((proTxHash) => ({ proTxHash })) }),
       capabilities: async () => ({ version: 1 }),
       prepare: async () => ({ request: { operation: 'updateService' } }),
     },
@@ -118,6 +120,34 @@ test('both proxy forms access the same authenticated watch and operation records
   expect(operations.body[0].id).toBe(prepared.body.id);
 });
 
+test('batch watch import preserves labels through both aliases with unchanged authentication', async () => {
+  const original = { network: 'testnet', proTxHash: HASH, label: 'Saved label' };
+  const incoming = { ...original, label: 'Batch label', preserveExisting: true };
+  await request(app).post('/api/sentry/v1/nodes').set('Cookie', cookie).set('Origin', ORIGIN)
+    .set('X-CSRF-Token', 'test-csrf').send(original).expect(200);
+  await request(app).post('/sentry/v1/nodes').set('Origin', ORIGIN).send(incoming).expect(401);
+  await request(app).post('/sentry/v1/nodes').set('Cookie', cookie).set('Origin', ORIGIN).send(incoming).expect(403);
+  await request(app).post('/sentry/v1/nodes').set('Cookie', cookie).set('Origin', 'https://other.example')
+    .set('X-CSRF-Token', 'test-csrf').send(incoming).expect(403);
+  const saved = await request(app).post('/sentry/v1/nodes').set('Cookie', cookie).set('Origin', ORIGIN)
+    .set('X-CSRF-Token', 'test-csrf').send(incoming).expect(200);
+  expect(saved.body).toEqual([original]);
+  const read = await request(app).get('/api/sentry/v1/nodes').set('Cookie', cookie).expect(200);
+  expect(read.body).toEqual([original]);
+});
+
+test.each(['/api/sentry/v1', '/sentry/v1'])('voting context is public, read-only and strictly bounded through %s', async (prefix) => {
+  const query = `network=testnet&proposalHash=${HASH}&proTxHashes=${HASH}`;
+  const response = await request(app).get(`${prefix}/voting-context?${query}`).expect(200);
+  expect(response.body).toMatchObject({ proposalHash: HASH, proposal: { name: 'verified-proposal' }, nodes: [{ proTxHash: HASH }] });
+  await request(app).get(`${prefix}/voting-context?${query}&privateKey=forbidden`).expect(422);
+  await request(app).get(`${prefix}/voting-context?network=testnet&proposalHash=${HASH}&proTxHashes[]=${HASH}`).expect(422);
+  await request(app).get(`${prefix}/voting-context?network=testnet&proposalHash=${HASH}&proTxHashes=${HASH},${HASH}`).expect(422);
+  await request(app).post(`${prefix}/voting-context`).send({}).expect(401);
+  expect(db.prepare('SELECT COUNT(*) AS n FROM sentry_operations').get().n).toBe(0);
+  expect(db.prepare('SELECT COUNT(*) AS n FROM sentry_watches').get().n).toBe(0);
+});
+
 test('alternating proxy forms share one anonymous read quota', async () => {
   mount(false);
   await withListener(async (client) => {
@@ -140,5 +170,19 @@ test('alternating proxy forms share one authenticated management quota across cl
     const limited = await client.get('/sentry/v1/nodes').set('Cookie', cookie)
       .set('X-Forwarded-For', '192.0.2.121').expect(429);
     expect(limited.body).toEqual({ error: 'too_many_sentry_requests' });
+  });
+});
+
+test('both proxy forms share the tighter voting-context quota without exhausting ordinary reads', async () => {
+  mount(false);
+  await withListener(async (client) => {
+    const query = `network=testnet&proposalHash=${HASH}&proTxHashes=${HASH}`;
+    for (let count = 0; count < 12; count++) {
+      await client.get(`${count % 2 ? '/sentry/v1' : '/api/sentry/v1'}/voting-context?${query}`).expect(200);
+    }
+    const limited = await client.get(`/api/sentry/v1/voting-context?${query}`).expect(429);
+    expect(limited.body).toEqual({ error: 'too_many_sentry_requests' });
+    await client.get('/api/sentry/v1/capabilities').expect(200);
+    await client.get('/sentry/v1/nodes').set('Cookie', cookie).expect(200);
   });
 });

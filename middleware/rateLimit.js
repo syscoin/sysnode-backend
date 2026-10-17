@@ -213,6 +213,14 @@ function sentryReadLimiter() {
     message: { error: 'too_many_sentry_requests' }, handler: trippedHandler('sentry-read') });
 }
 
+function sentryVotingContextLimiter() {
+  // A governance approval can inspect up to 20 registered nodes. Bound the
+  // heavier read separately without consuming transaction-management quota.
+  return rateLimit({ windowMs: MINUTE, max: 12, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => `sentry-voting-context|${ipBucket(req)}`,
+    message: { error: 'too_many_sentry_requests' }, handler: trippedHandler('sentry-voting-context') });
+}
+
 function sentryManagementLimiter() {
   return rateLimit({ windowMs: 60 * MINUTE, max: 120, standardHeaders: true, legacyHeaders: false,
     keyGenerator: (req) => `sentry-management|${req.user?.id || ipBucket(req)}`,
@@ -229,6 +237,7 @@ module.exports = {
   voteLimiter,
   reconcileLimiter,
   sentryReadLimiter,
+  sentryVotingContextLimiter,
   sentryManagementLimiter,
   disabled,
   // Exported for direct unit testing.
