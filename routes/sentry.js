@@ -1,6 +1,6 @@
 'use strict';
 const express = require('express');
-function createSentryRouter({ management, sessionMw, csrfMw, limiter, readLimiter, frontendUrl }) {
+function createSentryRouter({ management, sessionMw, csrfMw, limiter, readLimiter, votingContextLimiter = (_req, _res, next) => next(), frontendUrl }) {
   const router = express.Router();
   const route = (fn) => async (req, res) => {
     try { res.json(await fn(req)); }
@@ -10,6 +10,7 @@ function createSentryRouter({ management, sessionMw, csrfMw, limiter, readLimite
   router.get('/capabilities', route(() => management.capabilities()));
   router.get('/context', route((req) => management.context(req.query.network, req.query.proTxHash,
     req.query.collateralTxid ? { txid: req.query.collateralTxid, vout: Number(req.query.collateralVout) } : undefined)));
+  router.get('/voting-context', votingContextLimiter, route((req) => management.votingContext(req.query)));
   // The public context is read-only. Every management route requires a
   // verified session. State-changing calls additionally bind the exact origin.
   router.use(sessionMw.requireAuth);
