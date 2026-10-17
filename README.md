@@ -196,6 +196,32 @@ tick runs at a time to avoid overlap while SMTP is pending. A snapshot older tha
 one atomic transaction: a crash or log failure after SMTP accepts a message can
 still cause a retry, so this is best-effort delivery, not exactly-once mail.
 
+Governance vote delivery distinguishes rejection from uncertainty. Each Core RPC
+has a 10-second transport deadline and a vote batch has a 30-second total deadline.
+No timed-out vote is automatically retried: a response lost after submission is
+reported as `submission_unknown`, not as a successful relay or a definite failure.
+Entries the batch never invoked are `not_submitted` and do not create receipts.
+Response totals are `accepted`, `rejected` (definite only), `unknown`, and
+`notSubmitted`. A valid Core JSON-RPC rejection remains definite, including when
+delivered with HTTP 500.
+
+An uncertain receipt records the latest requested intent. Another submission is
+held until explicit reconciliation: the exact time/outcome/signal confirms it;
+a newer on-chain vote can supersede it with an explicit marker. Older votes do
+not confirm a newer uncertain intent. Fresh Core reconciliation after the
+10-minute grace period can mark a still-unobserved request stale for an explicit
+retry; elapsed time or a cached/failed read alone cannot do so. Reconciliation
+uses conditional updates so late reads cannot overwrite a newer request. No vote
+signatures or private keys are stored in receipt rows, and no database migration
+is needed for the additional status.
+When the configured receipt store cannot be read, that entry is not submitted:
+availability must not bypass an unresolved delivery hold. Other independent
+entries may still proceed. This does not change vote signatures or key custody.
+Receipt writes after a broadcast remain best-effort: if storage fails, the API
+still reports uncertainty and the client must retain its hold, but a restart or
+lost client state cannot rely on a receipt that was never persisted. This is not
+an exactly-once submission guarantee.
+
 In production the backend refuses to boot unless `SMTP_HOST` is set (or `MAIL_TRANSPORT=log` is set explicitly for stdout-only dry-run), so this step is required before the backend will start with `NODE_ENV=production`.
 
 ### 3. Clone both repos

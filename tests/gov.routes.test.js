@@ -319,7 +319,7 @@ describe('POST /gov/vote', () => {
         .set('X-CSRF-Token', csrf)
         .send(validVoteBody());
       expect(res.status).toBe(200);
-      expect(res.body.results.every((r) => r.error === 'rpc_error')).toBe(
+      expect(res.body.results.every((r) => r.error === 'submission_unknown' && r.uncertain === true)).toBe(
         true
       );
     } finally {

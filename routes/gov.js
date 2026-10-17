@@ -245,7 +245,9 @@ function createGovRouter({
 
         const out = {
           accepted: results.filter((r) => r && r.ok).length,
-          rejected: results.filter((r) => r && !r.ok).length,
+          rejected: results.filter((r) => r && !r.ok && !r.uncertain && !r.notSubmitted).length,
+          unknown: results.filter((r) => r && r.uncertain).length,
+          notSubmitted: results.filter((r) => r && r.notSubmitted).length,
           results,
         };
         // Invalidate the cached gobject_getcurrentvotes snapshot for
@@ -427,6 +429,7 @@ function createGovRouter({
           userId,
           proposalHash: propLower,
           getCurrentVotes,
+          fresh: refresh,
         });
         return res.json({
           receipts: out.receipts,
