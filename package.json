@@ -9,7 +9,7 @@
     "dev": "nodemon server.js",
     "test": "jest",
     "test:watch": "jest --watch",
-    "test:sentry-codec": "node --test tests/sentry-codec.integration.mjs",
+    "test:sentry-codec": "node --test tests/sentry-codec.integration.mjs tests/syscoin-dependencies.integration.mjs",
     "test:sentry-core": "node scripts/sentry-core-regtest.mjs",
     "verify:sentry-deployment": "node scripts/verify-sentry-deployment.js",
     "test:coverage": "jest --coverage",
@@ -48,7 +48,7 @@
     "numeral": "2.0.6",
     "papaparse": "^5.5.3",
     "pretty-ms": "6.0.1",
-    "syscoinjs-lib": "^1.0.268",
+    "syscoinjs-lib": "^1.0.274",
     "websocket": "1.0.34",
     "zod": "^4.3.6"
   },
