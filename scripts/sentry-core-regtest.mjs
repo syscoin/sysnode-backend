@@ -106,6 +106,67 @@ try {
     broadcast: async (hex) => { broadcastAttempts++; if (simulateOutage) throw new Error('Simulated transport outage before delivery'); return adapter.broadcast(hex); },
   } });
   const observed = [];
+  const managementLifecycle = [];
+  // These keys are synthetic and stay inside this disconnected test. The
+  // collateral and owner approvals below are produced by the published SDK,
+  // never Core's protx registration/registrar/revoke signing RPCs.
+  const collateralKey = await sdk.importSentryAuthorityKey('collateral', 'secp256k1', '00'.repeat(31) + '03');
+  const ownerKey = await sdk.importSentryAuthorityKey('owner', 'secp256k1', '00'.repeat(31) + '04');
+  const votingKey = await sdk.importSentryAuthorityKey('voting', 'secp256k1', '00'.repeat(31) + '05');
+  const registeredOperator = await sdk.importSentryAuthorityKey('operator', 'bls-basic', '00'.repeat(31) + '06');
+  const rotatedOperator = await sdk.importSentryAuthorityKey('operator', 'bls-basic', '00'.repeat(31) + '07');
+  const keyAddress = (key) => bitcoinjs.payments.p2wpkh({ pubkey: Buffer.from(key.publicKey, 'hex'), network }).address;
+  const externalCollateralAddress = keyAddress(collateralKey);
+  const externalCollateralTxid = await rpc('sendtoaddress', [externalCollateralAddress, 100]);
+  await rpc('generatetoaddress', [1, mining]);
+  const externalCollateralTx = bitcoinjs.Transaction.fromHex(await rpc('getrawtransaction', [externalCollateralTxid, false]));
+  const externalCollateralScript = bitcoinjs.address.toOutputScript(externalCollateralAddress, network);
+  const collateralVout = externalCollateralTx.outs.findIndex((output) => Buffer.from(output.script).equals(Buffer.from(externalCollateralScript)));
+  assert(collateralVout >= 0, 'External collateral output must exist');
+  const externalCollateral = { txid: externalCollateralTxid, vout: collateralVout };
+  const managementBody = { network: 'regtest', xpub: 'vpub-synthetic-regtest-fee-account', changeAddress: feeAddress, feeRate: 10 };
+  async function completeManagement(body, authority) {
+    const prepared = await adapter.prepare({ ...managementBody, ...body });
+    const context = await adapter.context('regtest', body.proTxHash, body.collateralOutpoint);
+    const inputs = sdk.decodeSentryTransaction(prepared.request.transactionHex).inputs;
+    assert(!inputs.some((input) => input.txid === externalCollateral.txid && input.vout === externalCollateral.vout), 'Collateral may never fund a management operation');
+    const previousTransactions = await Promise.all([...new Set(inputs.map((input) => input.txid))].map((txid) => rpc('getrawtransaction', [txid, false])));
+    const authorization = await sdk.signSentryManagementOperation(prepared.request, { ...context, previousTransactions, maxFeeSatoshis: '1000000' }, authority);
+    assert.equal(authorization.complete, true);
+    const row = { network: 'regtest', protx_hash: body.proTxHash || body.collateralOutpoint.txid, prepared };
+    const authorized = await adapter.authorize(row, authorization);
+    const signed = await rpc('walletprocesspsbt', [authorized.psbt.psbt]);
+    assert.equal(signed.complete, true, 'Core must sign only the fee inputs after SDK node authorization');
+    const verified = await adapter.validateSigned(row, signed.psbt);
+    assert.equal(await adapter.broadcast(verified.transactionHex), verified.txid);
+    assert.deepEqual(await adapter.readback({ ...row, txid: verified.txid }), { confirmed: false, matches: false, known: true });
+    await rpc('generatetoaddress', [1, mining]);
+    assert.deepEqual(await adapter.readback({ ...row, txid: verified.txid }), { confirmed: true, matches: true });
+    assert(await rpc('gettxout', [externalCollateral.txid, externalCollateral.vout, true]), 'Management must leave collateral unspent');
+    managementLifecycle.push({ operation: body.operation, txid: verified.txid });
+    return verified.txid;
+  }
+  const createdProTxHash = await completeManagement({
+    operation: 'register', collateralOutpoint: externalCollateral,
+    changes: { service: '1.2.3.5:18369', ownerAddress: keyAddress(ownerKey), votingAddress: keyAddress(ownerKey),
+      operatorPublicKey: registeredOperator.publicKey, operatorRewardBasisPoints: 0, payoutAddress: payout },
+  }, collateralKey);
+  let createdState = (await rpc('protx_info', [createdProTxHash])).state;
+  assert.equal(createdState.ownerAddress, keyAddress(ownerKey));
+  assert.equal(createdState.pubKeyOperator, registeredOperator.publicKey);
+  const updatedPayout = await rpc('getnewaddress');
+  await completeManagement({ operation: 'updateRegistrar', proTxHash: createdProTxHash,
+    changes: { operatorPublicKey: rotatedOperator.publicKey, votingAddress: keyAddress(votingKey), payoutAddress: updatedPayout },
+  }, ownerKey);
+  createdState = (await rpc('protx_info', [createdProTxHash])).state;
+  assert.equal(createdState.pubKeyOperator, rotatedOperator.publicKey);
+  assert.equal(createdState.votingAddress, keyAddress(votingKey));
+  assert.equal(createdState.payoutAddress, updatedPayout);
+  assert(createdState.PoSeBanHeight >= 0, 'An operator rotation resets service until recovery');
+  await completeManagement({ operation: 'revoke', proTxHash: createdProTxHash, changes: { reason: 2 } }, rotatedOperator);
+  createdState = (await rpc('protx_info', [createdProTxHash])).state;
+  assert.equal(createdState.revocationReason, 2);
+  assert(createdState.PoSeBanHeight >= 0, 'Revocation disables the operator');
   let tamperedAddressRejection;
   const updates = [
     { operation: 'revive service', changes: { service: '1.2.3.4:18369' } },
@@ -162,7 +223,7 @@ try {
     if (update.changes.service) { assert.equal(state.service, update.changes.service); assert.equal(state.PoSeBanHeight, -1); }
     observed.push({ operation: update.operation, txid: verified.txid, nevmAddress: state.nevmAddress || '' });
   }
-  console.log(JSON.stringify({ result: 'passed', scope: 'disconnected synthetic legacy-v3 regtest', proTxHash, tamperedAddressRejection, manualRetry: 'same bytes and txid after simulated transport outage; known mempool retry skipped', observed, datadir }, null, 2));
+  console.log(JSON.stringify({ result: 'passed', scope: 'disconnected synthetic legacy-v3 regtest', proTxHash, createdProTxHash, managementLifecycle, tamperedAddressRejection, manualRetry: 'same bytes and txid after simulated transport outage; known mempool retry skipped', observed, datadir }, null, 2));
 } finally {
   database?.close();
   if (indexer) await new Promise((done) => indexer.close(done));
