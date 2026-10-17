@@ -61,6 +61,20 @@ describe('auth routes', () => {
     expect(res.body.error).toBe('invalid_email');
   });
 
+  test.each([
+    'first@example.com,second@example.com',
+    'user(comment)@example.com',
+    'group:user@example.com;',
+    'user@example.com\r\nBcc: second@example.com',
+    `${'a'.repeat(65)}@example.com`,
+  ])('POST /auth/register rejects structured or injected recipient %s before mail delivery', async (email) => {
+    const res = await request(ctx.app)
+      .post('/auth/register')
+      .send({ email, authHash: SAMPLE_AUTH });
+    expect(res.status).toBe(400);
+    expect(ctx.mailer.outbox).toEqual([]);
+  });
+
   test('POST /auth/register returns 202 for duplicate (unverified) emails with no enumeration signal', async () => {
     // Under deferred binding we happily issue a fresh pending row +
     // email each /register for an unverified email (so clicking the
