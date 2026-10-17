@@ -1,0 +1,123 @@
+# Automatic deployment on the existing host
+
+The `Deploy production` CI job runs only after every existing backend CI job
+succeeds, on a push to `syscoin/sysnode-backend`'s exact `main` branch. The frontend
+has the equivalent job for `syscoin/sysnode-info`'s `master`. Pull requests, forks,
+tags, and manual workflow calls do not receive the deployment job's credentials.
+The GitHub `production` environment must also restrict branches to that one
+default branch. Normal PR review and branch protections remain the trust boundary
+for application code.
+
+## One host runner, two restricted identities
+
+Install a reviewed copy of `host-deploy.cjs` outside both live checkouts, at
+`/home/ubuntu/.local/libexec/sysnode-deploy/host-deploy.cjs`, with private
+`config.json` beside it. Create the configured state directory as mode 0700. The
+example configuration uses the existing Node 22, PM2 applications, mainnet genesis,
+public HTTPS origin and loopback backend port; verify each value before enabling.
+The host runner must be updated explicitly from reviewed source, not replaced by
+an arbitrary candidate's deployment script.
+
+Use **new, separate ED25519 keys** for the two repositories. Do not upload an
+existing administrator key. Each public key's `authorized_keys` entry must have
+`restrict` and its own fixed forced command, for example:
+
+```text
+restrict,command="/usr/bin/node /home/ubuntu/.local/libexec/sysnode-deploy/host-deploy.cjs request backend /home/ubuntu/.local/libexec/sysnode-deploy/config.json" ssh-ed25519 <backend-public-key>
+restrict,command="/usr/bin/node /home/ubuntu/.local/libexec/sysnode-deploy/host-deploy.cjs request frontend /home/ubuntu/.local/libexec/sysnode-deploy/config.json" ssh-ed25519 <frontend-public-key>
+```
+
+The only accepted commands are `status` (read-only, app/ref/online identity only)
+and `deploy <40-lowercase-hex-SHA> <run-id> <attempt>`. No shell, arbitrary path,
+repository, branch, forwarding or runtime argument comes from the client. Use
+`status` and negative commands before enabling the first deploy; preserve the
+previous authorized-keys file for recovery.
+
+The current host runs both apps as `ubuntu`. Forced commands limit what a stolen
+deployment key can request; they do **not** create OS isolation from trusted
+application code or npm lifecycle scripts running as that same Unix user.
+Review default-branch changes and dependencies accordingly. Production credentials
+are never sourced into staged tests/builds, but same-user filesystem isolation is
+not claimed.
+
+## GitHub environment setup
+
+For each repo's branch-restricted `production` environment:
+
+- Secret `SYSNODE_DEPLOY_KEY`: that repository's new private key only.
+- Secret `SYSNODE_KNOWN_HOSTS`: independently verified pinned host key entry.
+- Variable `SYSNODE_DEPLOY_HOST`: the existing host, currently `62.238.27.161`.
+- Variable `SYSNODE_DEPLOY_USER`: currently `ubuntu`.
+
+The client uses a temporary mode-0600 key and known-hosts file, refuses unknown
+host keys, disables agent/port forwarding and password fallback, and removes the
+temporary files afterward. It performs no npm install with deployment secrets.
+Default-branch push CI runs are not auto-cancelled mid-cutover; other CI runs retain
+the existing cancellation behavior.
+
+## Admission, staging and cutover
+
+The host independently fetches public GitHub run metadata: exact repository and
+head repository, push event, workflow file, branch, SHA and run attempt must match.
+Every required CI job and every additional non-deployment job must have completed
+successfully. It checks the fetched default-branch SHA before admission and again
+under the deployment lock after staging. Older or unqualified requests fail closed.
+
+An OS `flock` bounds admission to one requester per app and is released on process
+death. There is at most one active job per app. A detached supervisor durably
+records startup/lock-timeout failures and keeps the worker alive if the requesting
+SSH session disappears. A second shared host `flock` serializes frontend and
+backend deployments. Repeated identical run/attempt requests observe the same
+job, not another deploy. A process/host crash during a critical phase requires
+operator inspection of that saved job before retrying; no uncertain cutover is
+silently repeated.
+
+The worker archives only the exact qualified Git commit. It runs fresh `npm ci`,
+all repository unit tests, the production audit and the repository-specific codec
+or runtime/build checks in the stage. It does not copy the live `.env` or database
+into those test processes. Backend schema rehearsal is a separate process against
+a consistent private SQLite copy; it does not read live RPC or mail credentials.
+Frontend network selection is explicit at build time. Tracked dirty files,
+unexpected Git origin, runtime, process command, database path, or environment
+changes stop the deployment. Existing untracked `.env.bak.*` files are neither
+deleted nor copied into an artifact.
+
+Only the affected PM2 application is stopped. Its previous source revision,
+dependencies and frontend build are retained. The live `.env`, PM2 launch
+configuration, other app and database path are not replaced. Health checks require
+both public and loopback backend `ok: true`; backend capabilities must match the
+configured network, genesis, era, complete operation set and PQ-preparation gate.
+Frontend pages must serve the exact new main asset and retain `connect-src 'self'`.
+
+## Database policy and rollback
+
+The database is now live. Historical pre-production comments are not permission
+to edit an already deployed migration or discard data. Automatic backend rollout
+refuses changes to `lib/db.js` or `db/migrations/`; those need a separately reviewed
+data-migration deployment. A schema fingerprint also covers actual `sqlite_master`,
+migration records and user version before/after candidate startup on a copied DB,
+so moving startup DDL to another file does not bypass the check.
+
+Before backend cutover a consistent SQLite backup is made after stopping the app.
+On failure the worker first stops the candidate, then checks the real schema and
+integrity. If unchanged, it restores only the old code/dependencies/build and
+verifies the old service. **It never automatically restores a database backup**:
+that could discard newer user writes. If schema, integrity or environment changed,
+the job reports manual recovery and leaves the failed candidate stopped. The old
+code, backup and logs remain available for an operator's explicit recovery choice.
+
+The last three successful jobs/backups per app are retained. Active, failed and
+manual-recovery jobs are never automatically deleted. Successful npm caches and
+source archives are removed; the rollback build/dependencies remain. At least
+4 GiB free disk is required before staging. If failed jobs accumulate, review them
+and archive/remove only individually identified completed jobs; do not delete the
+state directory or live database. All saved files/logs are private to the host user.
+
+## Verification
+
+Backend `npm test` includes admission policy and real-filesystem failure tests.
+They exercise failures before stop, ambiguous stop, partial artifact swaps,
+unhealthy startup, schema changes, interrupted supervision and preservation of
+post-cutover DB writes. Frontend CI tests its strict deployment-request boundary.
+These synthetic checks do not replace the first real `status`, negative-command,
+no-op/current-SHA and qualified default-branch deployment checks on the host.
