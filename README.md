@@ -54,13 +54,12 @@ npm run audit:prod          # fail on critical production dependency issues
 
 ## Dependency Audit Triage
 
-`npm run audit:prod` is wired into CI and fails on critical production
-vulnerabilities. As of this update, the remaining production audit findings are
-known transitive issues under `syscoinjs-lib`'s Ethereum proof stack
-(`eth-proof` / `isomorphic-fetch` / `node-fetch` and `ethers` v5 helpers).
-`npm audit fix --force` proposes changing `syscoinjs-lib` through a breaking
-path, so that risk is tracked separately instead of forced into a dependency
-maintenance PR.
+`npm run audit:prod` is wired into CI and fails on high or critical production
+vulnerabilities. The pinned `syscoinjs-lib` dependency uses ethers v6; the backend
+does not call ethers directly. Remaining low/moderate findings include the
+transitive Ethereum proof stack and other application dependencies. Review the
+current audit output rather than applying `npm audit fix --force`, which can
+replace the transaction library with an incompatible version.
 
 `pm2` is intentionally not an application dependency. If you use it for process
 supervision, install it globally or through your host image, as shown in the
@@ -84,6 +83,10 @@ All configuration is via environment variables. `.env.example` is the source of 
 | `SYSCOIN_NETWORK`, `SYSCOIN_BLOCKBOOK_URL` | Enables the Pay-with-Pali collateral PSBT path |
 
 ## Production authenticated deployment
+
+Automatic, SHA-pinned deployment on the existing persistent host is documented in
+[`deploy/automation/README.md`](deploy/automation/README.md). It runs only after
+successful default-branch CI and preserves the live environment and database.
 
 Real voting-key custody should use a same-origin deployment for the authenticated API surface. Serve the SPA and proxy `/auth`, `/vault`, and `/gov` from the same public HTTPS origin:
 
@@ -334,6 +337,111 @@ pm2 restart sysnode-backend sysnode-info
 | Pay with Pali button disabled | `paliChainGuard` reports `pali_path_chain_mismatch` or `pali_path_rpc_down` | `GET /gov/proposals/network` returns a `paliPathReason` |
 | Verification emails never arrive | SMTP creds wrong, sender domain not verified at the provider, or mail filtered into spam | Check backend logs for 5xx SMTP responses, the provider's dashboard for bounces/delivery status, and the recipient's spam folder |
 | Frontend hits `https://syscoin.dev` instead of the test backend | `REACT_APP_API_BASE` not set at build time | Rebuild with the env var inline |
+
+## Sentry management API
+
+Enable `/api/sentry/v1/` with the existing `SYSCOIN_NETWORK` and
+`SYSCOIN_BLOCKBOOK_URL` settings plus `SYSCOIN_SENTRY_GENESIS_HASH` for the exact
+configured network. The Core node must provide `protx_capabilities` and, for PQ
+operators, extended `protx_operator_key_info`. Missing capability metadata disables
+signing; the backend never guesses an activation state from key length.
+Run Core with `txindex=1` and wait for the transaction index to synchronize before
+enabling management: historical registration and transaction readback use
+`getrawtransaction`. Transport errors or an unavailable/syncing index are not
+treated as transaction absence and do not demote confirmed operation records.
+
+`GET /capabilities` and `GET /context` are rate-limited public chain reads for
+wallets. All node-watch and operation endpoints require a verified session;
+writes also require the configured exact Origin and the existing CSRF token.
+The public API remains `/api/sentry/v1/`, including Pali's default
+`https://sysnode.info/api/sentry/v1/context`. The proxy example forwards that
+path without rewriting. Existing proxies that strip the leading `/api` are
+also supported through the internal `/sentry/v1/` prefix. Both forms mount the
+same router, session/CSRF checks and rate-limit buckets; the internal prefix is
+not a separate public API or a weaker authentication path. Do not expose raw
+backend ports or change the wallet's trusted service URL to accommodate a proxy.
+The existing live proxy and Core metadata APIs must be verified after rollout;
+updating these repository examples alone does not update deployed systems.
+No route accepts an RPC URL, RPC method name, or owner/operator private key.
+
+`POST /api/sentry/v1/nodes` accepts a public watch record
+`{ network, proTxHash, label?, preserveExisting? }`. The optional boolean
+`preserveExisting: true` is intended for batch imports: an existing label for
+the same user, network and ProTx hash is retained atomically, even if another
+tab saved it during the on-chain lookup. It still validates the registered node
+independently before inserting. Omit the option (or use `false`) to retain the
+existing single-node label-update behavior. The response remains the user's
+complete watch list. Watching a node grants no signing authority and imports
+no private key.
+
+`GET /api/sentry/v1/voting-context?network=testnet&proposalHash=<hash>&proTxHashes=<hash1>,<hash2>`
+is a public, read-only observation for Pali's governance-vote approval. It accepts
+at most 20 unique lowercase ProTx hashes and uses the same independently pinned
+Core network/genesis check. Its fixed `gobject_get` call verifies a valid,
+non-deleted proposal and returns the on-chain name/URL, not a dapp-provided title.
+The optional URL is omitted unless it is an HTTP(S) address without credentials;
+this does not reject an otherwise valid proposal with a non-web URI.
+The response is `{ chain, now, proposalHash, proposal: { name, url? }, nodes }`;
+each node has `{ proTxHash, collateralOutpoint: { txid, vout }, votingKeyId,
+valid: true }`. `valid` means a confirmed registered identity with a voting key,
+not a claim about its hosting provider or operational status. Active PQ voting
+is not supported by this legacy ECDSA context and is explicitly rejected.
+The request has a 10-second total deadline, at most four concurrent node reads,
+and a 64-KiB limit per Core response. It has a separate 12-request-per-minute IP
+limit shared across both proxy prefixes, in addition to the normal read limit.
+A changed chain tip rejects the combined
+observation so the wallet can request a fresh one. This endpoint does not sign,
+relay, import or persist anything; the existing `/gov/vote` relay and encrypted
+browser-vault voting path are unchanged.
+
+After deployment, run the anonymous, read-only verifier with independently
+trusted chain expectations (do not copy the genesis from the service being
+checked):
+
+```bash
+npm run verify:sentry-deployment -- \
+  --origin https://sysnode.info --network mainnet \
+  --genesis <trusted-genesis-hash> --era legacy-v3
+```
+
+Optionally add `--pro-tx-hash <known-node-hash>` to check the public node-context
+route. The command requires HTTPS, rejects redirects, bounds each request to
+10 seconds and 128 KiB, and exits nonzero on an HTML/rewritten route, mismatched
+chain, missing operations or broken anonymous-auth boundary. A `legacy-v3`
+check also requires PQ preparation to be explicitly false and rejects advertised
+PQ operations. `--era pq-v4` is an explicit different expectation, not an
+automatic fallback. `--timeout-ms` can set a request deadline up to 30 seconds.
+Successful output is JSON with `ok: true`; no server bodies or credentials are
+printed on failure. It sends only unauthenticated GETs to capabilities,
+operations and, when requested, context. It does not log in, inspect a user's
+history, sign or broadcast. Authenticated writes and a real operator lifecycle
+still require their separate rollout validation; this check cannot certify them.
+
+Preparation uses the shared `@sidhujag/sysweb3-sentry` codec and public fee-account
+data. `/operations/:id/authorize` checks completed wallet authorizations and
+returns a fee-signing PSBT. `/operations/:id/submit` checks the stored immutable
+transaction, current authority, fee limit and `testmempoolaccept`, then records
+the exact signed bytes and transaction ID before one broadcast attempt.
+`GET /operations/:id` reconciles uncertain submissions and verifies on-chain
+readback. It never creates a replacement transaction. SQLite journals contain
+public transaction data only and are isolated by authenticated user ID.
+After a network failure, the user may explicitly request
+`POST /operations/:id/retry` with an empty body. The backend checks for the
+original transaction first, then revalidates and republishes only the stored
+signed bytes if needed. A per-operation cooldown and atomic claim bound retries;
+no new signature, new transaction ID, replacement transaction or fee bump occurs.
+
+Run `npm test -- --runInBand` and `npm run test:sentry-codec`. Codec integration
+uses real legacy/PQ signatures and fee signatures with synthetic RPC fixtures;
+it does not submit transactions to a public network.
+
+For the actual legacy consensus smoke test, set `SENTRY_CORE_BIN` to a directory
+containing the metadata-enabled `syscoind` and `syscoin-cli`, then run
+`npm run test:sentry-core`. It creates a fresh disconnected regtest and synthetic
+wallet, registers a node, signs NEVM add/update/remove requests with the shared
+SDK, and requires Core mempool acceptance plus mined registration readback.
+The test stops its Core process and prints its isolated temporary data directory
+for inspection. It never uses a configured service RPC or an existing wallet.
 
 ## License
 

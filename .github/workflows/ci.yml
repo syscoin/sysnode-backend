@@ -7,7 +7,11 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never interrupt a production cutover when the next default-branch push lands.
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.repository == 'syscoin/sysnode-backend' && github.ref == 'refs/heads/main') }}
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -42,6 +46,9 @@ jobs:
 
       - name: Run tests
         run: npm test -- --runInBand --ci --colors
+
+      - name: Verify Sentry codec integration
+        run: npm run test:sentry-codec
 
   audit:
     name: Production dependency audit
@@ -83,3 +90,26 @@ jobs:
             echo "Duplicate migration prefix(es): $dup"
             exit 1
           fi
+
+  deploy:
+    name: Deploy production
+    needs: [test, audit, lint-sql]
+    if: github.event_name == 'push' && github.repository == 'syscoin/sysnode-backend' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Request exact-commit deployment
+        run: node scripts/request-deploy.cjs backend
+        env:
+          SYSNODE_DEPLOY_HOST: ${{ vars.SYSNODE_DEPLOY_HOST }}
+          SYSNODE_DEPLOY_USER: ${{ vars.SYSNODE_DEPLOY_USER }}
+          SYSNODE_DEPLOY_KEY: ${{ secrets.SYSNODE_DEPLOY_KEY }}
+          SYSNODE_KNOWN_HOSTS: ${{ secrets.SYSNODE_KNOWN_HOSTS }}
