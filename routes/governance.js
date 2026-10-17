@@ -23,6 +23,9 @@ router.post("/govlist", async (req, res) => {
       }
 
       list.push({
+        // Payload text is untrusted proposal content. Core metadata must win
+        // so a payload cannot forge voting identity, counts or validity flags.
+        ...dataString,
         Key: key,
         Hash: entry.Hash,
         ColHash: entry.CollateralHash,
@@ -37,8 +40,7 @@ router.post("/govlist", async (req, res) => {
         fCachedValid: entry.fCachedValid,
         fCachedFunding: entry.fCachedFunding,
         fCachedDelete: entry.fCachedDelete,
-        fCachedEndorsed: entry.fCachedEndorsed,
-        ...dataString
+        fCachedEndorsed: entry.fCachedEndorsed
       });
     });
 
