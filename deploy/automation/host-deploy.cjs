@@ -37,6 +37,9 @@ function validateRun(app, request, run, jobs) {
   if (APPS[app].jobs.some(name => !checks.some(job => job.name === name))) fail('missing_required_ci_job');
   if (checks.some(job => job.status !== 'completed' || job.conclusion !== 'success')) fail('ci_not_successful');
 }
+function validateJobsPage(data) {
+  if (!Number.isSafeInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.jobs) || data.jobs.length !== data.total_count) fail('incomplete_ci_jobs');
+}
 function failedIfUnfinished(job, code) {
   const file = path.join(job, 'status.json');
   const current = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -82,7 +85,7 @@ async function verifyCi(app, request) {
   const base = `https://api.github.com/repos/${APPS[app].repo}/actions/runs/${request.runId}`;
   const run = await jsonGet(base);
   const data = await jsonGet(`${base}/attempts/${request.attempt}/jobs?per_page=100`);
-  if (data.total_count > 100) fail('too_many_ci_jobs');
+  validateJobsPage(data);
   validateRun(app, request, run, data.jobs);
 }
 function command(file, args, options = {}) {
@@ -151,7 +154,9 @@ function capture(config) {
     const app = matches[0], env = app.pm2_env;
     const args = ['-c', name === 'backend' ? 'node --env-file=.env server.js' : 'node server.js'];
     if (env.status !== 'online' || !Number.isSafeInteger(app.pid) || app.pid <= 0 || env.pm_cwd !== root || env.pm_exec_path !== '/usr/bin/bash' || !isDeepStrictEqual(env.args, args)) fail('unexpected_pm2_launch');
-    state.apps[name] = { head: git(root, 'rev-parse', 'HEAD'), pid: app.pid, envHash: sha256(fs.readFileSync(path.join(root, '.env'))), launch: sha256(JSON.stringify(canonical([env.pm_cwd, env.pm_exec_path, env.args, env.env]))) };
+    const envFile = path.join(root, '.env');
+    if (!fs.lstatSync(envFile).isFile() || fs.lstatSync(envFile).isSymbolicLink()) fail('unsafe_environment_file');
+    state.apps[name] = { head: git(root, 'rev-parse', 'HEAD'), pid: app.pid, envHash: sha256(fs.readFileSync(envFile)), launch: sha256(JSON.stringify(canonical([env.pm_cwd, env.pm_exec_path, env.args, env.env]))) };
   }
   const database = databasePath(config, apps), stat = fs.statSync(database);
   if (fs.lstatSync(database).isSymbolicLink()) fail('unsafe_database');
@@ -181,6 +186,10 @@ function checkDatabase(config, file, snapshot) {
 }
 function sourceSchemaFence(root, previous, candidate) {
   return git(root, 'diff', '--name-only', previous, candidate, '--', 'db/migrations', 'lib/db.js').length === 0;
+}
+function sourceRuntimeFence(root, previous, candidate, app, readGit = git) {
+  const protectedPaths = ['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules/', app === 'frontend' ? 'build/' : 'data/'];
+  return readGit(root, 'diff', '--name-only', previous, candidate, '--', ...protectedPaths).length === 0;
 }
 async function rehearseSchema(config, stage, job, source, oldSchema) {
   const copy = path.join(job, 'schema-rehearsal.sqlite');
@@ -239,6 +248,7 @@ async function deploy(config, app, request, job, io = {}) {
   const oldSchema = await op.checkDatabase(config, before.database.path);
   writeJson(path.join(job, 'before.json'), before);
   if (previous === request.sha) { await op.publicHealth(config, app, root); status('already deployed and healthy', 'success'); return; }
+  if (!sourceRuntimeFence(root, previous, request.sha, app, op.git)) fail('protected_runtime_path_changed');
   if (app === 'backend' && !op.sourceSchemaFence(root, previous, request.sha)) fail('schema_source_requires_manual_rollout');
   const disk = fs.statfsSync(config.stateRoot);
   if (Number(disk.bavail) * Number(disk.bsize) < (config.minFreeBytes || 4 * 1024 ** 3)) fail('retention_cleanup_required_low_disk');
@@ -248,6 +258,7 @@ async function deploy(config, app, request, job, io = {}) {
   op.command('git', ['-C', root, 'archive', '--output', archive, request.sha]);
   op.command('tar', ['-xf', archive, '-C', stage]);
   const candidateEnv = path.join(stage, '.env');
+  if (fs.existsSync(candidateEnv) && (!fs.lstatSync(candidateEnv).isFile() || fs.lstatSync(candidateEnv).isSymbolicLink())) fail('unsafe_candidate_environment_file');
   if (fs.existsSync(candidateEnv) && sha256(fs.readFileSync(candidateEnv)) !== before.apps[app].envHash) fail('candidate_would_replace_environment');
   const env = stageEnvironment(job);
   op.command('npm', ['ci', '--include=dev'], { cwd: stage, env });
@@ -384,4 +395,4 @@ async function main() {
   catch (error) { writeJson(path.join(job, 'status.json'), { state: 'failed', phase: 'deployment stopped', code: /^[a-z_]+$/.test(error.code || '') ? error.code : 'deployment_failed' }); throw error; }
 }
 if (require.main === module) main().catch(error => { console.error(/^[a-z_]+$/.test(error.code || '') ? error.code : 'deployment_failed'); process.exitCode = 1; });
-module.exports = { APPS, canonical, parseCommand, validateRun, validateCapabilities, sourceSchemaFence, schema, compareState, stageEnvironment, deploy, requestDeploy, supervise, failedIfUnfinished, retainSuccessful };
+module.exports = { APPS, canonical, parseCommand, validateRun, validateJobsPage, validateCapabilities, sourceSchemaFence, sourceRuntimeFence, schema, compareState, stageEnvironment, deploy, requestDeploy, supervise, failedIfUnfinished, retainSuccessful };

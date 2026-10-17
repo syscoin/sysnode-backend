@@ -226,6 +226,42 @@ it("does not stop or replace the live app after a failed staged install", async 
   f.assertPreserved();
 });
 
+it.each(["deleted", "changed to a symlink"])(
+  "rejects a tracked environment file %s before staging or cutover",
+  async () => {
+    const f = fixture("frontend");
+    f.io.git.mockImplementation((_root, method) => method === "diff" ? ".env" : "");
+    await expect(deploy(f.config, f.app, f.request, f.job, f.io)).rejects.toThrow(
+      "protected_runtime_path_changed"
+    );
+    expect(f.pm2Commands()).toEqual([]);
+    expect(fs.existsSync(path.join(f.job, "stage"))).toBe(false);
+    expect(f.state.apps.frontend).toMatchObject({ head: OLD, online: true });
+    f.assertPreserved();
+  }
+);
+
+it.each(["directory", "symlink"])(
+  "rejects a staged environment %s without touching the live environment",
+  async shape => {
+    const f = fixture("frontend");
+    const execute = f.io.command.getMockImplementation();
+    f.io.command.mockImplementation((file, args, options) => {
+      const result = execute(file, args, options);
+      if (file === "tar") {
+        const stagedEnv = path.join(f.job, "stage", ".env");
+        if (shape === "directory") fs.mkdirSync(stagedEnv);
+        else fs.symlinkSync(path.join(f.root, ".env"), stagedEnv);
+      }
+      return result;
+    });
+    await expect(deploy(f.config, f.app, f.request, f.job, f.io)).rejects.toThrow();
+    expect(f.pm2Commands()).toEqual([]);
+    expect(f.state.apps.frontend).toMatchObject({ head: OLD, online: true });
+    f.assertPreserved();
+  }
+);
+
 it.each(["original-node_modules", "node_modules", "build"])(
   "restores real files after the %s replacement rename fails",
   async (member) => {

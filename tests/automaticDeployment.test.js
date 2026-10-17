@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const cp = require('node:child_process');
 const { EventEmitter } = require('node:events');
-const { parseCommand, validateRun, validateCapabilities, canonical, compareState, schema, stageEnvironment, supervise, requestDeploy, retainSuccessful } = require('../deploy/automation/host-deploy.cjs');
+const { parseCommand, validateRun, validateJobsPage, validateCapabilities, sourceRuntimeFence, canonical, compareState, schema, stageEnvironment, supervise, requestDeploy, retainSuccessful } = require('../deploy/automation/host-deploy.cjs');
 const { inputs } = require('../scripts/request-deploy.cjs');
 
 const sha = 'a'.repeat(40);
@@ -26,6 +26,17 @@ test('missing, failed, skipped and additional unfinished jobs all fail closed', 
   expect(() => validateRun('backend', request, run, jobs.slice(1))).toThrow();
   for (const conclusion of ['failure', 'skipped', 'cancelled', null]) expect(() => validateRun('backend', request, run, jobs.map((job, index) => index ? job : { ...job, conclusion }))).toThrow();
   expect(() => validateRun('backend', request, run, [...jobs, { name: 'New required check', status: 'queued' }])).toThrow();
+});
+test('CI job pages must be complete and bounded before accepting any success list', () => {
+  expect(() => validateJobsPage({ total_count: jobs.length, jobs })).not.toThrow();
+  for (const page of [{ jobs }, { total_count: jobs.length + 1, jobs }, { total_count: 101, jobs }, { total_count: 1.5, jobs }, { total_count: -1, jobs }]) expect(() => validateJobsPage(page)).toThrow('incomplete_ci_jobs');
+});
+test.each(['frontend', 'backend'])('the %s source fence covers runtime files before git can overwrite them', app => {
+  const read = jest.fn(() => '');
+  expect(sourceRuntimeFence('/app', 'old', 'new', app, read)).toBe(true);
+  expect(read.mock.calls[0].slice(6)).toEqual(['.env', '.env.local', '.env.*.local', '.env.bak*', 'node_modules/', app === 'frontend' ? 'build/' : 'data/']);
+  read.mockReturnValue('.env');
+  expect(sourceRuntimeFence('/app', 'old', 'new', app, read)).toBe(false);
 });
 test('client never admits PRs, forks, wrong refs or SSH argument injection', () => {
   expect(inputs('backend', env).command).toBe(`deploy ${sha} 123 2`);

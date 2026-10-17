@@ -81,6 +81,11 @@ Frontend network selection is explicit at build time. Tracked dirty files,
 unexpected Git origin, runtime, process command, database path, or environment
 changes stop the deployment. Existing untracked `.env.bak.*` files are neither
 deleted nor copied into an artifact.
+Candidate tree changes to live `.env`/local override/backup files, `node_modules`,
+the frontend `build` or backend `data` directory are rejected before staging or
+stopping an app. This also prevents Git from replacing an ignored runtime file
+with a newly tracked file. A staged environment path must be a regular file, not
+a directory or symbolic link.
 
 Only the affected PM2 application is stopped. Its previous source revision,
 dependencies and frontend build are retained. The live `.env`, PM2 launch
@@ -121,3 +126,6 @@ unhealthy startup, schema changes, interrupted supervision and preservation of
 post-cutover DB writes. Frontend CI tests its strict deployment-request boundary.
 These synthetic checks do not replace the first real `status`, negative-command,
 no-op/current-SHA and qualified default-branch deployment checks on the host.
+After a failed deployment, use GitHub **Re-run all jobs**, not only the failed
+deployment job: the host requires the complete green CI matrix for that exact
+run attempt and deliberately does not borrow results from a previous attempt.
