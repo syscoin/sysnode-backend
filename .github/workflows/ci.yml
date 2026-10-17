@@ -109,7 +109,7 @@ jobs:
       - name: Request exact-commit deployment
         run: node scripts/request-deploy.cjs backend
         env:
-          SYSNODE_DEPLOY_HOST: ${{ vars.SYSNODE_DEPLOY_HOST }}
+          SYSNODE_DEPLOY_HOST: ${{ secrets.SYSNODE_DEPLOY_HOST }}
           SYSNODE_DEPLOY_USER: ${{ vars.SYSNODE_DEPLOY_USER }}
           SYSNODE_DEPLOY_KEY: ${{ secrets.SYSNODE_DEPLOY_KEY }}
           SYSNODE_KNOWN_HOSTS: ${{ secrets.SYSNODE_KNOWN_HOSTS }}
