@@ -11,6 +11,7 @@
     "test:watch": "jest --watch",
     "test:sentry-codec": "node --test tests/sentry-codec.integration.mjs",
     "test:sentry-core": "node scripts/sentry-core-regtest.mjs",
+    "verify:sentry-deployment": "node scripts/verify-sentry-deployment.js",
     "test:coverage": "jest --coverage",
     "audit:prod": "npm audit --omit=dev --audit-level=high"
   },
