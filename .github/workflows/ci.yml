@@ -50,6 +50,27 @@ jobs:
       - name: Verify Sentry codec integration
         run: npm run test:sentry-codec
 
+  recovery-anvil:
+    name: Recovery alerts against real EVM contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CI: 'true'
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install pinned Anvil
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with:
+          version: v1.7.1
+      - run: npm ci
+      - name: Verify contract-bound enrollment and recovery lifecycle
+        run: npm run test:recovery-anvil
+
   audit:
     name: Production dependency audit
     runs-on: ubuntu-latest
@@ -93,7 +114,7 @@ jobs:
 
   deploy:
     name: Deploy production
-    needs: [test, audit, lint-sql]
+    needs: [test, audit, lint-sql, recovery-anvil]
     if: github.event_name == 'push' && github.repository == 'syscoin/sysnode-backend' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60

@@ -43,6 +43,8 @@ const {
 } = require('./lib/proposalPsbt');
 const { createPaliChainGuard } = require('./lib/paliChainGuard');
 const { createConfiguredSentryAdapter, createSentryRpc } = require('./lib/sentryAdapter');
+const { configuredRecoveryChains } = require('./lib/recoveryRegistry');
+const { createRecoveryMonitor } = require('./lib/recoveryMonitor');
 const {
   createMasternodeCountRepo,
 } = require('./lib/masternodeCountRepo');
@@ -200,6 +202,14 @@ const mailer = createMailer({
   publicBaseUrl: PUBLIC_BASE_URL,
 });
 const services = finalizeSessionMw(buildServices({ db }));
+const recoveryMonitor = createRecoveryMonitor({
+  repository: services.recoveryRepository,
+  users: services.users,
+  chains: configuredRecoveryChains(),
+  mailer,
+  log: (event, details) => console.warn(`[recovery] ${event}`, details),
+});
+recoveryMonitor.start();
 assertProductionAuthConfig({
   secureCookies: services.secureCookies,
   corsOrigin: AUTH_ORIGIN,
@@ -330,6 +340,7 @@ if (paliChainGuard) {
 mountAuthAndVault(app, {
   services,
   mailer,
+  recoveryMonitor,
   baseUrl: process.env.BASE_URL || 'http://localhost:3001',
   frontendUrl: PUBLIC_BASE_URL,
   // Read the live tracker snapshot fresh on every call rather than

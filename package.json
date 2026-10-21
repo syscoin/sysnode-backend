@@ -1,7 +1,9 @@
 {
   "name": "sysnode",
   "version": "1.0.0",
-  "engines": { "node": ">=20.19.0" },
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "description": "Syscoin backend for masternode and governance stats",
   "main": "server.js",
   "scripts": {
@@ -11,6 +13,7 @@
     "test:watch": "jest --watch",
     "test:sentry-codec": "node --test tests/sentry-codec.integration.mjs tests/syscoin-dependencies.integration.mjs",
     "test:sentry-core": "node scripts/sentry-core-regtest.mjs",
+    "test:recovery-anvil": "node --test tests/recovery-anvil.integration.mjs",
     "verify:sentry-deployment": "node scripts/verify-sentry-deployment.js",
     "test:coverage": "jest --coverage",
     "audit:prod": "npm audit --omit=dev --audit-level=high"
@@ -37,6 +40,7 @@
     "cookie-parser": "^1.4.7",
     "cors": "2.8.5",
     "csv-parser": "3.0.0",
+    "ethers": "6.17.0",
     "express": "^4.22.1",
     "express-rate-limit": "^8.5.1",
     "fs": "0.0.1-security",
