@@ -187,6 +187,11 @@ test('real Pali ERC7739/1271 HTTP enrollment and recovery monitoring on isolated
     const token = fixture.sessions.issue(user.id).token;
     const call = (method, path) => request(fixture.app)[method](path).set('Cookie', `sid=${token}; csrf=anvil-csrf`).set('X-CSRF-Token', 'anvil-csrf');
     const challenge = async () => (await call('post', '/recovery/challenges').send({ chainId: 57057, account: accountAddress }).expect(200)).body;
+
+    await t.test('an ordinary EOA receives the recovery setup error instead of a service outage', async () => {
+      const result = await call('post', '/recovery/challenges').send({ chainId: 57057, account: owner.address }).expect(400);
+      assert.equal(result.body.error, 'recovery_not_installed');
+    });
     let originalApproval;
 
     await t.test('wrong-account, wrong-chain and raw EOA signatures fail real ERC1271; accepted proof cannot replay', async () => {
