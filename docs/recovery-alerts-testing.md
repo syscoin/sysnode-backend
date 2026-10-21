@@ -2,6 +2,11 @@
 
 `npm test -- --runInBand` covers deterministic authentication, storage,
 monitoring, outbox, freshness, and reorganization cases.
+The deterministic sparse-cadence integration uses the real RPC adapter, HTTP
+routes and worker with synthetic JSON-RPC responses: a 330-second-old tip permits
+enrollment on the scoped testnet policy, a recovery alerts without additional
+blocks, an age over 420 seconds degrades the watch, and a replaced tip corrects
+the earlier observation. It does not establish public-network delivery or finality.
 
 `npm run test:recovery-anvil` additionally runs the HTTP API against real Pali
 contracts in an isolated local Anvil chain. Install Anvil 1.7.1 and the supported

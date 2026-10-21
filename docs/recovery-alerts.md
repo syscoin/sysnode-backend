@@ -10,7 +10,8 @@ password and its configured TOTP factor.
 The initial supported network is **zkTanenbaum (57057)**. Mainnet networks are
 not advertised before the pinned recovery module has been deployed and checked.
 The server-owned registry contains the RPC, chain ID, module address, exact
-runtime hash and confirmation depth. HTTP requests cannot supply any of these.
+runtime hash, confirmation depth and finite block-age limit. HTTP requests cannot
+supply any of these.
 Each enrollment persists its chain, module and account binding. Changing the
 registry cannot silently move an existing enrollment to another module: the
 old watch becomes unavailable and a new module requires a fresh signed proof.
@@ -19,9 +20,17 @@ disabled. Never add a runtime or chain without verifying its source and layout.
 
 ## Chain observations
 
-Each observation verifies the chain ID and the exact module runtime at a
-two-block-confirmed anchor. All calls and storage reads use that anchor, whose
-hash is checked again afterwards. The source-pinned `_activeRecovery` and
+Each observation verifies the chain ID and the exact module runtime at the
+selected canonical block. zkTanenbaum uses the latest observed block, not a
+finalized block, so an initiation does not wait for two more blocks. Its block
+production is transaction-driven: public read-only samples on 2026-10-21 showed
+blocks 3776–3784 separated by 316–333 seconds, each importing an interop root.
+Its server-owned freshness bound is seven minutes; the default for other chain
+configurations remains two minutes. No other chain is enabled by this change.
+All calls and storage reads use the selected anchor, whose hash is checked again
+afterwards. Repeated hash checks detect inconsistent observations but do not
+provide finality. Emails identify this observation/reorganization boundary.
+The source-pinned `_activeRecovery` and
 `_schedules` storage layout closes two otherwise ambiguous cases: an operation
 already pending before enrollment, and uninstall/reinstall that silently cancels
 an operation without emitting `RecoveryCanceled`. The layout fixture comes from
@@ -37,8 +46,8 @@ resnapshots state, warns about the reorganization and replays from the enrollmen
 anchor. An orphaned observation is not reported as an operator cancellation.
 
 One worker loop starts every 15 seconds after the previous iteration completes,
-with at most three subscription updates concurrently. A stale RPC chain (over two
-minutes old), read failure, unsupported runtime or incomplete backfill is shown
+with at most three subscription updates concurrently. A chain older than its
+configured finite freshness bound, read failure, unsupported runtime or incomplete backfill is shown
 as degraded/catching up. The API also expires a saved healthy status after one
 minute without a successful check, including when the process is down. Use one
 backend worker per SQLite database; horizontal worker leasing is not implemented.
