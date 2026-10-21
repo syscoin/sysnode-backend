@@ -1,4 +1,6 @@
 const data = require('../data/dataStore');
+const express = require('express');
+const request = require('supertest');
 
 jest.mock('../services/rpcClient', () => {
   const mockCalls = {
@@ -103,10 +105,13 @@ function resetDataStoreToInitial() {
 // lastGoodAt, etc.) between tests.
 process.env.NODE_ENV = 'test'; // suppress auto-start at require time
 const sysMain = require('./sysMain');
+const { getStatsMetadata } = require('../lib/statsSnapshot');
+const statsApp = express();
+statsApp.use(require('../routes/mnStats'));
 
 describe('sysMain periodic aggregator', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
     resetDataStoreToInitial();
     sysMain.__resetForTests();
   });
@@ -168,7 +173,7 @@ describe('sysMain periodic aggregator', () => {
   test('successful tick resets the backoff to BASE_TICK_MS', async () => {
     primeHappyRpc();
     // Simulate a prior failure that ramped the backoff.
-    axios.get.mockRejectedValueOnce(new Error('Request failed with status code 429'));
+    rpc.getNetworkInfo.mockRejectedValueOnce(new Error('Core unavailable'));
     const failRes = await sysMain.tick();
     expect(failRes.ok).toBe(false);
     expect(sysMain.getDiagnostics().currentTickMs).toBeGreaterThan(sysMain.BASE_TICK_MS);
@@ -180,22 +185,268 @@ describe('sysMain periodic aggregator', () => {
     expect(sysMain.getDiagnostics().currentTickMs).toBe(sysMain.BASE_TICK_MS);
   });
 
-  test('CoinGecko 429 leaves dataStore UNCHANGED (no partial writes, cold-start stays at initial defaults)', async () => {
-    axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
-    // RPC primed but should never be called.
+  test('cold CoinGecko 429 still publishes healthy Core stats and marks market unavailable', async () => {
     primeHappyRpc();
     axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
 
     const res = await sysMain.tick();
     expect(res.ok).toBe(false);
 
-    // Every field should still be at its initial value — no partial writes.
-    for (const [k, v] of Object.entries(INITIAL_DATA_SNAPSHOT)) {
-      expect(data[k]).toEqual(v);
+    expect(res.coreOk).toBe(true);
+    expect(data.currentBlock).toBe(1_999_999);
+    expect(data.mnEnabled).toBe(1_450);
+    expect(data.nextSuperBlock).toBe(2_053_680);
+    expect(data.sysUsd).toBe(INITIAL_DATA_SNAPSHOT.sysUsd);
+    expect(rpc.getNetworkInfo).toHaveBeenCalledTimes(1);
+    expect(rpc.masternode_count).toHaveBeenCalledTimes(1);
+    expect(getStatsMetadata().groups.market).toEqual({ status: 'unavailable', updated_at: null });
+    for (const group of ['chain', 'node', 'governance']) {
+      expect(getStatsMetadata().groups[group].status).toBe('ready');
     }
-    // RPC should not have been touched (CoinGecko is sequential-first).
-    expect(rpc.getNetworkInfo).not.toHaveBeenCalled();
-    expect(rpc.masternode_count).not.toHaveBeenCalled();
+    expect(sysMain.getDiagnostics().currentTickMs).toBe(sysMain.BASE_TICK_MS);
+    expect(sysMain.getDiagnostics().marketTickMs).toBe(sysMain.BASE_TICK_MS * 2);
+
+    const response = await request(statsApp).get('/mnstats').expect(200);
+    expect(response.body.stats.mn_stats.enabled).toBe('1,450');
+    expect(response.body.stats.mn_stats.total_locked).toBe('150,000,000.00');
+    expect(response.body.stats.mn_stats.roi).toMatch(/^\d+(?:\.\d+)?%$/);
+    expect(response.body.stats.blockchain_stats.connections).toBe('1,999,999');
+    expect(response.body.stats.superblock_stats.next_superblock).toContain('2053680');
+    expect(response.body.stats.price_stats.price_usd).toBeNull();
+    expect(response.body.stats.income_stats.usd.daily).toBeNull();
+    expect(response.body.stats.income_stats.sys.daily).toContain(' SYS');
+    expect(response.body.stats_meta.groups.market.status).toBe('unavailable');
+    expect(JSON.stringify(response.body)).not.toMatch(/NaN|Infinity/);
+  });
+
+  test('cold route does not turn initial defaults into zero balances or Infinity', async () => {
+    const response = await request(statsApp).get('/mnstats').expect(200);
+    for (const group of Object.values(response.body.stats_meta.groups)) {
+      expect(group).toEqual({ status: 'unavailable', updated_at: null });
+    }
+    expect(response.body.stats.mn_stats.enabled).toBeNull();
+    expect(response.body.stats.mn_stats.total_locked).toBeNull();
+    expect(response.body.stats.mn_stats.roi).toBeNull();
+    expect(response.body.stats.blockchain_stats.connections).toBeNull();
+    expect(response.body.stats.superblock_stats.next_superblock).toBeNull();
+    expect(JSON.stringify(response.body)).not.toMatch(/NaN|Infinity/);
+  });
+
+  test('market backoff does not delay Core updates or retry the market on every Core tick', async () => {
+    const clock = jest.spyOn(Date, 'now');
+    let now = 1_700_000_000_000;
+    clock.mockImplementation(() => now);
+    try {
+      primeHappyRpc();
+      axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
+      await sysMain.tick();
+      expect(axios.get).toHaveBeenCalledTimes(1);
+      now += sysMain.BASE_TICK_MS;
+      rpc.masternode_count.mockResolvedValueOnce({ total: 1_501, enabled: 1_451 });
+      const second = await sysMain.tick();
+      expect(second.marketSkipped).toBe(true);
+      expect(data.mnEnabled).toBe(1_451);
+      expect(axios.get).toHaveBeenCalledTimes(1);
+      expect(getStatsMetadata().groups.node.updated_at).toBe(now);
+      expect(sysMain.getDiagnostics().currentTickMs).toBe(sysMain.BASE_TICK_MS);
+
+      now = sysMain.getDiagnostics().marketNextAt;
+      await sysMain.tick();
+      expect(axios.get).toHaveBeenCalledTimes(2);
+      expect(sysMain.getDiagnostics().marketTickMs).toBe(80_000);
+      expect(sysMain.getDiagnostics().currentTickMs).toBe(sysMain.BASE_TICK_MS);
+
+      now = sysMain.getDiagnostics().marketNextAt;
+      axios.get.mockResolvedValueOnce(HAPPY_GECKO);
+      await sysMain.tick();
+      expect(getStatsMetadata().groups.market).toEqual({ status: 'ready', updated_at: now });
+      expect(sysMain.getDiagnostics().marketTickMs).toBe(sysMain.BASE_TICK_MS);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('market exponential backoff is capped independently while Core continues normally', async () => {
+    const clock = jest.spyOn(Date, 'now');
+    let now = 1_700_000_000_000;
+    clock.mockImplementation(() => now);
+    try {
+      primeHappyRpc();
+      axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
+      const seen = [];
+      for (let i = 0; i < 12; i++) {
+        await sysMain.tick();
+        seen.push(sysMain.getDiagnostics().marketTickMs);
+        expect(sysMain.getDiagnostics().currentTickMs).toBe(sysMain.BASE_TICK_MS);
+        now = sysMain.getDiagnostics().marketNextAt;
+      }
+      expect(axios.get).toHaveBeenCalledTimes(12);
+      expect(Math.max(...seen)).toBe(sysMain.MAX_BACKOFF_MS);
+      expect(seen[0]).toBe(sysMain.BASE_TICK_MS * 2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test('known zero enabled nodes is displayed as zero with undefined reward ratios', async () => {
+    primeHappyRpc();
+    rpc.masternode_count.mockResolvedValue({ total: 2, enabled: 0 });
+    await sysMain.tick();
+    const response = await request(statsApp).get('/mnstats').expect(200);
+    expect(response.body.stats_meta.groups.node.status).toBe('ready');
+    expect(response.body.stats.mn_stats.enabled).toBe('0');
+    expect(response.body.stats.mn_stats.total).toBe('2');
+    expect(response.body.stats.mn_stats.total_locked).toBe('200,000.00');
+    expect(response.body.stats.mn_stats.roi).toBeNull();
+    expect(response.body.stats.mn_stats.payout_frequency).toBeNull();
+    expect(response.body.stats.income_stats.sys.daily).toBeNull();
+    expect(JSON.stringify(response.body)).not.toMatch(/NaN|Infinity/);
+  });
+
+  test('invalid Core counts do not poison an earlier atomic Core snapshot', async () => {
+    primeHappyRpc();
+    await sysMain.tick();
+    const previous = getStatsMetadata().groups.node;
+    const oldCount = data.mnEnabled;
+    rpc.masternode_count.mockResolvedValue({ total: 10, enabled: 11 });
+    const result = await sysMain.tick();
+    expect(result.coreOk).toBe(false);
+    expect(data.mnEnabled).toBe(oldCount);
+    expect(getStatsMetadata().groups.node).toEqual({ ...previous, status: 'stale' });
+    expect(getStatsMetadata().groups.chain.status).toBe('stale');
+    expect(getStatsMetadata().groups.market.status).toBe('ready');
+  });
+
+  test('missing market quantities stay unavailable rather than becoming false zero prices', async () => {
+    primeHappyRpc();
+    axios.get.mockResolvedValue({ data: { market_data: { current_price: { usd: 0 }, total_supply: null } } });
+    await sysMain.tick();
+    const response = await request(statsApp).get('/mnstats').expect(200);
+    expect(response.body.stats_meta.groups.market.status).toBe('ready');
+    expect(response.body.stats.price_stats.price_usd).toBe('0.0000');
+    expect(response.body.stats.price_stats.price_btc).toBeNull();
+    expect(response.body.stats.price_stats.total_supply).toBeNull();
+    expect(response.body.stats.price_stats.price_change).toBeNull();
+  });
+
+  test.each([{}, { current_price: { usd: null, btc: null }, circulating_supply: null }])(
+    'an all-unusable HTTP200 market payload remains unavailable on cold start: %p',
+    async (market_data) => {
+      primeHappyRpc();
+      axios.get.mockResolvedValue({ data: { market_data } });
+      const result = await sysMain.tick();
+      expect(result.coreOk).toBe(true);
+      expect(result.marketOk).toBe(false);
+      expect(getStatsMetadata().groups.market).toEqual({ status: 'unavailable', updated_at: null });
+      const response = await request(statsApp).get('/mnstats').expect(200);
+      expect(response.body.stats.price_stats.price_usd).toBeNull();
+      expect(response.body.stats.mn_stats.enabled).toBe('1,450');
+    }
+  );
+
+  test('an empty later market HTTP200 cannot replace the last usable market snapshot', async () => {
+    primeHappyRpc();
+    await sysMain.tick();
+    const previous = getStatsMetadata().groups.market;
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(sysMain.getDiagnostics().marketNextAt);
+    try {
+      axios.get.mockResolvedValueOnce({ data: { market_data: {} } });
+      await sysMain.tick();
+      expect(data.sysUsd).toBe(0.12);
+      expect(data.circulatingSupply).toBe(700_000_000);
+      expect(getStatsMetadata().groups.market).toEqual({ ...previous, status: 'stale' });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test.each(['resolve', 'reject'])('late market %s cannot overwrite newer values, metadata or retry state', async (outcome) => {
+    primeHappyRpc();
+    let finish;
+    axios.get.mockReturnValueOnce(new Promise((resolve, reject) => {
+      finish = outcome === 'resolve'
+        ? () => resolve({ data: { market_data: { ...HAPPY_GECKO.data.market_data, current_price: { usd: 999, btc: 999 } } } })
+        : () => reject(new Error('late obsolete market failure'));
+    }));
+    const oldTick = sysMain.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    rpc.masternode_count.mockResolvedValueOnce({ total: 1_600, enabled: 1_550 });
+    expect((await sysMain.tick()).ok).toBe(true);
+    const metadata = getStatsMetadata();
+    const diagnostics = sysMain.getDiagnostics();
+    finish();
+    expect((await oldTick).stale).toBe(true);
+    expect(data.sysUsd).toBe(0.12);
+    expect(data.mnEnabled).toBe(1_550);
+    expect(getStatsMetadata()).toEqual(metadata);
+    expect(sysMain.getDiagnostics()).toEqual(diagnostics);
+  });
+
+  test.each(['Core', 'market'])('healthy source publishes without waiting for hung %s, and watchdog preserves it', async (hung) => {
+    jest.useFakeTimers();
+    try {
+      primeHappyRpc();
+      if (hung === 'Core') rpc.masternode_count.mockReturnValueOnce(new Promise(() => {}));
+      else axios.get.mockReturnValueOnce(new Promise(() => {}));
+      sysMain.start();
+      for (let i = 0; i < 100; i++) await Promise.resolve();
+      const healthyGroup = hung === 'Core' ? 'market' : 'node';
+      const healthy = getStatsMetadata().groups[healthyGroup];
+      expect(healthy.status).toBe('ready');
+      if (hung === 'Core') expect(data.sysUsd).toBe(0.12);
+      else expect(data.mnEnabled).toBe(1_450);
+      expect(sysMain.getDiagnostics().lastCompletedGen).toBe(0);
+      jest.advanceTimersByTime(sysMain.TICK_WATCHDOG_MS);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(sysMain.getDiagnostics().watchdogFires).toBe(1);
+      expect(getStatsMetadata().groups[healthyGroup]).toEqual(healthy);
+      expect(getStatsMetadata().groups[hung === 'Core' ? 'node' : 'market'].status).toBe('unavailable');
+    } finally {
+      sysMain.stop();
+      jest.useRealTimers();
+    }
+  });
+
+  test('per-source fence rejects old market result while newer Core observation is still pending', async () => {
+    primeHappyRpc();
+    let oldMarket;
+    let newCore;
+    axios.get.mockReturnValueOnce(new Promise((resolve) => { oldMarket = resolve; }));
+    const older = sysMain.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    rpc.masternode_count.mockReturnValueOnce(new Promise((resolve) => { newCore = resolve; }));
+    const newer = sysMain.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(getStatsMetadata().groups.market.status).toBe('ready');
+    const marketSnapshot = getStatsMetadata().groups.market;
+    oldMarket({ data: { market_data: { ...HAPPY_GECKO.data.market_data, current_price: { usd: 999, btc: 999 } } } });
+    await older;
+    expect(data.sysUsd).toBe(0.12);
+    expect(getStatsMetadata().groups.market).toEqual(marketSnapshot);
+    newCore({ total: 1_600, enabled: 1_550 });
+    await newer;
+    expect(data.mnEnabled).toBe(1_550);
+  });
+
+  test('stop fences a retired in-flight source before a restarted loop finishes', async () => {
+    primeHappyRpc();
+    let oldCore;
+    let newCore;
+    rpc.masternode_count.mockReturnValueOnce(new Promise((resolve) => { oldCore = resolve; }));
+    sysMain.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    sysMain.stop();
+    rpc.masternode_count.mockReturnValueOnce(new Promise((resolve) => { newCore = resolve; }));
+    sysMain.start();
+    await new Promise((resolve) => setImmediate(resolve));
+    oldCore({ total: 9999, enabled: 9999 });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(getStatsMetadata().groups.node.status).toBe('unavailable');
+    expect(data.mnTotal).toBe(INITIAL_DATA_SNAPSHOT.mnTotal);
+    newCore({ total: 1_600, enabled: 1_550 });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(data.mnTotal).toBe(1_600);
+    expect(getStatsMetadata().groups.node.status).toBe('ready');
   });
 
   test('CoinGecko 429 does NOT wipe a previously good snapshot', async () => {
@@ -211,19 +462,23 @@ describe('sysMain periodic aggregator', () => {
       sb3Budget: data.sb3Budget,
     };
 
+    const previousMarket = getStatsMetadata().groups.market;
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(sysMain.getDiagnostics().marketNextAt);
     axios.get.mockRejectedValueOnce(new Error('Request failed with status code 429'));
     const failTick = await sysMain.tick();
+    clock.mockRestore();
     expect(failTick.ok).toBe(false);
 
     // Previous good values persist verbatim.
     expect(data.sysUsd).toBe(good.sysUsd);
     expect(data.nextSuperBlock).toBe(good.nextSuperBlock);
-    expect(data.superBlockNextEpochSec).toBe(good.superBlockNextEpochSec);
+    expect(data.superBlockNextEpochSec).toBeGreaterThanOrEqual(good.superBlockNextEpochSec);
     expect(data.mnEnabled).toBe(good.mnEnabled);
     expect(data.sb3Budget).toBe(good.sb3Budget);
+    expect(getStatsMetadata().groups.market).toEqual({ ...previousMarket, status: 'stale' });
   });
 
-  test('RPC failure mid-tick does NOT partially mutate dataStore (atomic commit)', async () => {
+  test('RPC failure does not partially mutate Core snapshot, but healthy market remains available', async () => {
     // CoinGecko succeeds, chain-head succeeds, but governance fails.
     axios.get.mockResolvedValue(HAPPY_GECKO);
     rpc.getNetworkInfo.mockResolvedValue({ version: 1, subversion: '/x/', protocolversion: 1 });
@@ -236,11 +491,12 @@ describe('sysMain periodic aggregator', () => {
     const res = await sysMain.tick();
     expect(res.ok).toBe(false);
 
-    // Even though CoinGecko and network info succeeded, nothing lands in
-    // dataStore because the tick as a whole failed.
-    for (const [k, v] of Object.entries(INITIAL_DATA_SNAPSHOT)) {
-      expect(data[k]).toEqual(v);
+    for (const key of ['version', 'currentBlock', 'nextSuperBlock', 'mnEnabled']) {
+      expect(data[key]).toEqual(INITIAL_DATA_SNAPSHOT[key]);
     }
+    expect(data.sysUsd).toBe(0.12);
+    expect(getStatsMetadata().groups.market.status).toBe('ready');
+    expect(getStatsMetadata().groups.chain.status).toBe('unavailable');
   });
 
   test('per-sb getSuperblockBudget failure falls back to "To be determined" and does NOT abort the tick', async () => {
@@ -355,7 +611,7 @@ describe('sysMain periodic aggregator', () => {
     await new Promise((r) => setImmediate(r));
     await new Promise((r) => setImmediate(r));
 
-    axios.get.mockRejectedValueOnce(new Error('Request failed with status code 429'));
+    rpc.getNetworkInfo.mockRejectedValueOnce(new Error('Core unavailable'));
     const freshFail = await sysMain.tick();
     expect(freshFail.ok).toBe(false);
     const backoffAfterFreshFail = sysMain.getDiagnostics().currentTickMs;
@@ -546,7 +802,8 @@ describe('sysMain periodic aggregator', () => {
   });
 
   test('consecutive failures apply exponential backoff up to MAX_BACKOFF_MS', async () => {
-    axios.get.mockRejectedValue(new Error('Request failed with status code 429'));
+    primeHappyRpc();
+    rpc.getNetworkInfo.mockRejectedValue(new Error('Core unavailable'));
     // Run many ticks and confirm the delay never exceeds MAX_BACKOFF_MS and
     // doubles monotonically until the ceiling.
     const seen = [];
