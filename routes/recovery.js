@@ -68,12 +68,18 @@ function createRecoveryRouter({
   const wire = (sub) => ({
     id: sub.id,
     chainId: sub.chain_id,
+    recoveryModule: sub.module_address,
     account: sub.account,
     label: sub.label,
     createdAt: sub.created_at,
     monitoring: {
       status:
-        sub.checked_at && now() - sub.checked_at > 60000
+        !monitor.chains.some(
+          (chain) =>
+            chain.chainId === sub.chain_id &&
+            chain.recoveryModule.toLowerCase() === sub.module_address
+        ) ||
+        (sub.checked_at && now() - sub.checked_at > 60000)
           ? 'degraded'
           : sub.status,
       lastCheckedAt: sub.checked_at,
@@ -143,6 +149,7 @@ function createRecoveryRouter({
         id,
         userId: req.user.id,
         chainId,
+        recoveryModule: chain.recoveryModule,
         account,
         message,
         expiresAt,
@@ -166,6 +173,8 @@ function createRecoveryRouter({
         (v) => v.chainId === challenge.chain_id
       );
       if (!chain) return res.status(400).json({ error: 'unsupported_chain' });
+      if (chain.recoveryModule.toLowerCase() !== challenge.module_address)
+        throw new Error('challenge_expired');
       const snapshot = await chain.rpc.snapshot(challenge.account);
       if (!snapshot.installed) throw new Error('recovery_not_installed');
       if (
@@ -199,7 +208,8 @@ function createRecoveryRouter({
           challenge.chain_id,
           challenge.account.toLowerCase(),
           input.label,
-          snapshot.block
+          snapshot.block,
+          chain.recoveryModule
         );
         repo.queue(
           sub.id,

@@ -30,6 +30,16 @@ const PROXY_CREATION = '0x608060405261026c803803806100148161016e565b928339810160
 const ACCOUNT_ABI = [
   'function initializeAccount(bytes)',
   'function isValidSignature(bytes32,bytes) view returns(bytes4)',
+  'function uninstallModule(uint256,address,bytes)',
+  'function execute(bytes32,bytes) payable',
+];
+const PACKED_OPERATION = '(address sender,uint256 nonce,bytes initCode,bytes callData,bytes32 accountGasLimits,uint256 preVerificationGas,bytes32 gasFees,bytes paymasterAndData,bytes signature)';
+const ENTRYPOINT_ABI = [
+  'function getNonce(address,uint192) view returns(uint256)',
+  `function getUserOpHash(${PACKED_OPERATION}) view returns(bytes32)`,
+  `function handleOps(${PACKED_OPERATION}[] ops,address payable beneficiary)`,
+  'function depositTo(address) payable',
+  'event UserOperationEvent(bytes32 indexed userOpHash,address indexed sender,address indexed paymaster,uint256 nonce,bool success,uint256 actualGasCost,uint256 actualGasUsed)',
 ];
 const RECOVERY_ABI = [
   'function getRecoveryScheduleHash(address,bytes32,bytes32,bytes) view returns(bytes32)',
@@ -54,6 +64,7 @@ async function loadBytecodes() {
   };
   return {
     account: pick('accountImplementation'),
+    entryPoint: pick('entryPoint'),
     ecdsa: pick('ecdsaValidator'),
     recovery: pick('guardianRecoveryModule'),
   };
@@ -122,7 +133,12 @@ test('real Pali ERC7739/1271 HTTP enrollment and recovery monitoring on isolated
     };
     const validator = await deploy([], bytecodes.ecdsa);
     const recovery = await deploy(RECOVERY_ABI, bytecodes.recovery);
-    const implementation = await deploy(ACCOUNT_ABI, bytecodes.account);
+    const entryPoint = await deploy(ENTRYPOINT_ABI, bytecodes.entryPoint);
+    // Pali's implementation constructor accepts an EntryPoint. Change only
+    // that ABI-encoded argument to the real local deployment, never its code.
+    assert.equal(bytecodes.account.slice(-64), zeroPadValue('0x433709009B8330FDa32311DF1C2AFA402eD8D009', 32).slice(2).toLowerCase());
+    const localAccountCreation = bytecodes.account.slice(0, -64) + coder.encode(['address'], [await entryPoint.getAddress()]).slice(2);
+    const implementation = await deploy(ACCOUNT_ABI, localAccountCreation);
     const validatorAddress = await validator.getAddress();
     const recoveryAddress = await recovery.getAddress();
     assert.equal(keccak256(await provider.getCode(recoveryAddress)), ZK_TANENBAUM.runtimeHash, 'Real module differs from pinned runtime');
@@ -171,6 +187,7 @@ test('real Pali ERC7739/1271 HTTP enrollment and recovery monitoring on isolated
     const token = fixture.sessions.issue(user.id).token;
     const call = (method, path) => request(fixture.app)[method](path).set('Cookie', `sid=${token}; csrf=anvil-csrf`).set('X-CSRF-Token', 'anvil-csrf');
     const challenge = async () => (await call('post', '/recovery/challenges').send({ chainId: 57057, account: accountAddress }).expect(200)).body;
+    let originalApproval;
 
     await t.test('wrong-account, wrong-chain and raw EOA signatures fail real ERC1271; accepted proof cannot replay', async () => {
       const c = await challenge();
@@ -183,6 +200,7 @@ test('real Pali ERC7739/1271 HTTP enrollment and recovery monitoring on isolated
         assert.equal(result.body.error, 'invalid_signature');
       }
       const signature = accountSignature(owner, validatorAddress, accountAddress, c.message);
+      originalApproval = { hash: hashMessage(c.message), signature };
       const result = await call('post', '/recovery/subscriptions').send({ challengeId: c.id, signature, label: 'Isolated QA account' }).expect(201);
       assert.equal(result.body.subscription.pending[0].operationId, operationId);
       assert.equal(result.body.subscription.pending[0].executableAt, snapshot.schedules[operationId].scheduledAt + delay);
@@ -281,6 +299,56 @@ test('real Pali ERC7739/1271 HTTP enrollment and recovery monitoring on isolated
       const rows = (await call('get', '/recovery/subscriptions').expect(200)).body.subscriptions;
       assert.equal(rows[0].pending.find((item) => item.operationId === fourth.operationId).status, 'orphaned');
       assert.equal(rows[0].pending.find((item) => item.operationId === restoredPendingOperation.operationId).status, 'pending');
+    });
+
+    await t.test('only the owner can remove recovery; real UserOperation removal invalidates pending recovery without a cancel event', async () => {
+      const managed = new Contract(accountAddress, ACCOUNT_ABI, deployer);
+      await assert.rejects(managed.uninstallModule.staticCall(2, recoveryAddress, '0x'));
+      const uninstall = managed.interface.encodeFunctionData('uninstallModule', [2, recoveryAddress, '0x']);
+      const nonceKey = BigInt(validatorAddress) << 32n;
+      const operation = {
+        sender: accountAddress,
+        nonce: await entryPoint.getNonce(accountAddress, nonceKey),
+        initCode: '0x',
+        callData: managed.interface.encodeFunctionData('execute', [mode, concat([accountAddress, zeroPadValue('0x00', 32), uninstall])]),
+        accountGasLimits: concat([zeroPadValue(toBeHex(1000000), 16), zeroPadValue(toBeHex(1000000), 16)]),
+        preVerificationGas: 100000,
+        gasFees: concat([zeroPadValue(toBeHex(2000000000), 16), zeroPadValue(toBeHex(2000000000), 16)]),
+        paymasterAndData: '0x',
+        signature: '0x',
+      };
+      const signingHash = TypedDataEncoder.hash({
+        chainId: 57057, name: 'ERC4337', version: '1', verifyingContract: await entryPoint.getAddress(),
+      }, { PackedUserOperation: [
+        { name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' },
+        { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' },
+        { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' },
+        { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' },
+      ] }, operation);
+      assert.equal(await entryPoint.getUserOpHash(operation), signingHash);
+      await (await entryPoint.depositTo(accountAddress, { value: toBeHex(100000000000000000n) })).wait();
+      operation.signature = Wallet.createRandom().signingKey.sign(signingHash).serialized;
+      await assert.rejects(entryPoint.handleOps.staticCall([operation], await deployer.getAddress()));
+      operation.signature = owner.signingKey.sign(signingHash).serialized;
+      const tx = await entryPoint.handleOps([operation], await deployer.getAddress(), { gasLimit: 5000000 });
+      const receipt = await tx.wait();
+      const success = receipt.logs.map((log) => {
+        try { return entryPoint.interface.parseLog(log); } catch { return null; }
+      }).find((log) => log && log.name === 'UserOperationEvent');
+      assert.equal(success.args.success, true);
+      assert.ok(!receipt.logs.some((log) => log.address.toLowerCase() === recoveryAddress.toLowerCase()
+        && log.topics[0] === id('RecoveryCanceled(address,bytes32)')));
+      for (let n = 0; n < 3; n++) await provider.send('evm_mine', []);
+      await syncClock();
+      await fixture.recoveryMonitor.tick();
+      const cleared = await rpc.snapshot(accountAddress, [restoredPendingOperation.operationId]);
+      assert.equal(cleared.installed, false);
+      assert.equal(cleared.schedules[restoredPendingOperation.operationId].canceled, true);
+      const rows = (await call('get', '/recovery/subscriptions')).body.subscriptions;
+      assert.ok(['canceled', 'invalidated'].includes(rows[0].pending.find((item) => item.operationId === restoredPendingOperation.operationId).status));
+      const text = 'The owner still controls this account after disabling guardian recovery';
+      assert.equal(await managed.isValidSignature(hashMessage(text), accountSignature(owner, validatorAddress, accountAddress, text)), '0x1626ba7e');
+      assert.equal(await managed.isValidSignature(originalApproval.hash, originalApproval.signature), '0x1626ba7e');
     });
 
     await t.test('disabling requires the verified account password and stops new notices', async () => {

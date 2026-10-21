@@ -86,6 +86,22 @@ test('only verified authenticated users can create challenge; CSRF is mandatory'
     .expect(403);
   f.db.close();
 });
+test('public /api/recovery alias shares the authenticated router and CSRF checks', async () => {
+  const f = setup();
+  await request(f.app).get('/api/recovery/chains').expect(401);
+  const c = await f
+    .call('post', '/api/recovery/challenges')
+    .send({ chainId: 57057, account: ACCOUNT })
+    .expect(200);
+  await f
+    .call('post', '/api/recovery/subscriptions')
+    .send({ challengeId: c.body.id, signature: '0x1234' })
+    .expect(201);
+  expect(
+    (await f.call('get', '/recovery/subscriptions')).body.subscriptions
+  ).toHaveLength(1);
+  f.db.close();
+});
 test('binds message to origin email user chain account and module; one-use proof creates independent subscription', async () => {
   const f = setup({ pending: true });
   const c = await f.challenge();
@@ -224,6 +240,19 @@ test('persisted active becomes degraded after worker stops refreshing', async ()
       .monitoring.status
   ).toBe('active');
   f.setTime(f.snapshot.block.timestamp * 1000 + 60001);
+  expect(
+    (await f.call('get', '/recovery/subscriptions')).body.subscriptions[0]
+      .monitoring.status
+  ).toBe('degraded');
+  f.db.close();
+});
+test('changed module binding is immediately degraded even before the next worker poll', async () => {
+  const f = setup();
+  const enrolled = await f.enroll();
+  await f.recoveryMonitor.tick();
+  f.db
+    .prepare('UPDATE recovery_subscriptions SET module_address=? WHERE id=?')
+    .run('0x' + '99'.repeat(20), enrolled.body.subscription.id);
   expect(
     (await f.call('get', '/recovery/subscriptions')).body.subscriptions[0]
       .monitoring.status

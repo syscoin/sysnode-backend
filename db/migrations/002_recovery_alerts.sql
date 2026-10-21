@@ -3,6 +3,7 @@ CREATE TABLE recovery_challenges (
   id TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   chain_id INTEGER NOT NULL,
+  module_address TEXT NOT NULL,
   account TEXT NOT NULL,
   message TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
@@ -14,6 +15,7 @@ CREATE TABLE recovery_subscriptions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   chain_id INTEGER NOT NULL,
+  module_address TEXT NOT NULL,
   account TEXT NOT NULL,
   label TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -25,7 +27,7 @@ CREATE TABLE recovery_subscriptions (
   status TEXT NOT NULL DEFAULT 'catching_up',
   checked_at INTEGER,
   block_timestamp INTEGER,
-  UNIQUE(user_id, chain_id, account)
+  UNIQUE(user_id, chain_id, module_address, account)
 );
 CREATE INDEX recovery_subscriptions_enabled ON recovery_subscriptions(enabled, id);
 

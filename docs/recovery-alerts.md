@@ -11,6 +11,9 @@ The initial supported network is **zkTanenbaum (57057)**. Mainnet networks are
 not advertised before the pinned recovery module has been deployed and checked.
 The server-owned registry contains the RPC, chain ID, module address, exact
 runtime hash and confirmation depth. HTTP requests cannot supply any of these.
+Each enrollment persists its chain, module and account binding. Changing the
+registry cannot silently move an existing enrollment to another module: the
+old watch becomes unavailable and a new module requires a fresh signed proof.
 `RECOVERY_ALERTS_ENABLED=true` enables that registry; absent/false leaves it
 disabled. Never add a runtime or chain without verifying its source and layout.
 
@@ -57,8 +60,10 @@ and monitoring are best effort, never a guarantee that a user has time to act.
    separately reviewed manual migration procedure, a consistent SQLite backup,
    and a copied-database rehearsal before cutover. Do not reset or replace live
    user data, and do not automatically roll back the database after new writes.
-3. Forward `/recovery/` unchanged under the same HTTPS origin as the frontend,
-   like `/auth/`. Preserve the existing cookie, CSRF and CSP configuration.
+3. The public API is `/api/recovery/` under the same HTTPS origin as the
+   frontend. Both `/api/recovery/` and `/recovery/` mount the same authenticated
+   router, supporting existing proxies that strip `/api` and those that pass
+   it unchanged. Preserve the existing cookie, CSRF and CSP configuration.
 4. Enable the registry only after the worker, SMTP transport and same-origin
    route have passed a testnet enrollment and delivery check. No wallet funds or
    live recovery need be risked to verify enrollment; use an owned test account
