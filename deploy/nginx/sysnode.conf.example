@@ -66,6 +66,7 @@ server {
     location /auth/   { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
     location = /vault { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
     location /gov/    { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    location /recovery/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
     location /api/sentry/v1/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
 
     # Public anonymous data routes. Canonical casing is lowercase
