@@ -2,24 +2,25 @@ const moment = require("moment");
 const axios = require("axios");
 const { client, rpcServices } = require("../services/rpcClient");
 const data = require("../data/dataStore");
+const {
+  markStatsSuccess,
+  markStatsFailure,
+  resetStatsMetadata,
+} = require("../lib/statsSnapshot");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // sysMain — periodic aggregation of market + chain + governance stats into the
 // shared dataStore consumed by /mnstats (via services/calculations.js).
 //
 // Robustness model:
-//   • Atomic commit of the last-good payload. Every tick assembles its values
-//     into a local `next` object and only `Object.assign(data, next)` once the
-//     whole payload succeeded. A failed tick leaves the previous tick's values
-//     intact — we never half-overwrite dataStore with a mix of fresh + stale
-//     fields. On cold start with no prior success yet, dataStore keeps its
-//     initialised defaults (see data/dataStore.js) rather than becoming
-//     partially zeroed halfway through a failure.
-//   • Exponential backoff on failure. External calls (notably CoinGecko's
-//     public API) occasionally rate-limit this host. Instead of hammering at
-//     a fixed 20s interval through a 429 window, we double the tick delay
-//     after every failure up to MAX_BACKOFF_MS and reset to BASE_TICK_MS on
-//     the first successful commit.
+//   • Chain, governance and node counts commit as one last-good snapshot.
+//     Optional market data has a separate snapshot and retry clock: a public
+//     price-feed outage must not prevent healthy Core stats from refreshing.
+//     Failed groups retain their values but become stale; never-fetched groups
+//     remain unavailable, so initial zero defaults are not presented as facts.
+//   • Independent exponential backoff on Core and market failures. A market
+//     rate-limit does not slow down the normal 20s Core polling cadence, and
+//     Core failure cannot cause the price API to be hammered on every retry.
 //   • Per-sb budget failures are isolated. getSuperblockBudget() for each of
 //     sb1..sb5 is allowed to fail individually (the RPC sometimes returns
 //     "block height not found" for projections too far in the future). A
@@ -51,6 +52,7 @@ const COINGECKO_TIMEOUT_MS = 10_000;
 const SB_BUDGET_TIMEOUT_MS = 5_000;
 const SUPERBLOCK_INTERVAL = 17520; // mainnet nSuperblockCycle (kept identical to previous logic)
 const GENESIS_HASH = "00000c255f9999002258ddd4d4c86a4b758a5e2ec07e7d69b3e8e7f3fbd44b92";
+const CORE_GROUPS = ["chain", "node", "governance"];
 
 // Promise.race a work-promise against a timeout timer. The timer is unref'd
 // so it can never keep the event loop alive on its own, and is cleared on
@@ -70,7 +72,9 @@ function withTimeout(promise, ms, label) {
 }
 
 let currentTickMs = BASE_TICK_MS;
-let lastGoodAt = 0;         // ms epoch of the last successful commit (observability / tests)
+let marketTickMs = BASE_TICK_MS;
+let marketNextAt = 0;
+let lastGoodAt = 0;         // ms epoch of the last successful Core snapshot
 let tickTimer = null;
 let stopped = false;
 let started = false;        // idempotency guard for start(); set synchronously so two
@@ -88,6 +92,9 @@ let lastCompletedGen = 0;   // gen of the newest tick whose result has been publ
                              // (committed OR rejected OR watchdog-abandoned). Used to
                              // no-op late-arriving results from superseded ticks so a
                              // stalled tick can't roll back backoff or overwrite data.
+let lastCoreCompletedGen = 0;
+let lastMarketCompletedGen = 0;
+let lastMarketStartedGen = 0;
 let watchdogFires = 0;      // observability / tests
 
 async function fetchMarketData() {
@@ -95,18 +102,28 @@ async function fetchMarketData() {
     "https://api.coingecko.com/api/v3/coins/syscoin?tickers=true&market_data=true",
     { timeout: COINGECKO_TIMEOUT_MS }
   );
-  const m = gecko.data.market_data;
-  return {
-    sysUsd: m.current_price.usd,
-    sysBtc: m.current_price.btc,
-    circulatingSupply: m.circulating_supply,
-    totalSupply: m.total_supply,
-    marketCap: m.market_cap.usd,
-    marketCapBtc: m.market_cap.btc,
-    volume: m.total_volume.usd,
-    volumeBtc: m.total_volume.btc,
-    priceChange: m.price_change_percentage_24h,
+  const m = gecko.data && gecko.data.market_data;
+  if (!m || typeof m !== "object") throw new Error("Invalid market data response");
+  // CoinGecko can legitimately omit individual quantities (for example total
+  // supply). Missing/non-finite values are unavailable, never zero estimates.
+  const quantity = (value) =>
+    Number.isFinite(value) && value >= 0 ? value : null;
+  const result = {
+    sysUsd: quantity(m.current_price?.usd),
+    sysBtc: quantity(m.current_price?.btc),
+    circulatingSupply: quantity(m.circulating_supply),
+    totalSupply: quantity(m.total_supply),
+    marketCap: quantity(m.market_cap?.usd),
+    marketCapBtc: quantity(m.market_cap?.btc),
+    volume: quantity(m.total_volume?.usd),
+    volumeBtc: quantity(m.total_volume?.btc),
+    priceChange: Number.isFinite(m.price_change_percentage_24h)
+      ? m.price_change_percentage_24h : null,
   };
+  if (Object.values(result).every((value) => value === null)) {
+    throw new Error("Market response contains no usable statistics");
+  }
+  return result;
 }
 
 async function fetchChainHead() {
@@ -228,73 +245,113 @@ async function fetchMasternodeCount() {
   };
 }
 
-async function tick(externalGen) {
-  // If the scheduler allocated the generation for us (so the watchdog can
-  // name the same tick we're running), use that; otherwise allocate our
-  // own — this supports direct `tick()` invocation from unit tests.
-  const gen = externalGen !== undefined ? externalGen : ++tickGen;
-  try {
-    const next = {};
+async function fetchCoreData() {
+  const next = {};
+  Object.assign(next, await fetchChainHead());
+  Object.assign(next, await fetchGovernance());
 
-    Object.assign(next, await fetchMarketData());
-    Object.assign(next, await fetchChainHead());
-    Object.assign(next, await fetchGovernance());
-
-    const diffBlock = next.nextSuperBlock - next.currentBlock;
-    const sbDate = Date.now() + diffBlock * next.avgBlockTime;
-    next.superBlockNextDate = moment(sbDate).format("MMMM Do YYYY, h:mm:ss a");
-    // Raw next-superblock epoch (UNIX seconds) for API consumers that need a
-    // numeric anchor instead of parsing the human-formatted string
-    // (e.g. the /governance/new wizard's computeProposalWindow).
-    next.superBlockNextEpochSec = Math.floor(sbDate / 1000);
-
-    const voteDeadlineBlock = next.nextSuperBlock - 1728;
-    const voteDeadlineDate =
-      Date.now() + (voteDeadlineBlock - next.currentBlock) * next.avgBlockTime;
-    next.votingDeadlineDate = moment(voteDeadlineDate).format(
-      "MMMM Do YYYY, h:mm:ss a"
-    );
-
-    Object.assign(
-      next,
-      await fetchProjectedSuperblocks({
-        nextSuperBlock: next.nextSuperBlock,
-        currentBlock: next.currentBlock,
-        avgBlockTime: next.avgBlockTime,
-      })
-    );
-
-    Object.assign(next, await fetchMasternodeCount());
-
-    // Stale-commit guard. If a newer tick (or the watchdog on our behalf)
-    // has already published a result, our payload is by definition stale:
-    // it may mix values read before the supersession with values read
-    // after, and committing it would also roll back the newer tick's
-    // backoff reset. No-op instead.
-    if (gen <= lastCompletedGen) {
-      return { ok: false, stale: true, gen };
+  for (const key of ["version", "protocol", "currentBlock", "nextSuperBlock"]) {
+    if (!Number.isSafeInteger(next[key]) || next[key] <= 0) {
+      throw new Error(`Invalid Core statistic: ${key}`);
     }
-
-    // Atomic commit: only touch dataStore once the whole payload resolved.
-    Object.assign(data, next);
-    lastCommittedGen = gen;
-    lastCompletedGen = gen;
-    lastGoodAt = Date.now();
-    currentTickMs = BASE_TICK_MS;
-    return { ok: true, gen };
-  } catch (err) {
-    console.error("[sysMain]", err.message);
-    // Same guard as the success path: if we've been superseded (newer
-    // commit landed, newer rejection landed, or watchdog already
-    // accounted for us), don't double-apply backoff or overwrite a
-    // newer signal.
-    if (gen <= lastCompletedGen) {
-      return { ok: false, stale: true, err, gen };
-    }
-    lastCompletedGen = gen;
-    currentTickMs = Math.min(currentTickMs * 2, MAX_BACKOFF_MS);
-    return { ok: false, err, gen };
   }
+  if (!Number.isFinite(next.avgBlockTime) || next.avgBlockTime <= 0) {
+    throw new Error("Invalid Core statistic: avgBlockTime");
+  }
+  for (const key of ["lastSuperBlock", "proposalFee"]) {
+    if (!Number.isFinite(next[key]) || next[key] < 0) {
+      throw new Error(`Invalid Core statistic: ${key}`);
+    }
+  }
+
+  const diffBlock = next.nextSuperBlock - next.currentBlock;
+  const sbDate = Date.now() + diffBlock * next.avgBlockTime;
+  next.superBlockNextDate = moment(sbDate).format("MMMM Do YYYY, h:mm:ss a");
+  // Raw next-superblock epoch (UNIX seconds) for API consumers that need a
+  // numeric anchor instead of parsing the human-formatted string
+  // (e.g. the /governance/new wizard's computeProposalWindow).
+  next.superBlockNextEpochSec = Math.floor(sbDate / 1000);
+
+  const voteDeadlineBlock = next.nextSuperBlock - 1728;
+  const voteDeadlineDate =
+    Date.now() + (voteDeadlineBlock - next.currentBlock) * next.avgBlockTime;
+  next.votingDeadlineDate = moment(voteDeadlineDate).format(
+    "MMMM Do YYYY, h:mm:ss a"
+  );
+
+  Object.assign(
+    next,
+    await fetchProjectedSuperblocks({
+      nextSuperBlock: next.nextSuperBlock,
+      currentBlock: next.currentBlock,
+      avgBlockTime: next.avgBlockTime,
+    })
+  );
+
+  Object.assign(next, await fetchMasternodeCount());
+  if (!Number.isSafeInteger(next.mnTotal) || next.mnTotal < 0 ||
+      !Number.isSafeInteger(next.mnEnabled) || next.mnEnabled < 0 ||
+      next.mnEnabled > next.mnTotal) {
+    throw new Error("Invalid Core masternode count");
+  }
+  return next;
+}
+
+async function tick(externalGen) {
+  // The scheduler and watchdog share this generation. Direct test/operator
+  // calls allocate their own; neither source can publish an obsolete result.
+  const gen = externalGen !== undefined ? externalGen : ++tickGen;
+  const fetchMarket = Date.now() >= marketNextAt;
+  if (fetchMarket) lastMarketStartedGen = gen;
+  // Publish each independent source as soon as it completes. A stuck Core
+  // socket cannot suppress a healthy price observation, or vice versa.
+  // Per-source generation fences also prevent an older result from undoing
+  // the same source's newer success/failure before the entire tick finishes.
+  const observe = (work, publish) => work.then(
+    (value) => { publish({ status: "fulfilled", value }); return true; },
+    (reason) => { publish({ status: "rejected", reason }); return false; }
+  );
+  const [coreOk, marketOk] = await Promise.all([
+    observe(fetchCoreData(), (result) => {
+      if (gen <= lastCompletedGen || gen <= lastCoreCompletedGen) return;
+      lastCoreCompletedGen = gen;
+      if (result.status === "fulfilled") {
+        Object.assign(data, result.value);
+        markStatsSuccess(CORE_GROUPS);
+        lastGoodAt = Date.now();
+        currentTickMs = BASE_TICK_MS;
+        lastCommittedGen = Math.max(lastCommittedGen, gen);
+      } else {
+        console.error("[sysMain] Core stats:", result.reason.message);
+        markStatsFailure(CORE_GROUPS);
+        currentTickMs = Math.min(currentTickMs * 2, MAX_BACKOFF_MS);
+      }
+    }),
+    fetchMarket ? observe(fetchMarketData(), (result) => {
+      if (gen <= lastCompletedGen || gen <= lastMarketCompletedGen) return;
+      lastMarketCompletedGen = gen;
+      if (result.status === "fulfilled") {
+        Object.assign(data, result.value);
+        markStatsSuccess(["market"]);
+        marketTickMs = BASE_TICK_MS;
+        lastCommittedGen = Math.max(lastCommittedGen, gen);
+      } else {
+        console.error("[sysMain] Market stats:", result.reason.message);
+        markStatsFailure(["market"]);
+        marketTickMs = Math.min(marketTickMs * 2, MAX_BACKOFF_MS);
+      }
+      marketNextAt = Date.now() + marketTickMs;
+    }) : Promise.resolve(false),
+  ]);
+  if (gen <= lastCompletedGen) return { ok: false, stale: true, gen };
+  lastCompletedGen = gen;
+  return {
+    ok: coreOk && (!fetchMarket || marketOk),
+    coreOk,
+    marketOk,
+    marketSkipped: !fetchMarket,
+    gen,
+  };
 }
 
 function scheduleNext() {
@@ -346,7 +403,17 @@ async function runAndReschedule() {
     if (gen > lastCompletedGen) {
       watchdogFires++;
       lastCompletedGen = gen;
-      currentTickMs = Math.min(currentTickMs * 2, MAX_BACKOFF_MS);
+      if (gen > lastCoreCompletedGen) {
+        lastCoreCompletedGen = gen;
+        currentTickMs = Math.min(currentTickMs * 2, MAX_BACKOFF_MS);
+        markStatsFailure(CORE_GROUPS);
+      }
+      if (lastMarketStartedGen === gen && gen > lastMarketCompletedGen) {
+        lastMarketCompletedGen = gen;
+        marketTickMs = Math.min(marketTickMs * 2, MAX_BACKOFF_MS);
+        marketNextAt = Date.now() + marketTickMs;
+        markStatsFailure(["market"]);
+      }
       console.error(
         `[sysMain] tick watchdog fired after ${TICK_WATCHDOG_MS}ms — rescheduling without awaiting the stuck tick`
       );
@@ -378,6 +445,9 @@ function stop() {
   // if start() is called again before their tick settles, those stale
   // callbacks can't schedule a duplicate loop on top of the new one.
   activeRunToken = null;
+  // Retired callbacks cannot publish data/health after stop, including during
+  // a later start whose fresh observation is still in flight.
+  lastCompletedGen = Math.max(lastCompletedGen, tickGen);
   if (tickTimer) {
     clearTimeout(tickTimer);
     tickTimer = null;
@@ -387,10 +457,14 @@ function stop() {
 function getDiagnostics() {
   return {
     currentTickMs,
+    marketTickMs,
+    marketNextAt,
     lastGoodAt,
     tickGen,
     lastCommittedGen,
     lastCompletedGen,
+    lastCoreCompletedGen,
+    lastMarketCompletedGen,
     watchdogFires,
   };
 }
@@ -401,14 +475,20 @@ function getDiagnostics() {
 // other test-file-scoped references rely on).
 function __resetForTests() {
   currentTickMs = BASE_TICK_MS;
+  marketTickMs = BASE_TICK_MS;
+  marketNextAt = 0;
   lastGoodAt = 0;
   tickGen = 0;
   lastCommittedGen = 0;
   lastCompletedGen = 0;
+  lastCoreCompletedGen = 0;
+  lastMarketCompletedGen = 0;
+  lastMarketStartedGen = 0;
   watchdogFires = 0;
   stopped = false;
   started = false;
   activeRunToken = null;
+  resetStatsMetadata();
   if (tickTimer) {
     clearTimeout(tickTimer);
     tickTimer = null;
