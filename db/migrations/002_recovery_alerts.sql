@@ -25,6 +25,7 @@ CREATE TABLE recovery_subscriptions (
   cursor_hash TEXT,
   anchor INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'catching_up',
+  reconcile_needed INTEGER NOT NULL DEFAULT 0 CHECK(reconcile_needed IN (0,1)),
   checked_at INTEGER,
   block_timestamp INTEGER,
   UNIQUE(user_id, chain_id, module_address, account)

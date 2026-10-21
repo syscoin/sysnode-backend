@@ -44,6 +44,13 @@ safe lookback. The worker catches up in bounded 2,000-block chunks and keeps
 attempts that start and finish between polls. On a changed checkpoint hash it
 resnapshots state, warns about the reorganization and replays from the enrollment
 anchor. An orphaned observation is not reported as an operator cancellation.
+Current-state observations do not wait for log backfill. A durable reconciliation
+flag records provisional terminal observations and detected reorganizations so
+they remain revalidated through paged backfill, restarts and read failures. It is
+cleared only after all known operations are read at the same head as the committed
+cursor, not by a health-status update. Reconciliation is bounded to 1,000 known
+operations per account; exceeding that capacity degrades monitoring rather than
+silently dropping history. Emails remain provisional and revalidated at delivery.
 
 One worker loop starts every 15 seconds after the previous iteration completes,
 with at most three subscription updates concurrently. A chain older than its
