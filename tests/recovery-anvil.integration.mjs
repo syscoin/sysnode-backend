@@ -174,12 +174,20 @@ test('real Pali ERC7739/1271 HTTP enrollment and recovery monitoring on isolated
     };
     await syncClock();
     const config = { ...ZK_TANENBAUM, recoveryModule: recoveryAddress };
-    const rpc = createRecoveryRpc(config, { request: (method, params) => provider.send(method, params), now: () => nowMs });
+    let boundedViewCalls = 0;
+    const rpc = createRecoveryRpc(config, { request: (method, params) => {
+      if (method === 'eth_call') {
+        boundedViewCalls++;
+        assert.equal(params[0].gas, '0x989680', 'Every view, including real ERC1271, uses the public ten-million gas cap');
+      }
+      return provider.send(method, params);
+    }, now: () => nowMs });
     const snapshot = await rpc.snapshot(accountAddress);
     assert.equal(snapshot.activeOperationId, operationId);
     assert.equal(snapshot.schedules[operationId].canceled, false);
     assert.equal(snapshot.schedules[operationId].executed, false);
     assert.equal(snapshot.delay, delay);
+    assert.equal(boundedViewCalls, 3);
     fixture = buildTestApp({ now: () => nowMs, recoveryChains: [{ ...config, rpc }] });
     const auth = 'a'.repeat(64);
     const user = fixture.users.create({ email: 'anvil-owner@example.com', authHash: auth });
