@@ -10,7 +10,8 @@ password and its configured TOTP factor.
 The initial supported network is **zkTanenbaum (57057)**. Mainnet networks are
 not advertised before the pinned recovery module has been deployed and checked.
 The server-owned registry contains the RPC, chain ID, module address, exact
-runtime hash, confirmation depth and finite block-age limit. HTTP requests cannot
+runtime hash, confirmation depth, finite block-age limit and `eth_call` gas
+budget. HTTP requests cannot
 supply any of these.
 Each enrollment persists its chain, module and account binding. Changing the
 registry cannot silently move an existing enrollment to another module: the
@@ -30,6 +31,13 @@ configurations remains two minutes. No other chain is enabled by this change.
 All calls and storage reads use the selected anchor, whose hash is checked again
 afterwards. Repeated hash checks detect inconsistent observations but do not
 provide finality. Emails identify this observation/reorganization boundary.
+The zkTanenbaum registry uses a 10,000,000-gas call budget, matching the public
+RPC's configured maximum. This covers both snapshot views and ERC-1271
+verification. Signature execution that exceeds this budget remains unavailable;
+the backend never retries it at a higher limit or treats a failed call as a
+valid signature. Real ECDSA/ERC-7739 enrollment is exercised at this cap in the
+Anvil integration. That does not establish that every SLH-DSA or composite
+configuration fits the public RPC budget; those must be qualified separately.
 The source-pinned `_activeRecovery` and
 `_schedules` storage layout closes two otherwise ambiguous cases: an operation
 already pending before enrollment, and uninstall/reinstall that silently cancels
