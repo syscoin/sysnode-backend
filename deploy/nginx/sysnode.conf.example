@@ -69,6 +69,13 @@ server {
     location /recovery/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
     location /api/recovery/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
     location /api/sentry/v1/ { proxy_pass http://127.0.0.1:3001; include /etc/nginx/snippets/sysnode-proxy.conf; }
+    # Anonymous pool-wide snapshots. Preserve the path and avoid access logs
+    # linking a requesting IP to a pool. No note/leaf parameters are supported.
+    location /api/privacy/v1/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3001;
+        include /etc/nginx/snippets/sysnode-proxy.conf;
+    }
 
     # Public anonymous data routes. Canonical casing is lowercase
     # (matches the historical `https://syscoin.dev/mnstats` URL still
