@@ -53,7 +53,9 @@ contain only public data, can be rebuilt, and never change `sysnode.db` or its
 schema. The existing deployment preserves `data/`. The feature needs no SQL
 migration, but the opt-in environment values and nginx route must be configured
 separately; automatic deployment does not modify the host environment or nginx.
-See the `/api/privacy/v1/` location in the nginx example. It disables access
+The internal `/privacy/v1` mount also supports existing proxies which strip
+`/api`; clients still use the public `/api/privacy/v1` URL. See the
+`/api/privacy/v1/` location in the nginx example for path-preserving proxies. It disables access
 logging for this path; any upstream CDN/load balancer also needs an equivalent
 policy if operators want to avoid recording client IP/pool access metadata.
 The endpoint is anonymous with wildcard CORS and does not parse sessions or

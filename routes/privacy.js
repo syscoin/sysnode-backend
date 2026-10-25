@@ -7,7 +7,9 @@ const { ipKeyGenerator } = require('express-rate-limit');
 const { getPool } = require('../lib/privacyRegistry');
 
 const PRIVACY_PREFIX = '/api/privacy/v1';
-function createPrivacyRouter({ index = null, limiter } = {}) {
+// Existing production proxies strip /api; direct/same-origin proxies retain it.
+const PRIVACY_PREFIXES = Object.freeze([PRIVACY_PREFIX, '/privacy/v1']);
+function createPrivacyRouter({ index = null, relayers = null, limiter } = {}) {
   const router = express.Router();
   router.use(cors({ origin: '*', credentials: false, exposedHeaders: ['ETag', 'X-Privacy-Index-State', 'Retry-After'] }));
   router.use(limiter || rateLimit({ windowMs: 60000, limit: 60,
@@ -19,6 +21,20 @@ function createPrivacyRouter({ index = null, limiter } = {}) {
     if (req.url.includes('?') || req.headers['transfer-encoding'] || Number(req.headers['content-length'] || 0) > 0 ||
         (req.body && Object.keys(req.body).length)) return res.status(400).json({ error: 'privacy_request_parameters_not_allowed' });
     next();
+  });
+  router.get('/relayers', async (req, res) => {
+    if (!relayers) return res.status(503).json({ error: 'privacy_relayer_directory_disabled' });
+    try {
+      const result = await relayers.read();
+      if (result.status === 200) {
+        res.set('Cache-Control', 'public, max-age=0, must-revalidate');
+        res.set('ETag', result.etag); res.set('X-Privacy-Index-State', result.phase);
+        if (req.fresh) return res.status(304).end();
+        return res.status(200).type('json').send(result.encoded);
+      }
+      res.set('Retry-After', result.status === 202 ? '2' : '30');
+      return res.status(result.status).json(result.body);
+    } catch (_) { return res.status(503).json({ error: 'privacy_relayer_directory_unavailable' }); }
   });
   router.get('/pools/:poolId/snapshot', async (req, res) => {
     if (!getPool(req.params.poolId)) return res.status(404).json({ error: 'unknown_privacy_pool' });
@@ -39,4 +55,4 @@ function createPrivacyRouter({ index = null, limiter } = {}) {
   router.use((_req, res) => res.status(404).json({ error: 'unknown_privacy_route' }));
   return router;
 }
-module.exports = { PRIVACY_PREFIX, createPrivacyRouter };
+module.exports = { PRIVACY_PREFIX, PRIVACY_PREFIXES, createPrivacyRouter };
