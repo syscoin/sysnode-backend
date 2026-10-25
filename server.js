@@ -45,6 +45,8 @@ const { createPaliChainGuard } = require('./lib/paliChainGuard');
 const { createConfiguredSentryAdapter, createSentryRpc } = require('./lib/sentryAdapter');
 const { configuredRecoveryChains } = require('./lib/recoveryRegistry');
 const { createRecoveryMonitor } = require('./lib/recoveryMonitor');
+const { configuredPrivacyIndex } = require('./lib/privacyIndex');
+const { PRIVACY_PREFIX, createPrivacyRouter } = require('./routes/privacy');
 const {
   createMasternodeCountRepo,
 } = require('./lib/masternodeCountRepo');
@@ -69,6 +71,7 @@ const currentVotesCache = createCurrentVotesCache({
 });
 
 const app = express();
+const privacyIndex = configuredPrivacyIndex();
 
 // Reverse-proxy awareness. When deployed behind nginx / a load balancer,
 // Express's default `req.ip` is the proxy's socket address, which collapses
@@ -92,6 +95,7 @@ app.set(
 
 // Security headers apply everywhere. helmet defaults are safe for JSON APIs.
 app.use(helmet());
+app.use(PRIVACY_PREFIX, createPrivacyRouter({ index: privacyIndex }));
 app.use(bodyParser.json({ limit: '256kb' }));
 app.use(cookieParser());
 
