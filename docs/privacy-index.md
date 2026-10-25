@@ -1,7 +1,7 @@
 # Public Classic ETH pool snapshots
 
-`GET /api/privacy/v1/pools/:poolId/snapshot` supplies public deposit data for
-Pali's local Tornado Classic Merkle-tree reconstruction. It never receives a
+`GET /api/privacy/v1/pools/:poolId/snapshot` supplies public deposit and withdrawal data for
+Pali's local Tornado Classic Merkle-tree reconstruction and note-status checks. It never receives a
 note, commitment, nullifier, leaf position, account address, signing key, RPC
 URL or arbitrary contract address. Every query string or request body is
 rejected. Only the following Ethereum mainnet pools are accepted:
@@ -24,22 +24,31 @@ RPC. URLs containing credentials or fragments are rejected. A provider API
 token may be in its path/query; it never enters responses or application logs.
 The RPC must support `finalized` headers, historical `eth_call`/`eth_getCode`,
 and `eth_getLogs` from the deployment blocks. Scans start with 5,000-block
-ranges and shrink on provider range/response-size failures. There is no
+ranges and shrink on provider range/response-size failures. After three sparse
+successful full ranges, the scanner doubles the range toward the original
+5,000-block cap. The cap is not increased based on an assumed provider capability. There is no
 fallback to unfinalized data or to a different provider. A provider which cannot
 serve even one block of historical logs needs a suitable endpoint before enabling.
 
-No RPC is sent at startup. The first request starts a job, bounded to 16 chunks
-and a 45-second scheduling budget (an already-started RPC can take another
-10 seconds). A global queue runs only one job at a time; requests for the same
-pool share it. Further requests resume incomplete work. Successful snapshots
-are checked for refresh at most once a minute; failures back off for 30 seconds.
+An unused pool sends no RPC. Its first request durably activates it and starts
+a job, bounded to 16 chunks and a 45-second scheduling budget (an already-started
+RPC can take another 10 seconds). A global queue runs only one job at a time;
+requests for the same pool share it. Activated pools continue unfinished backfill
+in bounded jobs separated by one second, then refresh once a minute without
+requiring another client request. Failures back off for 30 seconds. On restart,
+only previously activated pools resume. The single scheduled timer is unreferenced;
+`index.close()` cancels future work and waits for the current bounded job. The
+standalone app exposes its index handle for test/server lifecycle cleanup.
 Per-process IP limits allow 60 requests/minute and apply IPv6 subnet bucketing.
 Run one writer process for this file store; multiple workers require explicit
 shared locking and shared request limits before deployment.
 
 The backend process needs write access to `data/privacy-index/`, resolved from
 its working directory. Checkpoints and complete snapshots live in separate
-files with checksums and are published by same-directory atomic rename. They
+files with checksums and are published by same-directory atomic rename. An
+allowlisted per-pool activation marker preserves opt-in intent even if the first
+RPC fails. Existing snapshot/checkpoint filenames also identify previously used
+pools during migration; unknown filenames activate nothing. They
 contain only public data, can be rebuilt, and never change `sysnode.db` or its
 schema. The existing deployment preserves `data/`. The feature needs no SQL
 migration, but the opt-in environment values and nginx route must be configured
@@ -66,20 +75,42 @@ HTTP 200 contains only:
 
 ```text
 { version: 1, chainId: 1, poolAddress, asOfBlockNumber, asOfBlockHash,
-  leafCount, root, leaves: ["0x<64 lowercase hex digits>", ...] }
+  leafCount, root, leaves: ["0x<64 lowercase hex digits>", ...],
+  withdrawnNullifiers: ["0x<64 lowercase hex digits>", ...] }
 ```
 
-Deposits are ordered by canonical event position and must have contiguous
+The additive `withdrawnNullifiers` field is required in new cache files. Old
+deposit-only snapshots and version-1 checkpoints are discarded and rebuilt,
+never interpreted as an empty spent list. Checkpoints now use internal version 2.
+Each array is bounded to 2^20 entries, withdrawals cannot outnumber deposits, and
+the complete serialized snapshot/file is bounded to 160 MiB. Existing clients
+which project the deposit fields can keep using public version 1; clients using
+spent-note status must require the added field.
+
+A single OR-topic request scans Deposit and Withdrawal events over the same
+block range. Deposits are ordered by canonical event position and must have contiguous
 indices starting at zero. The server validates field ranges, the pool's
 20-level configuration and denomination, and matches total count and root
 metadata at the pinned finalized block. It rejects removed/malformed logs,
-missing indices, count mismatches and changed block anchors. JSON-RPC responses
+missing indices, duplicate commitments/nullifiers, inconsistent event ordering,
+count mismatches and changed block anchors. Withdrawal nullifiers are unique
+and appear in event order at the same snapshot block as the deposits. JSON-RPC responses
 have a 10-second timeout, 4-MiB bound, no redirects and exact response-ID checks.
 
 The server does **not** independently reconstruct the MiMC root or authenticate
 the configured RPC cryptographically. Pali must reconstruct the tree and check
 the returned root against its own trusted chain observation before use. This
 service is a public-data accelerator, not a replacement for wallet verification.
+
+**The deposit root does not authenticate completeness of the withdrawal/nullifier
+feed.** A missing withdrawal can pass the deposit-count/root checks. Spent-status
+users additionally rely on the configured RPC and scanner returning all canonical
+Withdrawal events; checksums and block fences do not remove that trust assumption.
+An old or partial snapshot must not be called a current unspent result. No API
+accepts a note or a per-user nullifier to resolve this on the server.
+Even a fresh finalized snapshot does not include withdrawals in newer blocks or
+the mempool; absence from its list is an observation at that block, not a
+guarantee that a withdrawal will succeed now.
 
 Complete snapshots remain immutable while a refresh is incomplete or fails.
 `X-Privacy-Index-State` reports `ready`, `refreshing`, or `stale`; the block/hash
@@ -90,7 +121,8 @@ Strong ETags support `If-None-Match`/304 with the same freshness header.
 
 A persisted snapshot is withheld after restart until its block/hash,
 on-chain count and root are checked again. Known checkpoint/snapshot reorgs
-discard the affected pool's files and restart from deployment. A gap discards
+discard the affected pool's data files and restart from deployment; its
+activation marker is retained. A gap discards
 unfinished work and retries from the last complete snapshot or deployment. An RPC
 outage does not destroy a previously validated in-memory snapshot; cold starts
 during an outage return 503. Invalid/corrupt files are never served.
@@ -106,5 +138,6 @@ npm run audit:prod
 
 Tests use synthetic RPCs and temporary directories and never make mainnet
 writes. They cover restart/resume, gaps, reorgs, unavailable sources,
-deduplication, atomic snapshot availability, malformed inputs and anonymous
+deduplication, withdrawal coverage and old-cache rebuilds, periodic refresh,
+timer cleanup, atomic snapshot availability, malformed inputs and anonymous
 HTTP/ETag behavior. No deployment or live pool claim is part of these tests.
