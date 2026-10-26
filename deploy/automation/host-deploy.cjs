@@ -11,9 +11,14 @@ const { createHash } = require('node:crypto');
 const { parseEnv, isDeepStrictEqual } = require('node:util');
 
 const APPS = Object.freeze({
-  frontend: { repo: 'syscoin/sysnode-info', branch: 'master', directory: 'sysnode-info', jobs: ['Jest + build (Node 20)', 'Jest + build (Node 22)'] },
-  backend: { repo: 'syscoin/sysnode-backend', branch: 'main', directory: 'sysnode-backend', jobs: ['Jest (Node 20)', 'Jest (Node 22)', 'Production dependency audit', 'Schema sanity'] },
+  frontend: { repo: 'syscoin/sysnode-info', branch: 'master', directory: 'sysnode-info', jobs: ['Jest + build (Node 26.12.1)'] },
+  backend: { repo: 'syscoin/sysnode-backend', branch: 'main', directory: 'sysnode-backend', jobs: ['Jest (Node 26.12.1)', 'Production dependency audit', 'Schema sanity'] },
 });
+const runtimePath = `${path.dirname(process.execPath)}:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin`;
+function validateNodeRuntime(version = process.versions.node) {
+  const match = typeof version === 'string' && /^26\.(\d+)\.(\d+)$/.exec(version);
+  if (!match || match[0] !== version || Number(match[1]) < 12 || (Number(match[1]) === 12 && Number(match[2]) < 1)) fail('node_26_12_1_or_later_required');
+}
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -131,7 +136,7 @@ function retainSuccessful(config, app, currentJob) {
   }
 }
 function stageEnvironment(job) {
-  return { PATH: '/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin', HOME: os.homedir(), LANG: 'C.UTF-8', CI: 'true', NPM_CONFIG_USERCONFIG: '/dev/null', NPM_CONFIG_CACHE: path.join(job, 'npm-cache') };
+  return { PATH: runtimePath, HOME: os.homedir(), LANG: 'C.UTF-8', CI: 'true', NPM_CONFIG_USERCONFIG: '/dev/null', NPM_CONFIG_CACHE: path.join(job, 'npm-cache') };
 }
 function databasePath(config, apps) {
   const root = path.join(config.appsRoot, APPS.backend.directory);
@@ -372,8 +377,8 @@ async function requestDeploy(configFile, app, request, io = {}) {
   fail('deployment_status_timeout_worker_may_continue');
 }
 async function main() {
-  process.env.PATH = '/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin';
-  if (Number(process.versions.node.split('.')[0]) !== 22) fail('node_22_required');
+  validateNodeRuntime();
+  process.env.PATH = runtimePath;
   const [mode, app, configFile, sha, runId, attempt, job] = process.argv.slice(2);
   if (['request', 'admitted'].includes(mode) && process.argv.length === 5) {
     if (!APPS[app]) fail('unknown_application');
@@ -400,4 +405,4 @@ async function main() {
   catch (error) { writeJson(path.join(job, 'status.json'), { state: 'failed', phase: 'deployment stopped', code: /^[a-z_]+$/.test(error.code || '') ? error.code : 'deployment_failed' }); throw error; }
 }
 if (require.main === module) main().catch(error => { console.error(/^[a-z_]+$/.test(error.code || '') ? error.code : 'deployment_failed'); process.exitCode = 1; });
-module.exports = { APPS, canonical, parseCommand, validateRun, validateJobsPage, validateCapabilities, sourceSchemaFence, sourceRuntimeFence, schema, compareState, stageEnvironment, deploy, requestDeploy, supervise, failedIfUnfinished, retainSuccessful };
+module.exports = { APPS, validateNodeRuntime, canonical, parseCommand, validateRun, validateJobsPage, validateCapabilities, sourceSchemaFence, sourceRuntimeFence, schema, compareState, stageEnvironment, deploy, requestDeploy, supervise, failedIfUnfinished, retainSuccessful };

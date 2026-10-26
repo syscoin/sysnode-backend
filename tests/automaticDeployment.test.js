@@ -4,13 +4,13 @@ const os = require('node:os');
 const path = require('node:path');
 const cp = require('node:child_process');
 const { EventEmitter } = require('node:events');
-const { parseCommand, validateRun, validateJobsPage, validateCapabilities, sourceRuntimeFence, canonical, compareState, schema, stageEnvironment, supervise, requestDeploy, retainSuccessful } = require('../deploy/automation/host-deploy.cjs');
+const { parseCommand, validateNodeRuntime, validateRun, validateJobsPage, validateCapabilities, sourceRuntimeFence, canonical, compareState, schema, stageEnvironment, supervise, requestDeploy, retainSuccessful } = require('../deploy/automation/host-deploy.cjs');
 const { inputs, privateKeyText } = require('../scripts/request-deploy.cjs');
 
 const sha = 'a'.repeat(40);
 const request = { sha, runId: '123', attempt: '2' };
 const run = { id: 123, run_attempt: 2, event: 'push', head_branch: 'main', head_sha: sha, repository: { full_name: 'syscoin/sysnode-backend' }, head_repository: { full_name: 'syscoin/sysnode-backend' }, path: '.github/workflows/ci.yml', status: 'in_progress' };
-const jobs = ['Jest (Node 20)', 'Jest (Node 22)', 'Production dependency audit', 'Schema sanity'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
+const jobs = ['Jest (Node 26.12.1)', 'Production dependency audit', 'Schema sanity'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
 const env = { GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'syscoin/sysnode-backend', GITHUB_REF: 'refs/heads/main', GITHUB_SERVER_URL: 'https://github.com', GITHUB_SHA: sha, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', SYSNODE_DEPLOY_HOST: '192.0.2.10', SYSNODE_DEPLOY_USER: 'ubuntu', SYSNODE_DEPLOY_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-only\n-----END OPENSSH PRIVATE KEY-----', SYSNODE_KNOWN_HOSTS: 'host ssh-ed25519 synthetic' };
 
 test('real OpenSSH keys remain parseable when secrets omit final LF or use CRLF', () => {
@@ -28,6 +28,11 @@ test('real OpenSSH keys remain parseable when secrets omit final LF or use CRLF'
       expect(parsedPublic).toBe(expectedPublic);
     }
   } finally { fs.rmSync(root, { recursive: true }); }
+});
+
+test('host deployment requires the supported patched Node runtime', () => {
+  for (const version of ['26.12.1', '26.12.2', '26.13.0']) expect(() => validateNodeRuntime(version)).not.toThrow();
+  for (const version of ['20.20.0', '22.22.0', '24.22.1', '26.11.9', '26.12.0', '27.0.0', '26.12.1-rc.1', '26.12.1\n', 'invalid']) expect(() => validateNodeRuntime(version)).toThrow('node_26_12_1_or_later_required');
 });
 
 test('forced command accepts only exact status or SHA/run/attempt deployment', () => {
@@ -113,6 +118,12 @@ test('actual SQLite schema fingerprint sees DDL outside migration files', () => 
 test('staging never inherits the live application environment', () => {
   process.env.SMTP_PASS = 'synthetic-only';
   try { expect(stageEnvironment('/tmp/job')).not.toHaveProperty('SMTP_PASS'); expect(stageEnvironment('/tmp/job')).not.toHaveProperty('SYSNODE_DB_PATH'); expect(stageEnvironment('/tmp/job').NPM_CONFIG_USERCONFIG).toBe('/dev/null'); } finally { delete process.env.SMTP_PASS; }
+});
+test('staging resolves Node from the verified host runner before system defaults', () => {
+  const directory = path.dirname(process.execPath);
+  const env = stageEnvironment('/tmp/job');
+  expect(env.PATH.split(path.delimiter)[0]).toBe(directory);
+  expect(cp.execFileSync('node', ['-p', 'process.execPath'], { env, encoding: 'utf8' }).trim()).toBe(process.execPath);
 });
 
 test('health capabilities preserve the exact configured chain and PQ gate', () => {
