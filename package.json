@@ -52,7 +52,7 @@
     "numeral": "2.0.6",
     "papaparse": "^5.5.3",
     "pretty-ms": "6.0.1",
-    "syscoinjs-lib": "^1.0.274",
+    "syscoinjs-lib": "^1.0.275",
     "websocket": "1.0.34",
     "zod": "4.6.7"
   },
