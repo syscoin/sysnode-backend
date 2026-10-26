@@ -35,7 +35,7 @@ Authenticated routes (cookie + CSRF, same-site):
 
 ## Requirements
 
-- Node.js 20 LTS (engines in `package.json` gate Node ≥ 20, < 24)
+- Node.js 26.12.1 (pinned in `.nvmrc` and CI; engines allow patched Node 26 releases from 26.12.1, below 27)
 - A reachable `syscoind` on mainnet or testnet, with RPC enabled
 - SMTP server for verification emails and vote reminders (or `MAIL_TRANSPORT=log` for dry-run)
 - SQLite 3 (via `better-sqlite3`, no separate install; native module compiles at `npm install`)
@@ -49,6 +49,7 @@ Optional, used only for the Pali PSBT collateral path:
 ```bash
 git clone https://github.com/syscoin/sysnode-backend.git
 cd sysnode-backend
+nvm install && nvm use       # exact version from .nvmrc
 npm ci
 cp .env.example .env        # then edit — see .env.example for inline docs
 npm run dev                 # nodemon on :3001
@@ -150,17 +151,17 @@ For remote RPC nodes, either configure `rpcauth=` in `syscoin.conf` and use the 
 
 These steps stand up `sysnode-backend` + [`sysnode-info`](https://github.com/syscoin/sysnode-info) on one Ubuntu box that already runs `syscoind`. HTTP-only; intended for staging and testing, not production. Everything installs into the user's home directory — **no `sudo` required** on most steps (a couple of optional hardening steps do need it; they are clearly marked).
 
-Walked end-to-end against Ubuntu 24.04 LTS + Node 22. Port layout: backend :3001, frontend :3000.
+The commands below target Ubuntu 24.04 LTS with Node 26.12.1. Port layout: backend :3001, frontend :3000. For an existing production installation, follow the runtime migration requirements in [the deployment guide](deploy/automation/README.md#node-runtime-upgrades) before restarting either service.
 
-### 1. Node.js 20 or 22 + basic tooling
+### 1. Node.js 26.12.1 + basic tooling
 
-Node.js ≥ 20, < 24 (see `engines` in `package.json`). If the box already has a Node in that range, skip the `nvm` block. Ubuntu 24.04 ships a compatible Node in its default repos; many one-click images come with Node 20 or 22 pre-installed.
+Use the exact Node version in `.nvmrc`; the operating system's default Node package may be older. The package engine requires Node ≥ 26.12.1, < 27. Node 20, 22 and 24 are not qualified for this revision.
 
 ```bash
-# Only if you don't already have Node 20–23.x
+# Install the pinned runtime if it is not already available
 curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 source ~/.bashrc
-nvm install 22 && nvm use 22
+nvm install 26.12.1 && nvm use 26.12.1
 
 # Use a user-local npm prefix so global installs don't need sudo
 mkdir -p ~/.npm-global ~/.local/bin
@@ -288,7 +289,7 @@ EOF
 mkdir -p data
 ```
 
-> **The backend does not load `.env` automatically.** It has no `dotenv` dependency. We load the file with Node's native `--env-file=` flag (Node 20.6+), which is why every invocation of `node` for this repo below passes `--env-file=.env`.
+> **The backend does not load `.env` automatically.** It has no `dotenv` dependency. We load the file with Node's native `--env-file=` flag (available in the pinned Node runtime), which is why every invocation of `node` for this repo below passes `--env-file=.env`.
 
 > **Cookie file permissions.** If the backend user can't read `~/.syscoin/.cookie` (different uid than `syscoind`), add `rpccookieperms=group` to `~/.syscoin/syscoin.conf` and restart `syscoind`, then add the backend's user to the syscoin group. The backend's boot log prints the exact errno (`ENOENT` / `EACCES`) if it can't read the file.
 

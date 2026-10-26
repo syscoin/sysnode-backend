@@ -2,7 +2,7 @@
   "name": "sysnode",
   "version": "1.0.0",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=26.12.1 <27"
   },
   "description": "Syscoin backend for masternode and governance stats",
   "main": "server.js",
