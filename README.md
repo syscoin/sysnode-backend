@@ -21,9 +21,9 @@ should use lowercase.
 - `GET  /mnlist` — fresh `masternode_list` RPC passthrough
 - `POST /mnsearch` — paginated/searched view over the in-memory tracker snapshot
 - `POST /govlist` — active + historical governance proposals (Syscoin Core `gobject list`)
-- `GET /api/privacy/v1/pools/:poolId/snapshot` — opt-in anonymous Classic ETH
+- `GET /api/privacy/v1/pools/:poolId/snapshot` — anonymous Classic ETH
   pool snapshots for local wallet verification; see [configuration and protocol](docs/privacy-index.md).
-- `GET /api/privacy/v1/relayers` — separately opt-in anonymous Classic ETH
+- `GET /api/privacy/v1/relayers` — anonymous Classic ETH
   relayer discovery; see [source checks and endpoint boundaries](docs/privacy-relayers.md).
 
 Authenticated routes (cookie + CSRF, same-site):

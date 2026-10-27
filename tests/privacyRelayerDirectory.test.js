@@ -40,9 +40,29 @@ function setup({ saved, candidates = [candidate], end = DEPLOYMENT_BLOCK + 2, ov
 }
 async function ready(s) { await s.directory.read(); await s.directory.idle(); return s.directory.read(); }
 
-test('directory is opt-in and configuration requires a separately enabled flag', () => {
-  expect(configuredPrivacyRelayerDirectory({ PRIVACY_INDEX_RPC_URL: 'https://operator.example' })).toBeNull();
-  expect(() => configuredPrivacyRelayerDirectory({ PRIVACY_RELAYER_DIRECTORY_ENABLED: 'true' })).toThrow('rpc_required');
+test('directory defaults on with an RPC, remains idle until requested, and supports opt-out', async () => {
+  const post = jest.spyOn(require('axios'), 'post');
+  // A developer's real data directory may contain an active checkpoint; this
+  // test must exercise a fresh install and never resume that scanner.
+  const stat = jest.spyOn(fs, 'stat').mockRejectedValue(Object.assign(new Error('not found'), { code: 'ENOENT' }));
+  try {
+    expect(configuredPrivacyRelayerDirectory({})).toBeNull();
+    expect(configuredPrivacyRelayerDirectory({ PRIVACY_RELAYER_DIRECTORY_ENABLED: '', PRIVACY_INDEX_RPC_URL: '' })).toBeNull();
+    expect(configuredPrivacyRelayerDirectory({ PRIVACY_RELAYER_DIRECTORY_ENABLED: 'false', PRIVACY_INDEX_RPC_URL: 'broken' })).toBeNull();
+    expect(() => configuredPrivacyRelayerDirectory({ PRIVACY_RELAYER_DIRECTORY_ENABLED: 'true' })).toThrow('rpc_required');
+    expect(() => configuredPrivacyRelayerDirectory({ PRIVACY_RELAYER_DIRECTORY_ENABLED: 'yes' })).toThrow('PRIVACY_RELAYER_DIRECTORY_ENABLED_invalid');
+    expect(() => configuredPrivacyRelayerDirectory({ PRIVACY_INDEX_RPC_URL: 'http://localhost' })).toThrow('privacy_rpc_url_invalid');
+    for (const flag of [undefined, '', 'true']) {
+      const directory = configuredPrivacyRelayerDirectory({ PRIVACY_RELAYER_DIRECTORY_ENABLED: flag, PRIVACY_INDEX_RPC_URL: 'https://operator.example' });
+      expect(directory).not.toBeNull();
+      await directory.start();
+      expect(post).not.toHaveBeenCalled();
+      await directory.close();
+    }
+  } finally {
+    stat.mockRestore();
+    post.mockRestore();
+  }
 });
 test('unused directory stays idle; first bulk read publishes only public anchored observations', async () => {
   const s = setup(); await s.directory.start(); expect(s.rpc.head).not.toHaveBeenCalled();

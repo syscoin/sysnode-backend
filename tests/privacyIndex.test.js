@@ -40,11 +40,41 @@ describe('public privacy index lifecycle', () => {
   afterEach(async () => { await fs.rm(dir, { recursive: true, force: true }); });
   const setup = (dir, rpc, extra = {}) => createPrivacyIndex({ rpc, store: createPrivacyStore(dir), autoStart: false, refreshMs: 0, retryMs: 0, continueMs: 0, ...extra });
 
-  test('disabled config performs no RPC or file IO and opt-in validates configuration', () => {
+  test('default configuration enables the index only with an RPC and supports explicit opt-out', async () => {
+    const post = jest.spyOn(require('axios'), 'post');
+    expect(configuredPrivacyIndex({ enabled: '', rpcUrl: '' })).toBeNull();
     expect(configuredPrivacyIndex({ enabled: 'false', rpcUrl: 'broken' })).toBeNull();
     expect(() => configuredPrivacyIndex({ enabled: 'true', rpcUrl: '' })).toThrow('PRIVACY_INDEX_RPC_URL_required');
     expect(() => configuredPrivacyIndex({ enabled: 'yes' })).toThrow('PRIVACY_INDEX_ENABLED_invalid');
     expect(() => configuredPrivacyIndex({ enabled: 'true', rpcUrl: 'http://localhost' })).toThrow('privacy_rpc_url_invalid');
+    expect(() => configuredPrivacyIndex({ enabled: '', rpcUrl: 'http://localhost' })).toThrow('privacy_rpc_url_invalid');
+    for (const enabled of ['', 'true']) {
+      const index = configuredPrivacyIndex({ enabled, rpcUrl: 'https://operator.example', store: createPrivacyStore(dir) });
+      expect(index).not.toBeNull();
+      await index.start();
+      expect(post).not.toHaveBeenCalled();
+      await index.close();
+    }
+    post.mockRestore();
+  });
+
+  test('omitting the flag uses the configured process RPC by default', async () => {
+    const previousFlag = process.env.PRIVACY_INDEX_ENABLED;
+    const previousRpc = process.env.PRIVACY_INDEX_RPC_URL;
+    delete process.env.PRIVACY_INDEX_ENABLED;
+    delete process.env.PRIVACY_INDEX_RPC_URL;
+    try {
+      expect(configuredPrivacyIndex()).toBeNull();
+      process.env.PRIVACY_INDEX_RPC_URL = 'https://operator.example';
+      const index = configuredPrivacyIndex({ store: createPrivacyStore(dir) });
+      expect(index).not.toBeNull();
+      await index.close();
+    } finally {
+      if (previousFlag === undefined) delete process.env.PRIVACY_INDEX_ENABLED;
+      else process.env.PRIVACY_INDEX_ENABLED = previousFlag;
+      if (previousRpc === undefined) delete process.env.PRIVACY_INDEX_RPC_URL;
+      else process.env.PRIVACY_INDEX_RPC_URL = previousRpc;
+    }
   });
 
   test('returns progress first and only publishes complete pinned snapshots', async () => {

@@ -7,11 +7,12 @@ balance computation and the optional direct-withdrawal path.
 
 ## Deployment
 
-The directory is disabled by default. Opt in with
-`PRIVACY_RELAYER_DIRECTORY_ENABLED=true` and the existing
-`PRIVACY_INDEX_RPC_URL` set to an operator-controlled HTTPS Ethereum mainnet RPC.
-`PRIVACY_INDEX_ENABLED` does not enable the directory and need not be enabled
-for this route. The RPC needs historical `eth_getLogs`, `eth_getStorageAt`,
+The directory is enabled by default when `PRIVACY_INDEX_RPC_URL` is set to an
+operator-controlled HTTPS Ethereum mainnet RPC. Set
+`PRIVACY_RELAYER_DIRECTORY_ENABLED=false` to disable it independently. With no
+RPC it remains disabled; explicitly setting the directory flag to `true` without
+an RPC is a configuration error. `PRIVACY_INDEX_ENABLED` does not control the
+directory. The RPC needs historical `eth_getLogs`, `eth_getStorageAt`,
 `eth_getCode` and `eth_call`, plus finalized block support. There is no fallback
 to `latest` or a caller-provided provider. Existing deployments stripping `/api`
 before proxying are supported by the internal `/privacy/v1` mount; clients
@@ -21,7 +22,10 @@ proxy already forwards this namespace. Access logs should be disabled for the
 public privacy namespace, including any upstream proxy/CDN, if operators do not
 want to retain client IP/access metadata.
 
-The first request activates one directory scanner. It persists only public ENS
+Any caller with access to the endpoint can activate one directory scanner. The
+first request can initiate RPC traffic
+and relayer status checks; a configured provider may charge for those reads.
+Enabling the endpoint alone does not start a new scan. The scanner persists only public ENS
 registration candidates and a canonical scan checkpoint under
 `data/privacy-relayers/registry-checkpoint.json`. A persisted checkpoint resumes
 after restart; an unused directory sends no RPC or relayer requests. Endpoint
