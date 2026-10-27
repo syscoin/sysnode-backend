@@ -18,9 +18,11 @@ These are pinned from the original
 
 ## Configuration and deployment
 
-The feature is disabled unless `PRIVACY_INDEX_ENABLED=true` and
-`PRIVACY_INDEX_RPC_URL` supplies an operator-controlled HTTPS Ethereum mainnet
-RPC. URLs containing credentials or fragments are rejected. A provider API
+The feature is enabled by default when `PRIVACY_INDEX_RPC_URL` supplies an
+operator-controlled HTTPS Ethereum mainnet RPC. Set `PRIVACY_INDEX_ENABLED=false`
+to disable it independently. With no RPC it remains disabled; explicitly setting
+`PRIVACY_INDEX_ENABLED=true` without an RPC is a configuration error. No default
+RPC is selected. URLs containing credentials or fragments are rejected. A provider API
 token may be in its path/query; it never enters responses or application logs.
 The RPC must support `finalized` headers, historical `eth_call`/`eth_getCode`,
 and `eth_getLogs` from the deployment blocks. Scans start with 5,000-block
@@ -30,7 +32,8 @@ successful full ranges, the scanner doubles the range toward the original
 fallback to unfinalized data or to a different provider. A provider which cannot
 serve even one block of historical logs needs a suitable endpoint before enabling.
 
-An unused pool sends no RPC. Its first request durably activates it and starts
+Enabling the endpoint does not start a new pool's backfill by itself. An unused
+pool sends no RPC. Its first request durably activates it and starts
 a job, bounded to 16 chunks and a 45-second scheduling budget (an already-started
 RPC can take another 10 seconds). A global queue runs only one job at a time;
 requests for the same pool share it. Activated pools continue unfinished backfill
@@ -39,6 +42,8 @@ requiring another client request. Failures back off for 30 seconds. On restart,
 only previously activated pools resume. The single scheduled timer is unreferenced;
 `index.close()` cancels future work and waits for the current bounded job. The
 standalone app exposes its index handle for test/server lifecycle cleanup.
+Any caller with access to the endpoint can activate a pool, and the resulting
+backfill and refresh consume provider quota and may incur charges.
 Per-process IP limits allow 60 requests/minute and apply IPv6 subnet bucketing.
 Run one writer process for this file store; multiple workers require explicit
 shared locking and shared request limits before deployment.
@@ -46,12 +51,12 @@ shared locking and shared request limits before deployment.
 The backend process needs write access to `data/privacy-index/`, resolved from
 its working directory. Checkpoints and complete snapshots live in separate
 files with checksums and are published by same-directory atomic rename. An
-allowlisted per-pool activation marker preserves opt-in intent even if the first
+allowlisted per-pool activation marker preserves activation even if the first
 RPC fails. Existing snapshot/checkpoint filenames also identify previously used
 pools during migration; unknown filenames activate nothing. They
 contain only public data, can be rebuilt, and never change `sysnode.db` or its
 schema. The existing deployment preserves `data/`. The feature needs no SQL
-migration, but the opt-in environment values and nginx route must be configured
+migration, but the Ethereum RPC and nginx route must be configured
 separately; automatic deployment does not modify the host environment or nginx.
 The internal `/privacy/v1` mount also supports existing proxies which strip
 `/api`; clients still use the public `/api/privacy/v1` URL. See the
