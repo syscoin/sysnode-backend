@@ -28,8 +28,15 @@ describe('public relayer status transport', () => {
   test.each(['http://public.example', 'https://127.1', 'https://2130706433', 'https://[::1]',
     'https://169.254.169.254', 'https://user:pass@public.example', 'https://public.example:8443',
     'https://public.example/path', 'https://public.example?recipient=x', 'https://public.example#x',
-    'https://localhost', 'https://public.example.', 'https://public.example\\@private.example'])('rejects non-fixed endpoint %s', (url) => {
+    'https://localhost', 'https://public.example.', 'https://public.example\\@private.example',
+    'localhost', '127.1', '2130706433', '169.254.169.254', 'public.example.',
+    'public.example:443', 'public.example/path', 'public.example?x=1', 'public.example#x',
+    'user@public.example', 'public.example\\@private.example', 'public%2eexample',
+    ' public.example', 'public.example\n', '-public.example', 'public..example'])('rejects non-fixed endpoint %s', (url) => {
     expect(() => endpoint(url)).toThrow();
+  });
+  test.each(['public.example', 'PUBLIC.Example', 'https://public.example/'])('normalizes a fixed HTTPS origin from %s', (url) => {
+    expect(endpoint(url)).toBe('https://public.example');
   });
   test.each(['0.1.2.3', '10.0.0.1', '100.64.0.1', '127.0.0.1', '169.254.169.254', '172.31.1.2',
     '192.168.1.1', '192.0.0.2', '198.18.0.1', '203.0.113.2', '224.0.0.1', '255.255.255.255',
@@ -37,10 +44,10 @@ describe('public relayer status transport', () => {
     expect(publicAddress(ip)).toBe(false);
   });
   test.each(['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111', '2001:4860:4860::8888'])('allows public address %s', (ip) => expect(publicAddress(ip)).toBe(true));
-  test('pins checked DNS to TLS host and projects only advertised fields', async () => {
+  test.each(['public.example', 'https://public.example/'])('pins checked DNS to TLS host and projects only advertised fields for %s', async (input) => {
     const answers = [{ address: '8.8.8.8', family: 4 }];
     const request = transport();
-    const result = await createPrivacyRelayerStatus({ lookup: async () => answers, request, now: () => 123 })('https://public.example/');
+    const result = await createPrivacyRelayerStatus({ lookup: async () => answers, request, now: () => 123 })(input);
     const options = request.mock.calls[0][0];
     expect(options).toMatchObject({ hostname: 'public.example', servername: 'public.example', path: '/status', port: 443, rejectUnauthorized: true, agent: false });
     answers[0].address = '127.0.0.1';
@@ -54,6 +61,11 @@ describe('public relayer status transport', () => {
     const request = transport();
     const inspect = createPrivacyRelayerStatus({ lookup: async () => [...await publicDns(), { address: '127.0.0.1', family: 4 }], request });
     await expect(inspect('https://public.example')).rejects.toThrow('dns_rejected'); expect(request).not.toHaveBeenCalled();
+  });
+  test('bare host rejects mixed private DNS and never sends a request', async () => {
+    const request = transport();
+    const inspect = createPrivacyRelayerStatus({ lookup: async () => [{ address: '8.8.8.8', family: 4 }, { address: '127.0.0.1', family: 4 }], request });
+    await expect(inspect('public.example')).rejects.toThrow('dns_rejected'); expect(request).not.toHaveBeenCalled();
   });
   test('close/deadline guard runs again after DNS and before HTTPS', async () => {
     const request = transport(); let stopped = false;

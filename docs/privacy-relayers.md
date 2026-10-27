@@ -70,8 +70,9 @@ trust assumption; these reads are not a cryptographic Ethereum light client.
 
 ## Endpoint boundaries and response meaning
 
-ENS records are untrusted. Only a root HTTPS URL on a DNS hostname with the
-standard 443 port is accepted; credentials, IP literals, custom paths, queries
+ENS records are untrusted. A bare DNS hostname is normalized to a root HTTPS URL;
+root HTTPS URLs on DNS hostnames with the standard 443 port are also accepted.
+Credentials, IP literals, custom paths, queries
 and fragments are rejected. Only fixed `/status` is requested. DNS must return
 one to eight public addresses, all of which pass IPv4/IPv6 special-range checks.
 An approved address is pinned into the actual TLS request, with the original
