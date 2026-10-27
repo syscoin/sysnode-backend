@@ -3,9 +3,13 @@
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const { namehash } = require('ethers');
 const { createPrivacyRelayerDirectory, createRelayerCheckpointStore, configuredPrivacyRelayerDirectory,
   SOURCE_ID, REFRESH_MS, JOB_MS, RANGE, MAX_CHUNKS } = require('../lib/privacyRelayerDirectory');
+const { createPrivacyRelayerStatus } = require('../lib/privacyRelayerStatus');
+const { POOLS } = require('../lib/privacyRegistry');
 const { DEPLOYMENT_BLOCK, MAX_CANDIDATES } = require('../lib/privacyRelayerRegistry');
 const owner = '0x1111111111111111111111111111111111111111';
 const candidate = { ensName: 'relay.eth', ensHash: namehash('relay.eth'), registeredAddress: owner };
@@ -51,6 +55,30 @@ test('unused directory stays idle; first bulk read publishes only public anchore
   expect(s.disk).toMatchObject({ version: 1, source: SOURCE_ID, scannedBlock: s.header.number });
   expect(JSON.stringify(s.disk)).not.toContain('endpoint'); expect(JSON.stringify(s.disk)).not.toContain('Fee');
   await s.directory.close(); expect(s.timers.size).toBe(0);
+});
+test('registered bare ENS hostname yields a selectable HTTPS relayer through guarded status inspection', async () => {
+  const s = setup();
+  s.rpc.resolve.mockResolvedValue({ ensName: candidate.ensName, ensHash: candidate.ensHash, owner,
+    registryBalance: '123', endpoint: 'relay.example' });
+  const request = jest.fn((options, callback) => {
+    const req = new EventEmitter(); req.destroy = jest.fn();
+    req.end = () => queueMicrotask(() => {
+      const res = new PassThrough(); res.statusCode = 200; res.headers = { 'content-type': 'application/json' };
+      callback(res);
+      res.end(JSON.stringify({ netId: 1, rewardAccount: owner,
+        instances: { eth: { decimals: 18, instanceAddress: Object.fromEntries(POOLS.map((p) => [p.id.slice(4), p.address])) } },
+        tornadoServiceFee: 0.3, health: { status: 'true' }, currentQueue: 0, version: '5.0.1' }));
+    });
+    return req;
+  });
+  const inspect = createPrivacyRelayerStatus({ lookup: async () => [{ address: '8.8.8.8', family: 4 }], request, now: () => 1700000000000 });
+  s.inspect.mockImplementation(inspect);
+  const res = await ready(s);
+  expect(res.body.relayers[0]).toMatchObject({ endpoint: 'https://relay.example', health: 'reported-healthy',
+    rewardAccount: owner, supportedPools: POOLS.map((p) => p.id) });
+  expect(request.mock.calls[0][0]).toMatchObject({ protocol: 'https:', hostname: 'relay.example', port: 443, path: '/status', rejectUnauthorized: true });
+  expect(s.rpc.rewardRegistered).toHaveBeenCalledWith(owner, owner, s.header, expect.any(Object));
+  await s.directory.close();
 });
 test('deduplicates concurrent demand into one registry scan and one status request', async () => {
   const s = setup(); await Promise.all(Array.from({ length: 10 }, () => s.directory.read())); await s.directory.idle();
