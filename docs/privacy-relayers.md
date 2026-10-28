@@ -8,7 +8,9 @@ balance computation and the optional direct-withdrawal path.
 ## Deployment
 
 The directory is enabled by default when `PRIVACY_INDEX_RPC_URL` is set to an
-operator-controlled HTTPS Ethereum mainnet RPC. Set
+operator-controlled Ethereum mainnet RPC. Remote endpoints require HTTPS;
+local HTTP is supported only for `localhost`, `127.0.0.1`, or `[::1]` with an
+explicit port; `localhost` is pinned to `127.0.0.1` without DNS. Set
 `PRIVACY_RELAYER_DIRECTORY_ENABLED=false` to disable it independently. With no
 RPC it remains disabled; explicitly setting the directory flag to `true` without
 an RPC is a configuration error. `PRIVACY_INDEX_ENABLED` does not control the

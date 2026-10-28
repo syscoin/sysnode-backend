@@ -19,7 +19,9 @@ These are pinned from the original
 ## Configuration and deployment
 
 The feature is enabled by default when `PRIVACY_INDEX_RPC_URL` supplies an
-operator-controlled HTTPS Ethereum mainnet RPC. Set `PRIVACY_INDEX_ENABLED=false`
+operator-controlled Ethereum mainnet RPC. Remote endpoints require HTTPS;
+local HTTP is supported only for `localhost`, `127.0.0.1`, or `[::1]` with an
+explicit port; `localhost` is pinned to `127.0.0.1` without DNS. Set `PRIVACY_INDEX_ENABLED=false`
 to disable it independently. With no RPC it remains disabled; explicitly setting
 `PRIVACY_INDEX_ENABLED=true` without an RPC is a configuration error. No default
 RPC is selected. URLs containing credentials or fragments are rejected. A provider API
