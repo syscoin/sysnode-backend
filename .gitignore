@@ -6,5 +6,6 @@ coverage/
 *.sqlite-journal
 data/sysnode.db*
 data/privacy-index/
+data/privacy-relayers/
 .DS_Store
 npm-debug.log*

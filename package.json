@@ -8,6 +8,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "privacy:start": "node --env-file-if-exists=.env privacy-server.js",
     "dev": "nodemon server.js",
     "test": "jest",
     "test:watch": "jest --watch",

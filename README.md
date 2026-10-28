@@ -26,6 +26,9 @@ should use lowercase.
 - `GET /api/privacy/v1/relayers` — anonymous Classic ETH
   relayer discovery; see [source checks and endpoint boundaries](docs/privacy-relayers.md).
 
+For a local privacy-only API without the other Sysnode services, see
+[local privacy API setup](docs/privacy-standalone.md).
+
 Authenticated routes (cookie + CSRF, same-site):
 
 - `/auth/*` — registration, verification, login, session, delete account
