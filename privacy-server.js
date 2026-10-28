@@ -19,8 +19,9 @@ function portFrom(value) {
 }
 
 function localHost(value, port) {
-  return typeof value === 'string' &&
-    new RegExp(`^(?:localhost|127\\.0\\.0\\.1):${port}$`, 'i').test(value);
+  if (typeof value !== 'string') return false;
+  const match = /^(?:localhost|127\.0\.0\.1)(?::([0-9]+))?$/i.exec(value);
+  return Boolean(match && (match[1] === undefined ? port === 80 : match[1] === String(port)));
 }
 
 function allowedOrigin(value) {

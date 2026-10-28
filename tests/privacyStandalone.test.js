@@ -1,7 +1,7 @@
 'use strict';
 
 const expressRequest = require('supertest');
-const { HOST, portFrom, createPrivacyApp } = require('../privacy-server');
+const { HOST, portFrom, localHost, createPrivacyApp } = require('../privacy-server');
 
 const extension = `chrome-extension://${'a'.repeat(32)}`;
 const pool = '/api/privacy/v1/pools/eth-0.1/snapshot';
@@ -56,4 +56,13 @@ test('uses a bounded explicit port', () => {
   expect(portFrom()).toBe(3477);
   expect(portFrom('9876')).toBe(9876);
   for (const value of ['0', '-1', '65536', '1.5', '3477x']) expect(() => portFrom(value)).toThrow();
+});
+
+test('accepts a portless Host only when listening on default HTTP port 80', () => {
+  expect(localHost('localhost', 80)).toBe(true);
+  expect(localHost('127.0.0.1', 80)).toBe(true);
+  expect(localHost('localhost:80', 80)).toBe(true);
+  expect(localHost('127.0.0.1', 3477)).toBe(false);
+  expect(localHost('localhost:81', 80)).toBe(false);
+  expect(localHost('evil.example', 80)).toBe(false);
 });
