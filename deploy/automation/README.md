@@ -13,7 +13,7 @@ for application code.
 Install a reviewed copy of `host-deploy.cjs` outside both live checkouts, at
 `/home/ubuntu/.local/libexec/sysnode-deploy/host-deploy.cjs`, with private
 `config.json` beside it. Create the configured state directory as mode 0700. The
-example configuration uses Node 26.12.1, the existing PM2 applications, mainnet genesis,
+example configuration uses Node 26.13.1, the existing PM2 applications, mainnet genesis,
 public HTTPS origin and loopback backend port; verify each value before enabling.
 The host runner must be updated explicitly from reviewed source, not replaced by
 an arbitrary candidate's deployment script.
@@ -42,20 +42,21 @@ not claimed.
 
 ## Node runtime upgrades
 
-Development and every CI job use Node 26.12.1, pinned in `.nvmrc`. The host runner
-refuses Node versions below 26.12.1 or outside major 26. Staged npm commands and
+Backend development and CI use Node 26.13.1, pinned in `.nvmrc`. The host runner
+refuses Node versions below 26.13.1 or outside major 26. Staged npm commands and
 child processes put the runner's own Node directory first on `PATH` so a different
 system default cannot silently install native modules under another ABI.
 
 Changing `.nvmrc` or merging this file does not replace the host's Node runtime,
 the independently installed host runner, an existing PM2 daemon, or running apps.
-Before the first deployment on the new major, an operator must separately:
+Before merging an upgrade that changes the required CI job name, an operator
+must update the shared host runtime and runner in this order.
 
-1. Install and verify Node 26.12.1 and its npm on the host. The forced commands
+1. Install and verify Node 26.13.1 and its npm on the host. The forced commands
    above currently use `/usr/bin/node`; that executable must resolve to the
    supported runtime. Confirm `node --version`, `node -p process.execPath`,
    `/usr/bin/node --version`, and the runtime used by the PM2 daemon and both apps.
-2. Prepare and test fresh dependencies under Node 26.12.1. `better-sqlite3` is a
+2. Prepare and test fresh dependencies under Node 26.13.1. `better-sqlite3` is a
    native addon: do not reuse `node_modules` built for Node 20, 22 or 24. The host
    runner loads the installed backend addon for read-only database checks, so its
    current backend dependencies must also be compatible before the runner changes.
@@ -64,12 +65,15 @@ Before the first deployment on the new major, an operator must separately:
    runtime, preserving `.env`, launch arguments, the SQLite database and its live
    writes. Rebuilding native dependencies is not a database migration; never remove
    `data/` or restore a stale database backup as part of this upgrade.
-4. Install the reviewed `host-deploy.cjs` outside the application checkouts. It now
-   requires `Jest (Node 26.12.1)` for the backend and `Jest + build (Node 26.12.1)`
-   for the frontend; both workflows must match before automatic deployments resume.
+4. Preserve the prior host runner for rollback, then install the reviewed
+   `host-deploy.cjs` outside the application checkouts. The new runner
+   requires `Jest (Node 26.13.1)` for the backend and `Jest + build (Node 26.12.1)`
+   for the existing frontend workflow. Coordinate the runner update with the
+   backend merge because the old runner rejects the new CI job name.
 5. Check the actual restarted process runtime, read-only SQLite integrity and
-   schema, both public and loopback health, and exact deployed Git revisions. Then
-   exercise the restricted `status` and qualified no-op deployment checks above.
+   schema, both public and loopback health, and exact deployed Git revisions.
+   Exercise the restricted `status` before merging. Verify backend deployment
+   admission after the new main-branch CI run supplies the required job name.
 
 This repository does not automatically upgrade the host or restart its processes.
 The normal exact-commit deployment and rollback fences remain unchanged.

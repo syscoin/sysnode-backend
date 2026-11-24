@@ -38,7 +38,7 @@ Authenticated routes (cookie + CSRF, same-site):
 
 ## Requirements
 
-- Node.js 26.12.1 (pinned in `.nvmrc` and CI; engines allow patched Node 26 releases from 26.12.1, below 27)
+- Node.js 26.13.1 (pinned in `.nvmrc` and CI; engines allow patched Node 26 releases from 26.13.1, below 27)
 - A reachable `syscoind` on mainnet or testnet, with RPC enabled
 - SMTP server for verification emails and vote reminders (or `MAIL_TRANSPORT=log` for dry-run)
 - SQLite 3 (via `better-sqlite3`, no separate install; native module compiles at `npm install`)
@@ -154,17 +154,17 @@ For remote RPC nodes, either configure `rpcauth=` in `syscoin.conf` and use the 
 
 These steps stand up `sysnode-backend` + [`sysnode-info`](https://github.com/syscoin/sysnode-info) on one Ubuntu box that already runs `syscoind`. HTTP-only; intended for staging and testing, not production. Everything installs into the user's home directory — **no `sudo` required** on most steps (a couple of optional hardening steps do need it; they are clearly marked).
 
-The commands below target Ubuntu 24.04 LTS with Node 26.12.1. Port layout: backend :3001, frontend :3000. For an existing production installation, follow the runtime migration requirements in [the deployment guide](deploy/automation/README.md#node-runtime-upgrades) before restarting either service.
+The commands below target Ubuntu 24.04 LTS with Node 26.13.1. Port layout: backend :3001, frontend :3000. For an existing production installation, follow the runtime migration requirements in [the deployment guide](deploy/automation/README.md#node-runtime-upgrades) before restarting either service.
 
-### 1. Node.js 26.12.1 + basic tooling
+### 1. Node.js 26.13.1 + basic tooling
 
-Use the exact Node version in `.nvmrc`; the operating system's default Node package may be older. The package engine requires Node ≥ 26.12.1, < 27. Node 20, 22 and 24 are not qualified for this revision.
+Use the exact Node version in `.nvmrc`; the operating system's default Node package may be older. The package engine requires Node ≥ 26.13.1, < 27. Node 20, 22 and 24 are not qualified for this revision.
 
 ```bash
 # Install the pinned runtime if it is not already available
 curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 source ~/.bashrc
-nvm install 26.12.1 && nvm use 26.12.1
+nvm install 26.13.1 && nvm use 26.13.1
 
 # Use a user-local npm prefix so global installs don't need sudo
 mkdir -p ~/.npm-global ~/.local/bin
