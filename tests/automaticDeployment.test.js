@@ -10,7 +10,7 @@ const { inputs, privateKeyText } = require('../scripts/request-deploy.cjs');
 const sha = 'a'.repeat(40);
 const request = { sha, runId: '123', attempt: '2' };
 const run = { id: 123, run_attempt: 2, event: 'push', head_branch: 'main', head_sha: sha, repository: { full_name: 'syscoin/sysnode-backend' }, head_repository: { full_name: 'syscoin/sysnode-backend' }, path: '.github/workflows/ci.yml', status: 'in_progress' };
-const jobs = ['Jest (Node 26.12.1)', 'Production dependency audit', 'Schema sanity'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
+const jobs = ['Jest (Node 26.13.1)', 'Production dependency audit', 'Schema sanity'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
 const env = { GITHUB_EVENT_NAME: 'push', GITHUB_REPOSITORY: 'syscoin/sysnode-backend', GITHUB_REF: 'refs/heads/main', GITHUB_SERVER_URL: 'https://github.com', GITHUB_SHA: sha, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', SYSNODE_DEPLOY_HOST: '192.0.2.10', SYSNODE_DEPLOY_USER: 'ubuntu', SYSNODE_DEPLOY_KEY: '-----BEGIN OPENSSH PRIVATE KEY-----\nsynthetic-only\n-----END OPENSSH PRIVATE KEY-----', SYSNODE_KNOWN_HOSTS: 'host ssh-ed25519 synthetic' };
 
 test('real OpenSSH keys remain parseable when secrets omit final LF or use CRLF', () => {
@@ -31,8 +31,8 @@ test('real OpenSSH keys remain parseable when secrets omit final LF or use CRLF'
 });
 
 test('host deployment requires the supported patched Node runtime', () => {
-  for (const version of ['26.12.1', '26.12.2', '26.13.0']) expect(() => validateNodeRuntime(version)).not.toThrow();
-  for (const version of ['20.20.0', '22.22.0', '24.22.1', '26.11.9', '26.12.0', '27.0.0', '26.12.1-rc.1', '26.12.1\n', 'invalid']) expect(() => validateNodeRuntime(version)).toThrow('node_26_12_1_or_later_required');
+  for (const version of ['26.13.1', '26.13.2', '26.14.0']) expect(() => validateNodeRuntime(version)).not.toThrow();
+  for (const version of ['20.20.0', '22.22.0', '24.22.1', '26.12.1', '26.13.0', '27.0.0', '26.13.1-rc.1', '26.13.1\n', 'invalid']) expect(() => validateNodeRuntime(version)).toThrow('node_26_13_1_or_later_required');
 });
 
 test('forced command accepts only exact status or SHA/run/attempt deployment', () => {
@@ -44,6 +44,13 @@ test('CI proof binds repository, branch, workflow, SHA and exact run attempt', (
   expect(() => validateRun('backend', request, run, [...jobs, { name: 'Deploy production', status: 'in_progress' }])).not.toThrow();
   for (const mutation of [{ event: 'pull_request' }, { head_branch: 'other' }, { head_sha: 'b'.repeat(40) }, { repository: { full_name: 'fork/repo' } }, { head_repository: { full_name: 'fork/repo' } }, { path: 'other.yml' }, { run_attempt: 1 }, { status: 'completed', conclusion: 'cancelled' }]) expect(() => validateRun('backend', request, { ...run, ...mutation }, jobs)).toThrow();
 });
+test('the frontend keeps its existing CI admission job during the backend runtime upgrade', () => {
+  const repository = { full_name: 'syscoin/sysnode-info' };
+  const frontendRun = { ...run, head_branch: 'master', repository, head_repository: repository };
+  const frontendJobs = [{ name: 'Jest + build (Node 26.12.1)', status: 'completed', conclusion: 'success' }];
+  expect(() => validateRun('frontend', request, frontendRun, frontendJobs)).not.toThrow();
+});
+
 test('missing, failed, skipped and additional unfinished jobs all fail closed', () => {
   expect(() => validateRun('backend', request, run, jobs.slice(1))).toThrow();
   for (const conclusion of ['failure', 'skipped', 'cancelled', null]) expect(() => validateRun('backend', request, run, jobs.map((job, index) => index ? job : { ...job, conclusion }))).toThrow();

@@ -12,12 +12,12 @@ const { parseEnv, isDeepStrictEqual } = require('node:util');
 
 const APPS = Object.freeze({
   frontend: { repo: 'syscoin/sysnode-info', branch: 'master', directory: 'sysnode-info', jobs: ['Jest + build (Node 26.12.1)'] },
-  backend: { repo: 'syscoin/sysnode-backend', branch: 'main', directory: 'sysnode-backend', jobs: ['Jest (Node 26.12.1)', 'Production dependency audit', 'Schema sanity'] },
+  backend: { repo: 'syscoin/sysnode-backend', branch: 'main', directory: 'sysnode-backend', jobs: ['Jest (Node 26.13.1)', 'Production dependency audit', 'Schema sanity'] },
 });
 const runtimePath = `${path.dirname(process.execPath)}:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin`;
 function validateNodeRuntime(version = process.versions.node) {
   const match = typeof version === 'string' && /^26\.(\d+)\.(\d+)$/.exec(version);
-  if (!match || match[0] !== version || Number(match[1]) < 12 || (Number(match[1]) === 12 && Number(match[2]) < 1)) fail('node_26_12_1_or_later_required');
+  if (!match || match[0] !== version || Number(match[1]) < 13 || (Number(match[1]) === 13 && Number(match[2]) < 1)) fail('node_26_13_1_or_later_required');
 }
 const sha256 = value => createHash('sha256').update(value).digest('hex');
 function canonical(value) {

@@ -9,7 +9,7 @@ dependencies.
 
 ## Start
 
-Use Node.js 26.12.1 or later in the 26.x series. From this repository:
+Use Node.js 26.13.1 or later in the 26.x series. From this repository:
 
 ```sh
 npm ci
